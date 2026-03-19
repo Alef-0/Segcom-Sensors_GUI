@@ -98,6 +98,8 @@ def create_connection_communication(initial_dict : dict, pipe : Connection, pool
         connection.read_chunk()
         while (connection.can_create_can()):
             message  = connection.create_package()
+            print(message)
+            # continue
         # Tratar da Conexão
             if message.canId == 0x201: threat_201_message(message.canChannel, message.canData, pool)
             if message.canChannel != radar_choice: continue 

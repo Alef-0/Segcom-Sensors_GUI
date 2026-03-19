@@ -1,5 +1,6 @@
 import numpy as np
 import cv2 as cv
+import math
 
 # Frame dimensions
 WIDTH = 800
@@ -95,19 +96,22 @@ class Graph_radar():
 
     def create_details(self):
         new_img = self.base_image.copy()
-        
-        # Draw the diagonal lines
         center = self.graph_to_pixel(0,0)
-        end_right = self.graph_to_pixel(self.x_max, self.y_max)
-        end_left = self.graph_to_pixel(self.x_min, self.y_max)
-        cv.line(new_img, center, end_left, (0,0,0), 1)
-        cv.line(new_img, center, end_right, (0,0,0), 1)
 
+        angle_rad = math.radians(30)
+        slope = math.tan(angle_rad)
+
+        # Compute endpoints for ±60° diagonals
+        end_right = self.graph_to_pixel(self.x_max, self.x_max * slope)
+        end_left  = self.graph_to_pixel(self.x_min, -self.x_min * slope)
+        cv.line(new_img, center, end_left, (0, 0, 0), 1)
+        cv.line(new_img, center, end_right, (0, 0, 0), 1)
+
+        # Draw the semicircules
         for i in range(1, self.y_max + 1):
             x,y = self.graph_to_pixel(i,i)
-            cv.ellipse(new_img, center, (x - center[0], center[1] - y), 0, 225, 315, (0,0,0), 1)
+            cv.ellipse(new_img, center, (x - center[0], center[1] - y), 0, 270 - 60, 270 + 60, (0,0,0), 1)
 
-        # Draw
         return new_img
 
     def show_points(self, x_group, y_group, colors):

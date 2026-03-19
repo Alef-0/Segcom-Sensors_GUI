@@ -74,7 +74,8 @@ class can_data:
 
     def __init__(self,raw: bytes):
         if len(raw) < self.CANData_size: return
+        self.raw =raw
         self.dlc, self.flags, self.canId,self.timestamp, self.canData, self.canChannel = struct.unpack(self.CANData_fmt, raw[:self.CANData_size])
 
     def __repr__(self):
-        return f"""{hex(self.canId)} from channel {self.canChannel}: {hex(self.canData)}"""
+        return f"""{hex(self.canId)}, in {self.timestamp / 1e9:0.6f} from channel {self.canChannel}: {self.canData}"""
