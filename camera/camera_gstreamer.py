@@ -202,6 +202,7 @@ def signal_handler(sig, frame):
 
 
 def gstreamer_main(connection : Connection, pool : Queue):
+    print("SOMETHING IS WRONG")
     signal.signal(signal.SIGTERM, signal_handler) 
     signal.signal(signal.SIGINT, signal_handler)
     pipeline = GStreamerPipeline(connection, pool)

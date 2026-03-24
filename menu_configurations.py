@@ -12,9 +12,9 @@ class Configurations:
         sg.theme("SystemDefaultForReal")
         
         # Criar divisões especiais
-        self.create_radar_division()
-        self.create_options()
-        self.create_filter_list()
+        self.real_time_status()
+        self.radar_configurations()
+        self.filter_configurations()
 
         self.layout = [ [self.FRAME], [sg.Push(), self.options, sg.Push()], [self.filter]]
         self.window = sg.Window("Configurations Menu", self.layout, finalize=True)
@@ -24,20 +24,20 @@ class Configurations:
         self.connected_radar = False
         self.connected_cam = False
 
-    def create_radar_division(self):
-        """Criando Tabs para ficar mais organizado"""
+    def real_time_status(self):
+        # O GPS foi colocado aqui porque era Melhor
         GPS = sg.Frame("", 
                        [[sg.Text("0° 0' 0\" N, 0° 0' 0\" E", expand_x=True, key="gps_text"), 
                          sg.Button("OPEN GPS", key="conn_gps", button_color=("white", "green")), 
                          sg.Button("MAPS", key="gps_maps")]], 
                        title_location=sg.TITLE_LOCATION_RIGHT)
         warning_text = [
-            sg.Push(), sg.Text("CLUSTER + QUALITY FOR GRAPHS"), sg.Push(), 
+            sg.Push(), sg.Text("GRAPHS NEEDS CLUSTER + QUALITY"), sg.Push(), 
             GPS, sg.Push()
         ]
         separation = []
         names = ["", "LEFT", "MIDDLE", "RIGHT"]
-        letter = ["dsadas", "A", "B", "C"]
+        letter = ["NULL", "A", "B", "C"]
         for i in range(1,4):
             curr_tab = sg.Column([
                 [sg.Text(f"{names[i]} {letter[i]}", justification="center", expand_x=True)],
@@ -53,9 +53,9 @@ class Configurations:
         separation.pop()
 
         
-        self.FRAME = [sg.Frame("Real Time Configurations", [separation, warning_text], expand_x=True, title_location=sg.TITLE_LOCATION_TOP)]
+        self.FRAME = [sg.Frame("Radar Status", [separation, warning_text], expand_x=True, title_location=sg.TITLE_LOCATION_TOP)]
 
-    def create_options(self):
+    def radar_configurations(self):
         self.choices = sg.Frame("Radar", [[
             sg.Radio("1", "choose", key="send_1"), sg.Radio("2", "choose", key="send_2"), 
             sg.Radio("3", "choose", key="send_3"),  sg.Radio("all", "choose", key="send_all", default=True)
@@ -71,7 +71,7 @@ class Configurations:
             [sg.Push(), sg.Checkbox("Send Quality", key="CHECK_QUALITY",default=True), sg.Push()]
         ])
 
-        self.options = sg.Frame("Options", [
+        self.options = sg.Frame("Radar Configurations", [
             # Distancia baseada no que o radar no modo consegue alcançar
             [sg.Checkbox("Max Distance", expand_x=True, key="CHECK_DISTANCE",default=True),  sg.Push(), sg.Slider((196, 260), 100, orientation="h", resolution=1, key="DISTANCE", size=(40, 20)), sg.Push()],
             [self.column1, sg.VerticalSeparator(), self.column2],
@@ -79,7 +79,7 @@ class Configurations:
             [sg.Button("SAVE in Non Volatile Memory", key="save_nvm", expand_x=True, button_color=("black", "white"))]
         ], title_location=sg.TITLE_LOCATION_TOP)
 
-    def create_filter_list(self):
+    def filter_configurations(self):
         self.dynprop = sg.Column([
             [sg.Push(), 
                 sg.Checkbox("Moving", default=True, enable_events=True, key="filter_dyn_move"),                     sg.Button("", button_color="#FF0000", disabled=True), 
@@ -96,12 +96,12 @@ class Configurations:
         ], justification="center")
         
         self.slider_pdh = sg.Column([
-            [sg.Push(), sg.Text("PDH - False Alarm Probability %\nZero is invalid", justification="center"), sg.Push()],
+            [sg.Push(), sg.Text("PDH - False Alarm Probability", justification="center"), sg.Push()],
             [sg.Slider((1, 7),disable_number_display=True, default_value=3, orientation='h', tick_interval=1, expand_x=True, enable_events=True, key="filter_phd")],
             [sg.Text("[0, 1 = 25, 2 = 50, 3 = 75, 4 = 90, 5 = 99...]", expand_x=True, justification="center")]
         ], justification="center")
 
-        self.cluster_ambg = sg.Column([
+        self.ambig_state = sg.Column([
             [sg.Push(), sg.Text("Ambiguitity State"), sg.Push()],
             [
                 sg.Push(), sg.Checkbox("Ambiguous", enable_events=True, key="filter_ambg_ambig") , 
@@ -113,7 +113,7 @@ class Configurations:
             ]
         ], justification="center")
 
-        self.invalid_state = sg.Column([
+        self.cluster_state = sg.Column([
             [sg.Text("Cluster State", justification="center", expand_x=True)],
             [sg.Push(), 
                 sg.Checkbox("0x0", default=True, enable_events=True,    key="filter_inv_00") , 
@@ -139,12 +139,19 @@ class Configurations:
             sg.Push()],
         ], expand_x=True)
 
+        self.rcs_limit = sg.Column([
+            [sg.Text("RCS Filtering\nMinimum Value", justification="center"),
+             sg.Slider((-64, 64), default_value=-20, orientation='h', tick_interval=10, expand_x=True, enable_events=True, key="filter_rcs")]
+        ], expand_x=True)
+
         self.filter = sg.Frame("Filters for points", [
                 [self.dynprop], 
                 [sg.HorizontalSeparator()], 
-                [self.slider_pdh, sg.VerticalSeparator(), self.cluster_ambg],
+                [self.rcs_limit],
+                [sg.HorizontalSeparator()], 
+                [self.slider_pdh, sg.VerticalSeparator(), self.ambig_state],
                 [sg.HorizontalSeparator()],
-                [self.invalid_state]
+                [self.cluster_state]
             ], title_location=sg.TITLE_LOCATION_TOP, expand_x=True)
 
     def centralize_combos(self):

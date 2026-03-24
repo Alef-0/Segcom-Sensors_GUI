@@ -7,6 +7,8 @@ from multiprocessing import Pipe
 import time
 import webbrowser
 
+import zenoh
+
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 DVR_IP = "192.168.1.108"
@@ -15,9 +17,18 @@ PASSWORD = "l1v3user5"
 URL = f"http://{DVR_IP}/cgi-bin/positionManager.cgi?action=getStatus"
 
 def get_gps():
-    response = requests.get(URL, auth=HTTPDigestAuth(USERNAME, PASSWORD), verify=False)
-    return response.text
-
+    try:
+        response = requests.get(URL, auth=HTTPDigestAuth(USERNAME, PASSWORD), verify=False, timeout=1)
+        response.raise_for_status()
+        return response.text
+    except requests.exceptions.Timeout:
+        return "Error: The request timed out."
+    except requests.exceptions.HTTPError as err:
+        return f"Error occurred: {err}"
+    except requests.exceptions.RequestException as e:
+        # This catches any other requests-related issues
+        return f"Error occurred: {e}"
+    
 
 def dms_to_dd(degrees, minutes, seconds):
     """Converts Degrees, Minutes, Seconds to Decimal Degrees."""
@@ -51,31 +62,3 @@ def transform_into_coordinates(text : str):
             
     
     return f"{latitude_text}, {longitude_text}", f"https://www.google.com/maps/search/?api=1&query={lat_value},{lon_value}"
-
-def main(connection : Connection, pool : Queue):
-    read = False
-    maps_link = f"https://www.google.com/maps/search/?api=1&query={0},{0}"
-
-    while True:
-        if read: 
-            all_values = get_gps()
-            text, maps_link = transform_into_coordinates(all_values)
-            pool.put(("gps_text", text))
-            time.sleep(1)
-        
-        # Tratar dos callbacks
-        if connection.poll():
-            event, value = connection.recv()
-            match event:
-                case "conn_gps": 
-                    read = not read;
-                    pool.put((event, read))
-                case "gps_maps":
-                    webbrowser.open(maps_link)
-                
-
-
-if __name__ == "__main__": 
-    send, receive = Pipe()
-    q = Queue(5)
-    main()
