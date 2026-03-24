@@ -20,16 +20,18 @@ def gps_main():
     pub_sub = zenoh.open(zenoh.Config())
     sub = pub_sub.declare_subscriber("GUI/GPS", lambda x: threat_message(x, pub_sub))
     
-    while True:
-        if read: 
-            all_values = get_gps()
-            if all_values.startswith("Error"): 
-                read = not read; 
-                pub_sub.put("GUI/MAIN/conn_gps", f"{read}")
-            else:
-                global maps_link
-                text, maps_link = transform_into_coordinates(all_values)
-                pub_sub.put("GUI/MAIN/gps_text", text)
-                sleep(1)
+    try:
+        while True:
+            if read: 
+                all_values = get_gps()
+                if all_values.startswith("Error"): 
+                    read = not read; 
+                    pub_sub.put("GUI/MAIN/conn_gps", f"{read}")
+                else:
+                    global maps_link
+                    text, maps_link = transform_into_coordinates(all_values)
+                    pub_sub.put("GUI/MAIN/gps_text", text)
+            sleep(1)
+    except: pass
         
 if __name__ == "__main__": gps_main()
