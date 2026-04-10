@@ -3,6 +3,7 @@ import numpy as np
 import cv2 as cv
 import queue
 import signal
+from time import sleep
 
 gi.require_version('Gst', '1.0')
 gi.require_version('GstApp', '1.0')
@@ -208,6 +209,7 @@ def gstreamer_main(connection : Connection, pool : Queue):
     global STOP
 
     while True:
+        sleep(0.01)
         if pipeline.connected:
             pipeline.run()
             if STOP: pipeline.cleanup(); break

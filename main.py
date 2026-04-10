@@ -72,6 +72,7 @@ if __name__ == "__main__":
     
 
     while loop:
+        sleep(0.01)
         event, values = config.read()
         if event == sg.WINDOW_CLOSED: send_cam.send(("STOP", None)); break
         

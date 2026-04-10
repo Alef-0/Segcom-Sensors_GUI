@@ -6,6 +6,7 @@ from multiprocess.queues import Queue
 from multiprocessing import Pipe
 import time
 import webbrowser
+from time import sleep
 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -57,6 +58,7 @@ def main(connection : Connection, pool : Queue):
     maps_link = f"https://www.google.com/maps/search/?api=1&query={0},{0}"
 
     while True:
+        sleep(0.01)
         if read: 
             all_values = get_gps()
             text, maps_link = transform_into_coordinates(all_values)

@@ -14,6 +14,8 @@ from multiprocessing import Process, Manager, Queue
 import re
 import cv2 as cv
 
+from time import sleep
+
 def threat_201_message(channel, bytes, pool : Queue):
     MaxDistanceCfg, RadarPowerCfg, OutputTypeCfg, RCS_Treshold, SendQualityCfg, _ = r201(bytes)
     
@@ -69,6 +71,7 @@ def create_connection_communication(initial_dict : dict, pipe : Connection, pool
     filter = Filter_graph(initial_dict)
 
     while True:
+        sleep(0.01)
         try:
             if pipe.poll(): 
                 event, values = pipe.recv()
