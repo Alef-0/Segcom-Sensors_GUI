@@ -185,18 +185,25 @@ pair into another snapshot folder.
 
 ## Calibration
 
-The Calibration tab records camera channel 4 while one persistent fullscreen
-canvas presents clockwise QR timestamps, two quadrants at a time. An underline
-below the time identifies the newest marker. Press **P** to pause/resume the
-display. Paused markers are excluded from timing analysis.
+The Calibration tab lets you require the desktop NVIDIA, ARM/Jetson, or CPU
+camera pipeline and choose the monitor used by the Qt/OpenGL fullscreen clock.
+The selected pipeline is validated before the clock starts and does not silently
+fall back to another decoder. The right side of the tab selects a 4, 6, 8, 9,
+10, or 12-code grid and independently controls how many of its latest QR codes
+remain visible. The clock presents QR timestamps in a snake path through the
+grid at the refresh rate reported for the selected monitor. An underline
+below the time identifies the newest marker. Press **P** to pause/resume, or use
+**Q**, Escape, or Ctrl+C to close it. Paused markers are excluded from timing
+analysis.
 
 The Visualization tab opens the single analyzer with the project's copied
 camera intrinsics, an undistorted image, and alpha 0.25 by default. QReader
-detects every QR bounding box, retries any missing quadrant separately, and
-orders the results by quadrant. Analysis starts immediately, skips frames that
-still have a missing quadrant, and advances until four decoded QR values no
-longer form one consecutive clockwise sequence. The PTS,
-NTP and four QR values are editable in the viewer; applying a valid correction
+detects every QR bounding box, retries grid cells without a readable result,
+and orders detections by grid cell. Analysis starts immediately and accepts any
+frame with at least one readable QR that matches its journal entry and grid
+cell. Unreadable and invalid detections are retained as diagnostics while the
+latest valid readable QR supplies the offset. The PTS, NTP, and configured grid
+values are editable in the viewer; applying a valid correction
 restarts the scan using the corrected values without changing the recording.
 The **Create analysis files** button only writes `calibration_analysis.json`
 and `calibration_frames.csv` to a sibling

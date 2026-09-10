@@ -7,7 +7,7 @@ from interface_core import Configurations as BaseConfigurations
 
 
 class Configurations(BaseConfigurations):
-    def __init__(self):
+    def __init__(self, calibration_screens=None):
         self.snapshot_playback = False
         self.snapshot_playback_pending = False
         self.snapshot_playback_paused = False
@@ -22,7 +22,21 @@ class Configurations(BaseConfigurations):
         self.calibration_camera_pending = False
         self.calibration_clock = False
         self.calibration_recording = False
+        self.transposition = False
+        self.calibration_screens = list(
+            calibration_screens or ["0: Primary @ unknown Hz"]
+        )
         super().__init__()
+
+    def centralize_combos(self):
+        super().centralize_combos()
+        for key in (
+            "calibration_decoder",
+            "calibration_screen",
+            "calibration_grid_qrs",
+            "calibration_visible_qrs",
+        ):
+            self.window[key].Widget.configure(justify="center")
 
     def create_radar_division(self):
         columns = []
@@ -270,24 +284,64 @@ class Configurations(BaseConfigurations):
         ]
 
     @staticmethod
-    def _create_calibration_layout():
+    def _create_calibration_layout(screen_choices=None):
+        screen_choices = list(screen_choices or ["0: Primary @ unknown Hz"])
         return [
             [
                 sg.Push(),
-                sg.Column([[
-                    sg.Text("Camera latency"),
-                    sg.Input("145", key="camera_pipeline_latency", size=(9, 1), justification="right"),
-                    sg.Text("Pipeline Adjustment (ms)"),
-                    sg.Input("109", key="camera_latency_adjustment", size=(9, 1), justification="right"),
-                    sg.Button("APPLY LATENCIES", key="calibration_latency_apply"),
-                ]]),
+                sg.Text("Camera latency"),
+                sg.Input("145", key="camera_pipeline_latency", size=(9, 1), justification="right"),
+                sg.Text("Pipeline Adjustment (ms)"),
+                sg.Input("109", key="camera_latency_adjustment", size=(9, 1), justification="right"),
+                sg.Button("APPLY LATENCIES", key="calibration_latency_apply"),
                 sg.Push(),
             ],
-            [sg.Push(), sg.Text("145 ms / 109 ms", key="calibration_latency_status"), sg.Push()],
-            [sg.HorizontalSeparator()],
-            [sg.Push(), sg.Text("QR display · 2 quadrants at a time"), sg.Push()],
             [
                 sg.Push(),
+                sg.Text("Current latencies: 145 ms / 109 ms", key="calibration_latency_status"),
+                sg.Text("Camera pipeline"),
+                sg.Combo(
+                    ("Usual NVIDIA", "ARM / Jetson", "CPU"),
+                    "Usual NVIDIA",
+                    key="calibration_decoder",
+                    readonly=True,
+                    size=(15, 1),
+                ),
+                sg.Push(),
+            ],
+            [
+                sg.Push(),
+                sg.Text("Display monitor"),
+                sg.Combo(
+                    screen_choices,
+                    screen_choices[0],
+                    key="calibration_screen",
+                    readonly=True,
+                    size=(24, 1),
+                ),
+                sg.Text("QR grid"),
+                sg.Combo(
+                    (4, 6, 8, 9, 10, 12),
+                    4,
+                    key="calibration_grid_qrs",
+                    readonly=True,
+                    enable_events=True,
+                    size=(5, 1),
+                ),
+                sg.Text("QR codes kept"),
+                sg.Combo(
+                    tuple(range(1, 5)),
+                    2,
+                    key="calibration_visible_qrs",
+                    readonly=True,
+                    size=(5, 1),
+                ),
+                sg.Push(),
+            ],
+            [sg.HorizontalSeparator()],
+            [
+                sg.Push(),
+                sg.Text("Qt/OpenGL QR calibration clock"),
                 sg.Button(
                     "OPEN CALIBRATION CAMERA 4",
                     key="calibration_camera_toggle",
@@ -298,6 +352,7 @@ class Configurations(BaseConfigurations):
                     key="calibration_clock_start",
                     button_color=("white", "green"),
                 ),
+                sg.Text("", key="calibration_status"),
                 sg.Push(),
             ],
             [
@@ -307,7 +362,6 @@ class Configurations(BaseConfigurations):
                     justification="center",
                 )
             ],
-            [sg.Push(), sg.Text("IDLE", key="calibration_status"), sg.Push()],
         ]
 
     @staticmethod
@@ -330,7 +384,7 @@ class Configurations(BaseConfigurations):
             sg.Tab("Record", self._create_record_layout()),
             sg.Tab("Snapshots", self._create_snapshot_layout()),
             sg.Tab("Display", self._create_general_configurations_layout()),
-            sg.Tab("Calibration", self._create_calibration_layout()),
+            sg.Tab("Calibration", self._create_calibration_layout(self.calibration_screens)),
             sg.Tab("Visualization", self._create_visualization_layout()),
         ]]
         self.radar_control = sg.Frame(
@@ -339,6 +393,42 @@ class Configurations(BaseConfigurations):
             expand_x=True,
             title_location=sg.TITLE_LOCATION_TOP,
             pad=(0, 0),
+        )
+
+    @staticmethod
+    def _create_transposition_layout():
+        return [
+            [
+                sg.Push(),
+                sg.Text("Camera B + Radar B"),
+                sg.Button(
+                    "ENABLE TRANSPOSITION",
+                    key="transposition_toggle",
+                    button_color=("white", "green"),
+                ),
+                sg.Push(),
+            ],
+            [
+                sg.Text(
+                    "OFF · camera points use the current radar filters and distance cutoff",
+                    key="transposition_status",
+                    expand_x=True,
+                    justification="center",
+                )
+            ],
+        ]
+
+    def create_filters(self):
+        tabs = [[
+            sg.Tab("Basic", self._create_filter_layout()),
+            sg.Tab("Cluster Options", self._create_cluster_filter_layout()),
+            sg.Tab("Transposition", self._create_transposition_layout()),
+        ]]
+        self.filters = sg.Frame(
+            "Radar controls",
+            [[sg.TabGroup(tabs, expand_x=True)]],
+            expand_x=True,
+            title_location=sg.TITLE_LOCATION_TOP,
         )
 
     def _refresh_mode_controls(self):
@@ -460,6 +550,21 @@ class Configurations(BaseConfigurations):
         )
         self.window["calibration_clock_start"].update(
             disabled=self.calibration_clock
+        )
+        settings_disabled = self.calibration_camera or self.calibration_camera_pending
+        self.window["calibration_decoder"].update(disabled=settings_disabled)
+        self.window["calibration_screen"].update(disabled=self.calibration_clock)
+        self.window["calibration_grid_qrs"].update(disabled=self.calibration_clock)
+        self.window["calibration_visible_qrs"].update(disabled=self.calibration_clock)
+        self.window["transposition_toggle"].update(
+            disabled=(
+                self.playback
+                or self.playback_pending
+                or self.snapshot_playback
+                or self.snapshot_playback_pending
+                or self.calibration_camera
+                or self.calibration_camera_pending
+            )
         )
 
     def change_received_messages(self, message_ids):
@@ -591,17 +696,30 @@ class Configurations(BaseConfigurations):
         if active:
             self.window["calibration_status"].update("CAMERA 4 OPEN")
         elif not self.calibration_recording:
-            self.window["calibration_status"].update("IDLE")
+            self.window["calibration_status"].update("")
         self._refresh_mode_controls()
 
     def change_calibration_clock(self, active):
         self.calibration_clock = bool(active)
         self.window["calibration_clock_start"].update(
-            "BARCODE ACTIVE" if active else "START BARCODE CALIBRATION",
+            "QR ACTIVE" if active else "START QR CALIBRATION",
             disabled=active,
             button_color=("white", "red" if active else "green"),
         )
         self._refresh_mode_controls()
+
+    def change_calibration_qr_grid(self, grid_qrs, visible_qrs):
+        grid_qrs = int(grid_qrs)
+        choices = tuple(range(1, grid_qrs + 1))
+        try:
+            selected = int(visible_qrs)
+        except (TypeError, ValueError):
+            selected = 1
+        selected = min(grid_qrs, max(1, selected))
+        self.window["calibration_visible_qrs"].update(
+            values=choices,
+            value=selected,
+        )
 
     def change_calibration_recording(self, payload):
         self.calibration_recording = bool(payload.get("active"))
@@ -629,8 +747,23 @@ class Configurations(BaseConfigurations):
 
     def change_calibration_latencies(self, pipeline_latency_ms, adjustment_ms):
         self.window["calibration_latency_status"].update(
-            f"{pipeline_latency_ms} ms / {adjustment_ms:g} ms"
+            f"Current latencies: {pipeline_latency_ms} ms / {adjustment_ms:g} ms"
         )
+
+    def change_transposition(self, active, message=None):
+        self.transposition = bool(active)
+        self.window["transposition_toggle"].update(
+            "DISABLE TRANSPOSITION" if self.transposition else "ENABLE TRANSPOSITION",
+            button_color=("white", "red" if self.transposition else "green"),
+        )
+        if message is None:
+            message = (
+                "ON · GROUP B · waiting for camera and radar frames"
+                if self.transposition
+                else "OFF · camera points use the current radar filters and distance cutoff"
+            )
+        self.window["transposition_status"].update(message)
+        self._refresh_mode_controls()
 
     def change_recording_rate(self, frames_per_30):
         self.window["recording_rate_status"].update(

@@ -26,6 +26,12 @@ from sensors.radar.object_messages import (
 )
 from processing.visualization.graph_draw import Graph_radar
 from processing.visualization.graph_filter import Filter_graph
+from processing.visualization.transposition import (
+    RADAR_GROUP_B,
+    clear_latest,
+    put_latest,
+    transposition_payload,
+)
 from processing import ManualSnapshotWriter, RadarRecordingSession
 from processing.recording.point_cloud_recorder import CAMERA_DELAY_SECONDS
 
@@ -127,7 +133,13 @@ def _stop_recording(recording, pool, recording_ready):
         )
 
 
-def create_connection_communication(initial_values, pipe, pool, shutdown_event):
+def create_connection_communication(
+    initial_values,
+    pipe,
+    pool,
+    shutdown_event,
+    transposition_channel=None,
+):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, lambda *_: shutdown_event.set())
     radar_choice = next(
@@ -151,6 +163,7 @@ def create_connection_communication(initial_values, pipe, pool, shutdown_event):
     frame_history = {channel: deque() for channel in RADAR_CHANNELS}
     recording_ready: dict[int, bool] = {}
     received_message_ids: set[int] = set()
+    transposition_active = False
     graph = Graph_radar(
         initial_values.get("point_cutoff", 15.0),
         initial_values.get("graph_width", 800),
@@ -185,14 +198,33 @@ def create_connection_communication(initial_values, pipe, pool, shutdown_event):
         previous_type = frame_types.get(channel)
         if previous_type is not None:
             previous_messages = frame_messages(channel, previous_type)
-            if channel == radar_choice:
+            points = previous_messages.snapshot()
+            filtered_points = ()
+            colors = ()
+            if channel == radar_choice or (
+                transposition_active and channel == RADAR_GROUP_B
+            ):
                 if previous_type == "cluster":
-                    x, y, colors = filters.filter_points(previous_messages)
+                    x, y, colors = filters.filter_point_sequence(points)
                 else:
-                    x, y, colors = filters.filter_objects(previous_messages)
+                    x, y, colors = filters.filter_object_sequence(points)
+                filtered_points = filters.last_points
+
+            if channel == radar_choice:
                 graph.show_points(x, y, colors, filters.last_points)
 
-            points = previous_messages.snapshot()
+            if transposition_active and channel == RADAR_GROUP_B:
+                put_latest(
+                    transposition_channel,
+                    transposition_payload(
+                        filtered_points,
+                        colors,
+                        frame_type=previous_type,
+                        recorded_at=frame_timestamps[channel],
+                        distance_cutoff=graph.distance_cutoff,
+                    ),
+                )
+
             frame = RadarFrame(
                 recorded_at=frame_timestamps[channel],
                 frame_type=previous_type,
@@ -289,6 +321,10 @@ def create_connection_communication(initial_values, pipe, pool, shutdown_event):
                         send_configuration_message(values, connection, True)
                     elif event == "choose":
                         radar_choice = values
+                    elif event == "transposition":
+                        transposition_active = bool(values.get("active"))
+                        if not transposition_active:
+                            clear_latest(transposition_channel)
                     elif event == "record_start":
                         try:
                             folders = recording.start(values["folder"], values["channels"])
@@ -385,6 +421,7 @@ def create_connection_communication(initial_values, pipe, pool, shutdown_event):
                     elif message.canId == 0x60E:
                         object_messages[channel].fill_60e(r60e(message.canData))
     finally:
+        clear_latest(transposition_channel)
         _stop_recording(recording, pool, recording_ready)
         if connection.sock:
             connection.sock.close()

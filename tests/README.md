@@ -20,8 +20,8 @@ plugins from affecting this project.
 | `test_graph_filter.py` | Dynamic, quality, ambiguity, invalid-state, and RCS filtering |
 | `test_point_cloud_recorder.py` | Cluster/object PCD schemas, writer behavior, and recording sessions |
 | `test_recording_changes.py` | Camera/radar pairing, metadata, frame-rate selection, calibration journals, and playback loading |
-| `test_calibration_workflow.py` | Fake-process display startup, recording destinations, delayed capture and cancellation |
-| `test_qr_calibration.py` | QR generation, two-quadrant display, QReader sector ordering, four-value stop rules, journal matching, replacement timing, mismatch reporting, and quantitative verdict artifacts |
+| `test_calibration_workflow.py` | Fake-process display startup, pipeline/monitor/QR-count selections, recording destinations, delayed capture and cancellation |
+| `test_qr_calibration.py` | QR generation, configurable grids and visible-code counts, QReader cell ordering, partial-read acceptance, latest-readable selection, journal matching, replacement timing, mismatch reporting, and quantitative verdict artifacts |
 | `test_manual_snapshot.py` | Snapshot folder validation, indexes, metadata, and cleanup after failure |
 | `test_snapshot_playback.py` | Paired-entry filtering, stepping, rendering controls, and copy-current-pair behavior |
 | `test_camera_pipeline_policy.py` | Decoder choice, pipeline structure, host-anchored PTS, reference clocks, transport counters, and capture callbacks |
@@ -39,7 +39,7 @@ Passing tests do not establish:
 - sustained 30 FPS capture and JPEG writing;
 - fullscreen calibration appearance or QR readability through the camera;
 - the correctness of the operational camera-delay value for a new session;
-- clean interaction among the real FreeSimpleGUI, OpenCV, GTK, and Pygame
+- clean interaction among the real FreeSimpleGUI, OpenCV, GTK, and Qt/OpenGL
   windows.
 
 Those behaviors require separate checks on the target installation. UI checks

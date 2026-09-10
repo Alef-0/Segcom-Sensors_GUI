@@ -6,7 +6,7 @@ numpy
 opencv-python
 pypcd4
 PyGObject
-pygame
+PySide6
 qrcode
 qreader
 requests

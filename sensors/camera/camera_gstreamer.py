@@ -9,6 +9,12 @@ import gi
 import numpy as np
 
 from processing import CameraSnapshotRecorder
+from processing.visualization.transposition import (
+    RADAR_GROUP_B,
+    RadarCameraOverlay,
+    clear_latest,
+    get_latest,
+)
 from sensors.camera.camera_pipeline import (
     available_decoder_backends,
     build_camera_pipeline,
@@ -37,7 +43,7 @@ _RESULT_CLOSED = "closed"
 
 
 class GStreamerPipeline:
-    def __init__(self, conn, pool, shutdown_event):
+    def __init__(self, conn, pool, shutdown_event, transposition_channel=None):
         self.pipeline = None
         self.main_loop = None
         self.frames = queue.Queue(maxsize=1)
@@ -66,8 +72,11 @@ class GStreamerPipeline:
         self.timestamp_policy = FrameTimestampPolicy()
         self.reference_clock = ReferenceClockObserver()
         self.stream_epoch = 0
+        self.decoder_preference = "auto"
         self.decoder_backends = available_decoder_backends()
         self.decoder_backend_index = 0
+        self.last_pipeline_error: str | None = None
+        self._pipeline_error_reported = False
         self._last_timestamp_warning = 0.0
         self._last_published_camera_ntp_ns: int | None = None
         self._last_ntp_ui_update = 0.0
@@ -77,6 +86,16 @@ class GStreamerPipeline:
         self._pending_pts_gap_candidates = 0
         self._manual_snapshot_lock = threading.Lock()
         self._pending_manual_snapshot: dict | None = None
+        self.transposition_channel = transposition_channel
+        self.transposition_active = False
+        self.transposition_payload = None
+        self.capture_size: tuple[int, int] | None = None
+        self.transposition_overlay = None
+        self.transposition_error = None
+        try:
+            self.transposition_overlay = RadarCameraOverlay.from_json()
+        except Exception as error:
+            self.transposition_error = str(error).strip() or type(error).__name__
 
     @staticmethod
     def create_url(channel):
@@ -102,6 +121,31 @@ class GStreamerPipeline:
         )
         self._put_status("camera_recording_drop", payload)
         self._last_writer_drop_warning = now
+
+    def _set_transposition(self, value):
+        active = bool(value.get("active"))
+        if active and self.transposition_overlay is None:
+            self.transposition_active = False
+            self.transposition_payload = None
+            clear_latest(self.transposition_channel)
+            message = self.transposition_error or "Could not load camera_matrixes.json"
+            self._put_status("transposition_error", message)
+            return
+        self.transposition_active = active
+        if not active:
+            self.transposition_payload = None
+            clear_latest(self.transposition_channel)
+        self._put_status(
+            "transposition_state",
+            {
+                "active": active,
+                "message": (
+                    "ON · GROUP B · camera matrix loaded"
+                    if active
+                    else "OFF · camera points use the current radar filters and distance cutoff"
+                ),
+            },
+        )
 
     def _report_unusual_pts_gap(self, timing):
         if not timing.get("large_pts_gap_candidate"):
@@ -287,6 +331,29 @@ class GStreamerPipeline:
             "camera_recording_rate_state",
             {"frames_per_30": frames_per_30},
         )
+
+    def _set_decoder_backend(self, value):
+        preference = str(value.get("backend", "auto")).strip().lower()
+        if preference not in ("auto", "rtx", "orin", "cpu"):
+            self._put_status(
+                "camera_pipeline_error",
+                f"Unsupported camera pipeline selection: {preference!r}",
+            )
+            return False
+        if preference == self.decoder_preference:
+            return False
+
+        self.decoder_preference = preference
+        self._pipeline_error_reported = False
+        self.last_pipeline_error = None
+        if not self.connected:
+            return False
+        if not self.reset_decoder_selection():
+            self.connected = False
+            self._put_status("change_cam", False)
+            return True
+        self.exit_reason = _RESULT_RESTART
+        return True
 
     def _set_display_resolution(self, value):
         try:
@@ -506,6 +573,9 @@ class GStreamerPipeline:
         frame = self._sample_to_frame(sample)
         if frame is None:
             return Gst.FlowReturn.ERROR
+        shape = getattr(frame, "shape", ())
+        if len(shape) >= 2:
+            self.capture_size = (shape[1], shape[0])
         first_frame = not self.first_frame_received
         self.first_frame_received = True
         if first_frame:
@@ -576,6 +646,7 @@ class GStreamerPipeline:
             self.exit_reason = _RESULT_FAILURE
             if message.type == Gst.MessageType.ERROR:
                 error, debug = message.parse_error()
+                self.last_pipeline_error = f"{error}; {debug}"
                 print(f"[DEBUG][CAMERA] GStreamer error: {error}; {debug}")
             if self.main_loop:
                 self.main_loop.quit()
@@ -598,6 +669,9 @@ class GStreamerPipeline:
                         continue
                     self.channel = value
                     self.channel_changed = True
+                    self.capture_size = None
+                    self.transposition_payload = None
+                    self._clear_frames()
                     if self.connected:
                         self.exit_reason = _RESULT_RESTART
                         restart = True
@@ -614,10 +688,14 @@ class GStreamerPipeline:
                         self._connect_camera()
                 elif event == "calibration_camera":
                     restart = self._set_calibration_camera(value.get("active")) or restart
+                elif event == "camera_decoder_backend":
+                    restart = self._set_decoder_backend(value) or restart
                 elif event == "camera_latency_settings":
                     restart = self._set_latency_settings(value) or restart
                 elif event == "camera_recording_rate":
                     self._set_recording_rate(value)
+                elif event == "transposition":
+                    self._set_transposition(value)
                 elif event == "record_start":
                     self._start_snapshot_recording(value)
                 elif event == "record_stop":
@@ -645,6 +723,28 @@ class GStreamerPipeline:
             frame = self.frames.get_nowait()
         except queue.Empty:
             return GLib.SOURCE_CONTINUE
+        if (
+            self.transposition_active
+            and not self.calibration_mode
+            and self.channel == RADAR_GROUP_B
+            and self.transposition_overlay is not None
+            and self.capture_size is not None
+        ):
+            self.transposition_payload = get_latest(
+                self.transposition_channel,
+                self.transposition_payload,
+            )
+            try:
+                frame = self.transposition_overlay.draw(
+                    frame,
+                    self.transposition_payload,
+                    source_size=self.capture_size,
+                )
+            except (KeyError, TypeError, ValueError, cv.error) as error:
+                self.transposition_active = False
+                self.transposition_payload = None
+                clear_latest(self.transposition_channel)
+                self._put_status("transposition_error", str(error))
         cv.imshow("CALIBRATION CAMERA 4" if self.calibration_mode else "CAMERA", frame)
         cv.waitKey(1)
         return GLib.SOURCE_CONTINUE
@@ -657,6 +757,10 @@ class GStreamerPipeline:
         print(
             f"[DEBUG][CAMERA] Camera channel {self.channel} did not produce a frame within "
             f"{FIRST_FRAME_TIMEOUT_SECONDS:.1f} seconds"
+        )
+        self.last_pipeline_error = (
+            f"The {self.current_decoder_backend.name} camera pipeline did not "
+            f"produce a frame within {FIRST_FRAME_TIMEOUT_SECONDS:.1f} seconds"
         )
         self.exit_reason = _RESULT_FAILURE
         if self.main_loop:
@@ -676,13 +780,24 @@ class GStreamerPipeline:
 
     def reset_decoder_selection(self):
         try:
-            self.decoder_backends = available_decoder_backends()
+            self.decoder_backends = available_decoder_backends(
+                self.decoder_preference,
+                strict=self.decoder_preference != "auto",
+            )
         except RuntimeError as error:
-            self._put_status("camera_recording_error", str(error))
+            self._report_pipeline_error(str(error))
             print(f"[DEBUG][CAMERA] {error}")
             return False
         self.decoder_backend_index = 0
+        self._pipeline_error_reported = False
+        self.last_pipeline_error = None
         return True
+
+    def _report_pipeline_error(self, message):
+        if self._pipeline_error_reported:
+            return
+        self._pipeline_error_reported = True
+        self._put_status("camera_pipeline_error", message)
 
     def advance_decoder_backend(self):
         next_index = self.decoder_backend_index + 1
@@ -753,13 +868,25 @@ class GStreamerPipeline:
             ]
 
             if self.pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
-                print(f"[DEBUG][CAMERA] GStreamer could not start camera channel {self.channel}")
+                self.last_pipeline_error = (
+                    f"GStreamer could not start camera channel {self.channel} "
+                    f"with the {self.current_decoder_backend.name} pipeline"
+                )
+                print(f"[DEBUG][CAMERA] {self.last_pipeline_error}")
+                if self.decoder_preference != "auto":
+                    self._report_pipeline_error(self.last_pipeline_error)
                 return self.exit_reason, self.first_frame_received
 
             self.main_loop.run()
             return self.exit_reason, self.first_frame_received
         except Exception as error:
-            print(f"[DEBUG][CAMERA] Camera pipeline failure: {error}")
+            self.last_pipeline_error = (
+                f"Could not build the {self.current_decoder_backend.name} "
+                f"camera pipeline: {error}"
+            )
+            print(f"[DEBUG][CAMERA] {self.last_pipeline_error}")
+            if self.decoder_preference != "auto":
+                self._report_pipeline_error(self.last_pipeline_error)
             return _RESULT_FAILURE, self.first_frame_received
         finally:
             self.snapshot_recorder.record_timing_events(self.reference_clock.poll())
@@ -777,10 +904,15 @@ class GStreamerPipeline:
             self.main_loop = None
 
 
-def gstreamer_main(connection, pool, shutdown_event):
+def gstreamer_main(connection, pool, shutdown_event, transposition_channel=None):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, lambda *_: shutdown_event.set())
-    pipeline = GStreamerPipeline(connection, pool, shutdown_event)
+    pipeline = GStreamerPipeline(
+        connection,
+        pool,
+        shutdown_event,
+        transposition_channel,
+    )
     failed_attempts = 0
 
     try:
@@ -812,6 +944,14 @@ def gstreamer_main(connection, pool, shutdown_event):
                 print(
                     f"[DEBUG][CAMERA] Camera channel {pipeline.channel} failed after "
                     f"{MAX_PIPELINE_ATTEMPTS} attempts"
+                )
+                pipeline._report_pipeline_error(
+                    pipeline.last_pipeline_error
+                    or (
+                        f"Camera channel {pipeline.channel} failed after "
+                        f"{MAX_PIPELINE_ATTEMPTS} attempts with the "
+                        f"{pipeline.current_decoder_backend.name} pipeline"
+                    )
                 )
                 pipeline.connected = False
                 pipeline._fail_manual_snapshot("Camera pipeline failed before taking the snapshot")

@@ -42,6 +42,11 @@ camera is reported closed.
 
 Set `SEGCOM_CAMERA_DECODER=rtx`, `orin`, or `cpu` to request a path explicitly.
 Hardware requests still fall back to CPU when their elements are missing.
+The explicit pipeline selected in the Calibration tab is stricter: missing
+plugins or a pipeline construction/startup failure is shown as an error instead
+of falling back to a different decoder. The ARM/Jetson option is rejected on a
+computer that is not detected as an NVIDIA Jetson, even if similarly named
+plugins happen to be installed.
 
 ## Pipeline shape
 

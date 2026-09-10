@@ -136,6 +136,7 @@ class CameraPipelinePolicyTests(unittest.TestCase):
         elements = {*RTX_BACKEND.required_elements, *CPU_BACKEND.required_elements}
         backends = available_decoder_backends(
             factory_find=lambda name: object() if name in elements else None,
+            factory_make=lambda name: object() if name in elements else None,
             jetson=False,
         )
         self.assertEqual([backend.name for backend in backends], ["rtx", "cpu"])
@@ -144,6 +145,7 @@ class CameraPipelinePolicyTests(unittest.TestCase):
         elements = {*ORIN_BACKEND.required_elements, *CPU_BACKEND.required_elements}
         backends = available_decoder_backends(
             factory_find=lambda name: object() if name in elements else None,
+            factory_make=lambda name: object() if name in elements else None,
             jetson=True,
         )
         self.assertEqual([backend.name for backend in backends], ["orin", "cpu"])
@@ -153,13 +155,37 @@ class CameraPipelinePolicyTests(unittest.TestCase):
         backends = available_decoder_backends(
             "rtx",
             factory_find=lambda name: object() if name in elements else None,
+            factory_make=lambda name: object() if name in elements else None,
         )
         self.assertEqual(backends, (CPU_BACKEND,))
+
+    def test_strict_requested_hardware_decoder_reports_missing_elements(self):
+        elements = set(CPU_BACKEND.required_elements)
+        with self.assertRaisesRegex(RuntimeError, "Missing GStreamer element"):
+            available_decoder_backends(
+                "rtx",
+                factory_find=lambda name: object() if name in elements else None,
+                factory_make=lambda name: object() if name in elements else None,
+                jetson=False,
+                strict=True,
+            )
+
+    def test_strict_arm_decoder_is_rejected_off_jetson(self):
+        elements = set(ORIN_BACKEND.required_elements)
+        with self.assertRaisesRegex(RuntimeError, "requires an NVIDIA Jetson"):
+            available_decoder_backends(
+                "orin",
+                factory_find=lambda name: object() if name in elements else None,
+                factory_make=lambda name: object() if name in elements else None,
+                jetson=False,
+                strict=True,
+            )
 
     def test_available_hardware_decoder_does_not_require_cpu_plugin(self):
         elements = set(RTX_BACKEND.required_elements)
         backends = available_decoder_backends(
             factory_find=lambda name: object() if name in elements else None,
+            factory_make=lambda name: object() if name in elements else None,
             jetson=False,
         )
         self.assertEqual(backends, (RTX_BACKEND,))

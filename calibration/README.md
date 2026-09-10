@@ -11,16 +11,21 @@ alignment.
 
 ## Components
 
-- `display.py` creates one persistent Pygame canvas. It advances timestamped QR
-  codes clockwise through the four quadrants at 60 Hz by default, keeps two QR
-  codes visible, underlines the newest code, and records presentation timing in
-  `display_timestamps.jsonl`. Press `P` to pause or resume.
+- `display_qt.py` creates one persistent Qt/OpenGL window. It advances
+  timestamped QR codes through a selectable 4, 6, 8, 9, 10, or 12-cell grid at
+  the selected monitor's refresh rate, keeps the selected number of recent QR
+  codes visible,
+  underlines the newest code, and records swap timing in
+  `display_timestamps.jsonl`. Press `P` to
+  pause or resume; `Q`, Escape, and Ctrl+C close it.
 - `qr.py` creates the 12-digit monotonic-millisecond QR payloads and provides
-  QReader decoding, quadrant retries, and clockwise ordering.
+  QReader decoding, per-cell retries, and snake-grid ordering.
 - `recording_display.py` opens the recording inspection window. It decodes the
   undistorted frames, allows PTS, NTP, and QR values to be corrected, validates
-  the displayed sequence and its following replacement, and labels suspect or
-  unknown timing evidence. The default undistortion alpha is `0.25`.
+  every readable value against the display journal and cell, selects the latest
+  valid readable QR, and labels suspect or unknown timing evidence. Missing or
+  unreadable QR codes do not reject a frame when another valid QR is available.
+  The default undistortion alpha is `0.25`.
 - `quantitative_analysis.py` compares correction strategies on clean evidence,
   writes the verdict, and creates all graphs with Matplotlib. PNG is the default;
   vector SVG copies are optional.
@@ -37,9 +42,10 @@ alignment.
    the complete recording, then close it so its journal is flushed.
 2. Open **Visualization** for the recording, or start the root analyzer from a
    terminal.
-3. Review the automatically decoded frames. If scanning stops on invalid
-   evidence, correct the editable PTS, NTP, or QR values only when the recording
-   visibly supports the correction.
+3. Review the automatically decoded frames. Frames without any valid readable
+   QR are skipped; other readable values remain usable even when several grid
+   cells are unreadable. Correct editable PTS, NTP, or QR values only when the
+   recording visibly supports the correction.
 4. Select **Create analysis files**. The button creates only
    `calibration_analysis.json` and `calibration_frames.csv` in a sibling folder
    named `<recording>_analysis`.
@@ -78,8 +84,10 @@ PNG-only default.
 The QR display can also be started directly:
 
 ```bash
-python3 -m calibration.display
-python3 -m calibration.display --windowed --width 1280 --height 720
+python3 -m calibration.display_qt --list-screens
+python3 -m calibration.display_qt --screen 1
+python3 -m calibration.display_qt --screen 1 --grid-qrs 12 --visible-qrs 8
+python3 -m calibration.display_qt --screen 1 --windowed --width 1280 --height 720
 ```
 
 ## Required recording inputs
@@ -164,8 +172,9 @@ bins. Residual ranges are symmetric around zero.
 
 ## Interpreting the verdict safely
 
-- Exclude timing-suspect rows and rows whose following QR replacement timing is
-  unknown. A missing replacement is not evidence of a clean transition.
+- Exclude timing-suspect rows and rows whose QR removal timing is unknown. A QR
+  is removed after the configured number of newer visible codes; missing that
+  replacement evidence is not a clean transition.
 - A recommended correction replaces the existing `109 ms` subtraction; it is
   never added to it.
 - The chronological holdout tests a later portion of the same recording. It is

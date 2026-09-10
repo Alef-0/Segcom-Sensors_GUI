@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
+import json
 import math
 from pathlib import Path
 import signal
@@ -12,13 +13,22 @@ from queue import Empty
 import FreeSimpleGUI as sg
 
 import application_core as base
-from calibration.display import DISPLAY_JOURNAL_NAME, run_calibration_display
+from calibration.qr import GRID_LAYOUTS
 from sensors.camera.camera_gstreamer import gstreamer_main
+from sensors.camera.camera_pipeline import available_decoder_backends
 from sensors.radar.connection_main import create_connection_communication
 from sensors.gps.gps_connection import main as gps_main
 from menu_configurations import Configurations
 from processing.playback.playback import playback_main
 from processing.playback.snapshot_playback import snapshot_playback_main
+
+
+DISPLAY_JOURNAL_NAME = "display_timestamps.jsonl"
+CALIBRATION_DECODER_BACKENDS = {
+    "Usual NVIDIA": "rtx",
+    "ARM / Jetson": "orin",
+    "CPU": "cpu",
+}
 
 
 @dataclass
@@ -33,6 +43,7 @@ class RuntimeState:
     pending_calibration_camera: dict | None = None
     calibration_clock_process: object | None = None
     calibration_clock_stop_event: object | None = None
+    calibration_clock_error_queue: object | None = None
     visualization_process: object | None = None
     process_context: object | None = None
 
@@ -106,6 +117,121 @@ def _camera_recording_rate(values):
     return frames_per_30
 
 
+def _calibration_decoder_backend(values):
+    label = str(values.get("calibration_decoder", "Usual NVIDIA")).strip()
+    try:
+        return CALIBRATION_DECODER_BACKENDS[label]
+    except KeyError as error:
+        choices = ", ".join(CALIBRATION_DECODER_BACKENDS)
+        raise ValueError(f"Select a camera pipeline: {choices}") from error
+
+
+def _calibration_screen_index(values):
+    selection = str(values.get("calibration_screen", "0")).strip()
+    try:
+        index = int(selection.split(":", 1)[0])
+    except ValueError as error:
+        raise ValueError("Select a valid QR display monitor") from error
+    if index < 0:
+        raise ValueError("Select a valid QR display monitor")
+    return index
+
+
+def _calibration_grid_qrs(values):
+    try:
+        grid_qrs = int(str(values.get("calibration_grid_qrs", "4")).strip())
+    except ValueError as error:
+        raise ValueError("QR grid amount must be a whole number") from error
+    if grid_qrs not in GRID_LAYOUTS:
+        choices = ", ".join(str(value) for value in GRID_LAYOUTS)
+        raise ValueError(f"QR grid amount must be one of: {choices}")
+    return grid_qrs
+
+
+def _calibration_visible_qrs(values, grid_qrs=4):
+    try:
+        visible_qrs = int(str(values.get("calibration_visible_qrs", "2")).strip())
+    except ValueError as error:
+        raise ValueError(
+            f"Visible QR codes must be a whole number from 1 to {grid_qrs}"
+        ) from error
+    if not 1 <= visible_qrs <= grid_qrs:
+        raise ValueError(f"Visible QR codes must be from 1 to {grid_qrs}")
+    return visible_qrs
+
+
+def _validate_calibration_decoder(values):
+    decoder_backend = _calibration_decoder_backend(values)
+    available_decoder_backends(decoder_backend, strict=True)
+    return decoder_backend
+
+
+def _set_transposition(active, config, send_radar, send_cam, message=None):
+    active = bool(active)
+    if active:
+        config.window["choose_2"].update(value=True)
+        send_radar.send(("choose", 2))
+        send_cam.send(("choose", 2))
+    payload = {"active": active}
+    send_radar.send(("transposition", payload))
+    send_cam.send(("transposition", payload))
+    config.change_transposition(active, message)
+
+
+def _qt_screen_choices():
+    """Read Qt's monitor order in a disposable process, before creating Tk."""
+    command = [
+        sys.executable,
+        "-m",
+        "calibration.display_qt",
+        "--list-screens-json",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        catalog = json.loads(completed.stdout.strip().splitlines()[-1])
+        if completed.returncode == 0 and catalog:
+            return [
+                (
+                    f"{item['index']}: {item['name']} @ "
+                    f"{item['refresh_hz']:.3f} Hz"
+                )
+                for item in catalog
+            ]
+    except (IndexError, json.JSONDecodeError, KeyError, OSError, subprocess.TimeoutExpired):
+        pass
+    # Still allow an external screen to be selected if discovery is unavailable.
+    return [
+        "0: Primary @ unknown Hz",
+        "1: Monitor 2 @ unknown Hz",
+        "2: Monitor 3 @ unknown Hz",
+        "3: Monitor 4 @ unknown Hz",
+    ]
+
+
+def _run_calibration_clock_process(stop_event, error_queue, display_options):
+    try:
+        from calibration.display_qt import run_calibration_display
+
+        exit_code = run_calibration_display(stop_event, **display_options)
+        if exit_code:
+            raise RuntimeError(f"Qt display exited with status {exit_code}")
+    except KeyboardInterrupt:
+        return
+    except BaseException as error:
+        message = str(error).strip() or type(error).__name__
+        try:
+            error_queue.put(message, timeout=0.5)
+        except Exception:
+            pass
+        raise
+
+
 def _request_calibration_camera(
     values,
     config,
@@ -128,6 +254,7 @@ def _request_calibration_camera(
     try:
         pipeline_latency_ms, adjustment_ms = _camera_latency_settings(values)
         recording_frames_per_30 = _camera_recording_rate(values)
+        decoder_backend = _calibration_decoder_backend(values)
     except ValueError as error:
         config.show_calibration_error(str(error))
         return
@@ -137,6 +264,7 @@ def _request_calibration_camera(
         "pipeline_latency_ms": pipeline_latency_ms,
         "latency_adjustment_ms": adjustment_ms,
         "recording_frames_per_30": recording_frames_per_30,
+        "decoder_backend": decoder_backend,
     }
     if config.recording or config.recording_pending:
         base._request_recording_stop(config, runtime, send_cam)
@@ -170,6 +298,8 @@ def _maybe_open_calibration_camera(config, runtime, send_cam):
         return
     runtime.pending_calibration_camera = None
     recording_frames_per_30 = payload.pop("recording_frames_per_30")
+    decoder_backend = payload.pop("decoder_backend")
+    send_cam.send(("camera_decoder_backend", {"backend": decoder_backend}))
     send_cam.send(("camera_latency_settings", payload))
     send_cam.send((
         "camera_recording_rate",
@@ -181,6 +311,15 @@ def _maybe_open_calibration_camera(config, runtime, send_cam):
 def _start_calibration_clock(values, config, runtime):
     process = runtime.calibration_clock_process
     if process is not None and process.is_alive():
+        return
+
+    try:
+        screen_index = _calibration_screen_index(values)
+        grid_qrs = _calibration_grid_qrs(values)
+        visible_qrs = _calibration_visible_qrs(values, grid_qrs)
+        _validate_calibration_decoder(values)
+    except (RuntimeError, ValueError) as error:
+        config.show_calibration_error(str(error))
         return
 
     recording_root = None
@@ -207,20 +346,27 @@ def _start_calibration_clock(values, config, runtime):
         journal_path = str(folder / DISPLAY_JOURNAL_NAME)
 
     stop_event = runtime.process_context.Event()
+    error_queue = runtime.process_context.Queue(1)
     process = runtime.process_context.Process(
-        target=run_calibration_display,
-        args=(stop_event,),
-        kwargs={"journal_path": journal_path},
+        target=_run_calibration_clock_process,
+        args=(stop_event, error_queue, {
+            "journal_path": journal_path,
+            "screen_index": screen_index,
+            "visible_qrs": visible_qrs,
+            "grid_qrs": grid_qrs,
+        }),
         name="calibration-clock",
     )
     try:
         process.start()
     except (OSError, RuntimeError) as error:
+        error_queue.close()
         runtime.calibration_prepared_folder = None
         config.show_calibration_error(f"Could not start QR display: {error}")
         return
     runtime.calibration_clock_process = process
     runtime.calibration_clock_stop_event = stop_event
+    runtime.calibration_clock_error_queue = error_queue
     config.change_calibration_clock(True)
 
     if not (config.calibration_camera and config.connected_cam):
@@ -247,8 +393,16 @@ def _service_calibration(config, runtime, send_cam):
     process = runtime.calibration_clock_process
     if process is not None and not process.is_alive():
         process.join(timeout=0.1)
+        error_message = None
+        if runtime.calibration_clock_error_queue is not None:
+            try:
+                error_message = runtime.calibration_clock_error_queue.get_nowait()
+            except Empty:
+                pass
+            runtime.calibration_clock_error_queue.close()
         runtime.calibration_clock_process = None
         runtime.calibration_clock_stop_event = None
+        runtime.calibration_clock_error_queue = None
         runtime.calibration_recording_deadline = None
         runtime.calibration_recording_root = None
         runtime.calibration_prepared_folder = None
@@ -257,7 +411,8 @@ def _service_calibration(config, runtime, send_cam):
         config.change_calibration_clock(False)
         if process.exitcode:
             config.show_calibration_error(
-                "The QR display stopped with an error; check the terminal output."
+                error_message
+                or "The QR display stopped with an error; check the terminal output."
             )
 
     deadline = runtime.calibration_recording_deadline
@@ -396,10 +551,33 @@ def _handle_gui_event(
     send_radar, send_cam, send_gps, send_playback, send_snapshot_playback,
     shutdown_event,
 ):
+    if event == "calibration_grid_qrs":
+        config.change_calibration_qr_grid(
+            values.get("calibration_grid_qrs", 4),
+            values.get("calibration_visible_qrs", 2),
+        )
+        return
+    if event == "transposition_toggle":
+        _set_transposition(
+            not config.transposition,
+            config,
+            send_radar,
+            send_cam,
+        )
+        return
+    if (
+        isinstance(event, str)
+        and event.startswith("choose_")
+        and event != "choose_2"
+        and config.transposition
+    ):
+        _set_transposition(False, config, send_radar, send_cam)
     if event == "visualization_open":
         _start_calibration_visualization(values, config, runtime)
         return
     if event == "snapshot_playback_toggle":
+        if not config.snapshot_playback and config.transposition:
+            _set_transposition(False, config, send_radar, send_cam)
         _request_snapshot_playback(
             values, config, runtime, send_radar, send_cam, send_snapshot_playback
         )
@@ -482,6 +660,8 @@ def _handle_gui_event(
         send_snapshot_playback.send(("camera_latency_adjustment", payload))
         return
     if event == "calibration_camera_toggle":
+        if not config.calibration_camera and config.transposition:
+            _set_transposition(False, config, send_radar, send_cam)
         _request_calibration_camera(
             values,
             config,
@@ -506,6 +686,9 @@ def _handle_gui_event(
     if event == "calibration_clock_start":
         _start_calibration_clock(values, config, runtime)
         return
+
+    if event == "playback_toggle" and not config.playback and config.transposition:
+        _set_transposition(False, config, send_radar, send_cam)
 
     base._handle_gui_event(
         event, values, config, runtime,
@@ -563,6 +746,19 @@ def _apply_status_message(
         return
     if message == "camera_latency_error":
         config.show_calibration_error(payload)
+        return
+    if message == "camera_pipeline_error":
+        config.show_calibration_error(payload)
+        return
+    if message == "transposition_state":
+        config.change_transposition(
+            payload.get("active"),
+            payload.get("message"),
+        )
+        return
+    if message == "transposition_error":
+        send_radar.send(("transposition", {"active": False}))
+        config.change_transposition(False, f"ERROR · {payload}")
         return
     if message == "camera_recording_rate_state":
         config.change_recording_rate(payload["frames_per_30"])
@@ -643,6 +839,11 @@ def _stop_calibration_clock(runtime):
     if process.is_alive():
         process.terminate()
         process.join(timeout=1.0)
+    if runtime.calibration_clock_error_queue is not None:
+        runtime.calibration_clock_error_queue.close()
+    runtime.calibration_clock_process = None
+    runtime.calibration_clock_stop_event = None
+    runtime.calibration_clock_error_queue = None
 
 
 def main():
@@ -656,6 +857,7 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     sg.set_options(font=("Helvetica", 12))
     all_queue = process_context.Queue(128)
+    transposition_channel = process_context.Queue(1)
 
     receive_radar, send_radar = process_context.Pipe()
     receive_cam, send_cam = process_context.Pipe()
@@ -663,7 +865,7 @@ def main():
     receive_playback, send_playback = process_context.Pipe()
     receive_snapshot_playback, send_snapshot_playback = process_context.Pipe()
 
-    config = Configurations()
+    config = Configurations(calibration_screens=_qt_screen_choices())
     _, values = config.read()
     runtime = RuntimeState()
     runtime.process_context = process_context
@@ -671,11 +873,22 @@ def main():
     processes = [
         process_context.Process(
             target=create_connection_communication,
-            args=(values, receive_radar, all_queue, shutdown_event),
+            args=(
+                values,
+                receive_radar,
+                all_queue,
+                shutdown_event,
+                transposition_channel,
+            ),
         ),
         process_context.Process(
             target=gstreamer_main,
-            args=(receive_cam, all_queue, shutdown_event),
+            args=(
+                receive_cam,
+                all_queue,
+                shutdown_event,
+                transposition_channel,
+            ),
         ),
         process_context.Process(
             target=gps_main,
@@ -702,12 +915,15 @@ def main():
     finally:
         _stop_calibration_clock(runtime)
         _stop_visualization(runtime)
-        base._shutdown(
-            processes,
-            (send_radar, send_cam, send_gps, send_playback, send_snapshot_playback),
-            config,
-            shutdown_event,
-        )
+        try:
+            base._shutdown(
+                processes,
+                (send_radar, send_cam, send_gps, send_playback, send_snapshot_playback),
+                config,
+                shutdown_event,
+            )
+        finally:
+            transposition_channel.close()
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 import csv
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
@@ -10,14 +11,22 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
-import pygame
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PySide6.QtGui import QGuiApplication
 
 import analyze_calibration_recording as recording_launcher
-from calibration.display import QRClockRenderer, VISIBLE_QRS
+from calibration.display_qt import QRClockRenderer, VISIBLE_QRS
 from calibration.quantitative_analysis import analyze_output_directory
 from calibration.qr import (
+    GRID_LAYOUTS,
     QUIET_ZONE_MODULES,
+    cell_index_for,
     decode_qrs_with_quadrant_retries,
+    grid_bounds,
+    grid_cell_names,
+    grid_positions,
+    grid_shape,
     order_by_quadrant,
     qr_matrix,
     timestamp_payload,
@@ -100,18 +109,59 @@ class QRHelpersTests(unittest.TestCase):
         self.assertEqual([item["raw"] for item in ordered], ["1", "2", "3", "4"])
         self.assertEqual(reader.calls, [(100, 100), (50, 50)])
 
+    def test_supported_grid_shapes_and_snake_order(self):
+        self.assertEqual(tuple(GRID_LAYOUTS), (4, 6, 8, 9, 10, 12))
+        self.assertEqual(grid_shape(6), (2, 3))
+        self.assertEqual(
+            grid_positions(6),
+            ((0, 0), (0, 1), (0, 2), (1, 2), (1, 1), (1, 0)),
+        )
+        self.assertEqual(cell_index_for((90, 75), (120, 100), 6), 3)
+        self.assertEqual(grid_cell_names(4)[2], "Bottom-right")
+
     def test_renderer_keeps_exactly_two_quadrants(self):
-        renderer = QRClockRenderer(pygame.Surface((960, 540)))
+        self.qt_app = QGuiApplication.instance() or QGuiApplication(["qr-test"])
+        renderer = QRClockRenderer(960, 540)
         for index in range(4):
-            renderer.render_next(10_000_000_000 + index * 20_000_000)
+            renderer.render_next(
+                10_000_000_000 + index * 20_000_000,
+                index,
+            )
         self.assertEqual(VISIBLE_QRS, 2)
         self.assertEqual(sum(value is not None for value in renderer.timestamps), 2)
         self.assertEqual(renderer.metadata()["visible_qrs"], 2)
 
+    def test_renderer_respects_selected_visible_qr_count(self):
+        self.qt_app = QGuiApplication.instance() or QGuiApplication(["qr-test"])
+        renderer = QRClockRenderer(1920, 1080, visible_qrs=6, grid_qrs=12)
+        for index in range(14):
+            renderer.render_next(10_000_000_000 + index * 20_000_000, index)
+        self.assertEqual(sum(value is not None for value in renderer.timestamps), 6)
+        self.assertEqual(renderer.metadata()["visible_qrs"], 6)
+        self.assertEqual(renderer.metadata()["grid_qrs"], 12)
+        self.assertEqual(renderer.metadata()["grid_columns"], 6)
+
+    def test_qr_areas_are_shifted_away_from_timestamp_labels(self):
+        self.qt_app = QGuiApplication.instance() or QGuiApplication(["qr-test"])
+        renderer = QRClockRenderer(1920, 1080)
+        for area, underline, qr in zip(
+            renderer.areas,
+            renderer.underlines,
+            renderer.qr_rects,
+        ):
+            self.assertGreater(qr.top(), underline.bottom())
+            self.assertGreaterEqual(qr.left(), area.left())
+            self.assertLessEqual(qr.right(), area.right())
+            self.assertLessEqual(qr.bottom(), area.bottom())
+
 
 class RecordingTests(unittest.TestCase):
-    def fixture(self, folder: Path, count=5, legacy=False):
+    def fixture(self, folder: Path, count=5, legacy=False, grid_qrs=4, visible_qrs=2):
         rows = display_rows(count)
+        rows[0].update({"grid_qrs": grid_qrs, "visible_qrs": visible_qrs})
+        for index, row in enumerate(rows[1:]):
+            row["cell"] = index % grid_qrs
+            row["corner"] = row["cell"]
         (folder / "display_timestamps.jsonl").write_text(
             "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
         )
@@ -141,10 +191,10 @@ class RecordingTests(unittest.TestCase):
     def test_timeline_checks_following_replacement(self):
         with TemporaryDirectory() as temporary:
             folder = Path(temporary)
-            rows = self.fixture(folder)
+            rows = self.fixture(folder, count=6)
             timeline = DisplayTimeline(folder)
             self.assertEqual(timeline.marker_status(2), ("Clean", []))
-            rows[4]["late_submit"] = True
+            rows[5]["late_submit"] = True
             (folder / "display_timestamps.jsonl").write_text(
                 "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
             )
@@ -153,7 +203,7 @@ class RecordingTests(unittest.TestCase):
             self.assertEqual(status, "Timing suspect")
             self.assertIn("replacement_late_submission", issues)
 
-    def test_qreader_box_is_matched_and_quadrant_mismatch_is_reported(self):
+    def test_qreader_box_is_matched_and_grid_cell_mismatch_is_reported(self):
         with TemporaryDirectory() as temporary:
             folder = Path(temporary)
             rows = self.fixture(folder)
@@ -163,41 +213,98 @@ class RecordingTests(unittest.TestCase):
             result = model.analyze(0)
             self.assertEqual(result["latest"]["display_index"], marker["index"])
             self.assertTrue(result["latest"]["mismatch"])
-            self.assertEqual(result["latest"]["status"], "Quadrant mismatch")
+            self.assertEqual(result["latest"]["status"], "Grid cell mismatch")
 
-    def test_four_values_must_form_one_clockwise_consecutive_sequence(self):
+    def test_partial_grid_values_choose_the_latest_readable_marker(self):
         with TemporaryDirectory() as temporary:
-            model, frames = self.four_value_model(Path(temporary), count=9)
+            folder = Path(temporary)
+            rows = self.fixture(folder, count=14, grid_qrs=12, visible_qrs=8)
+            frames = rows[1:]
+            model = RecordingAnalyzer(
+                folder,
+                DEFAULT_INTRINSICS,
+                reader=FakeReader([], []),
+            )
             result = model.analyze(0)
-            self.assertTrue(model.check_frame(result)["valid"])
+            qrs = [None] * 12
+            for cell in (0, 5, 11):
+                qrs[cell] = timestamp_payload(frames[cell]["marker_ns"])
             model.set_manual_values(0, {
                 "pts_ns": result["row"]["pts_ns"],
                 "ntp_ns": result["row"]["reference_ntp_ns"],
-                "qrs": (
-                    timestamp_payload(frames[8]["marker_ns"]),
-                    timestamp_payload(frames[1]["marker_ns"]),
-                    timestamp_payload(frames[2]["marker_ns"]),
-                    timestamp_payload(frames[3]["marker_ns"]),
-                ),
+                "qrs": tuple(qrs),
             })
             check = model.check_frame(result)
-            self.assertFalse(check["valid"])
-            self.assertIn("not one consecutive clockwise sequence", check["reason"])
+            self.assertTrue(check["valid"])
+            self.assertEqual(check["matched_readable_qrs"], 3)
+            self.assertEqual(check["latest_cell"], 11)
+            self.assertEqual(check["latest_marker"]["index"], 11)
 
-    def test_scan_skips_frame_with_missing_quadrant(self):
+    def test_twelve_cell_recording_uses_journal_grid_for_automatic_detections(self):
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            rows = self.fixture(folder, count=14, grid_qrs=12, visible_qrs=12)
+            frames = rows[1:]
+            selected_cells = (0, 5, 11)
+            boxes = []
+            for cell in selected_cells:
+                left, top, right, bottom = grid_bounds(100, 100, 12)[cell]
+                boxes.append([left + 2, top + 2, right - 2, bottom - 2])
+            reader = FakeReader(
+                [timestamp_payload(frames[cell]["marker_ns"]) for cell in selected_cells],
+                boxes,
+            )
+            model = RecordingAnalyzer(folder, DEFAULT_INTRINSICS, reader=reader)
+
+            check = model.check_frame(model.analyze(0))
+
+            self.assertTrue(check["valid"])
+            self.assertEqual(check["matched_readable_qrs"], 3)
+            self.assertEqual(check["latest_cell"], 11)
+            self.assertEqual(check["latest_marker"]["index"], 11)
+
+    def test_scan_accepts_any_amount_of_missing_qrs_when_one_matches(self):
         with TemporaryDirectory() as temporary:
             folder = Path(temporary)
             rows = self.fixture(folder)
             frames = rows[1:]
             reader = FakeReader(
-                [timestamp_payload(frames[index]["marker_ns"]) for index in (4, 1, 2)],
-                [[10, 10, 30, 30], [60, 10, 80, 30], [60, 60, 80, 80]],
+                [
+                    *[timestamp_payload(frames[index]["marker_ns"]) for index in (4, 1, 2)],
+                    None,
+                ],
+                [
+                    [10, 10, 30, 30], [60, 10, 80, 30],
+                    [60, 60, 80, 80], [10, 60, 30, 80],
+                ],
             )
             model = RecordingAnalyzer(folder, DEFAULT_INTRINSICS, reader=reader)
             report = model.summarize(0.25, threading.Event(), lambda *_: None)
             self.assertEqual(report["processed"], 1)
             self.assertIsNone(report["stopped"])
-            self.assertEqual(report["counts"]["skipped_incomplete_frames"], 1)
+            self.assertEqual(report["counts"]["accepted_frames"], 1)
+            self.assertEqual(report["counts"]["unreadable"], 1)
+            self.assertEqual(report["frames"][0]["matched_readable_qrs"], 3)
+            self.assertEqual(report["frames"][0]["latest_display_index"], 4)
+            self.assertEqual(
+                report["readability"]["frames_by_matched_readable_qr_count"],
+                {"3": 1},
+            )
+
+    def test_scan_skips_only_when_no_readable_qr_matches(self):
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            self.fixture(folder)
+            model = RecordingAnalyzer(
+                folder,
+                DEFAULT_INTRINSICS,
+                reader=FakeReader([], []),
+            )
+            report = model.summarize(0.25, threading.Event(), lambda *_: None)
+            self.assertEqual(report["processed"], 1)
+            self.assertIsNone(report["stopped"])
+            self.assertEqual(report["counts"]["frames_without_readable_qr"], 1)
+            self.assertEqual(report["frames"][0]["validation"], "skipped_no_readable_qr")
 
     def test_analysis_results_are_saved_beside_recording(self):
         with TemporaryDirectory() as temporary:
@@ -215,7 +322,7 @@ class RecordingTests(unittest.TestCase):
             loaded = json.loads(json_path.read_text(encoding="utf-8"))
             self.assertEqual(loaded["counts"]["accepted_frames"], 1)
             self.assertEqual(loaded["frames"][0]["validation"], "accepted_unknown")
-            self.assertIn("qr_top_left_ms", csv_path.read_text(encoding="utf-8"))
+            self.assertIn("qr_values_ms", csv_path.read_text(encoding="utf-8"))
 
     def test_legacy_calibration_journal_and_loose_image_remain_readable(self):
         with TemporaryDirectory() as temporary:

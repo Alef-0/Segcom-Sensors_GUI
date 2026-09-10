@@ -64,9 +64,11 @@ def available_decoder_backends(
     preference: str | None = None,
     *,
     factory_find: Callable[[str], object | None] = Gst.ElementFactory.find,
+    factory_make: Callable[[str], object | None] = Gst.ElementFactory.make,
     jetson: bool | None = None,
+    strict: bool = False,
 ) -> tuple[CameraDecoderBackend, ...]:
-    """Return usable decoders in preferred order, with CPU as a fallback if present."""
+    """Return usable decoders, optionally requiring the explicit preference."""
 
     requested = (preference or os.getenv(DECODER_ENVIRONMENT_VARIABLE, "auto")).lower()
     if requested not in (*BACKENDS, "auto"):
@@ -76,8 +78,14 @@ def available_decoder_backends(
         )
         requested = "auto"
 
+    use_jetson_order = is_jetson_platform() if jetson is None else jetson
+    if strict and requested == ORIN_BACKEND.name and not use_jetson_order:
+        raise RuntimeError(
+            "The selected ARM / Jetson camera pipeline requires an NVIDIA "
+            "Jetson platform; this computer is not detected as a Jetson"
+        )
+
     if requested == "auto":
-        use_jetson_order = is_jetson_platform() if jetson is None else jetson
         order = (ORIN_BACKEND, RTX_BACKEND, CPU_BACKEND) if use_jetson_order else (
             RTX_BACKEND,
             ORIN_BACKEND,
@@ -85,21 +93,38 @@ def available_decoder_backends(
         )
     else:
         selected = BACKENDS[requested]
-        order = (selected,) if selected is CPU_BACKEND else (selected, CPU_BACKEND)
+        order = (
+            (selected,)
+            if strict or selected is CPU_BACKEND
+            else (selected, CPU_BACKEND)
+        )
 
     available = []
+    requested_missing = []
     for backend in order:
         if backend in available:
             continue
-        if all(factory_find(element) is not None for element in backend.required_elements):
+        missing = [
+            element
+            for element in backend.required_elements
+            if factory_find(element) is None or factory_make(element) is None
+        ]
+        if not missing:
             available.append(backend)
         elif requested == backend.name:
-            print(
-                f"[DEBUG][CAMERA] Requested {backend.name} decoder is unavailable; "
-                "trying the available fallback"
-            )
+            requested_missing = missing
+            if not strict:
+                print(
+                    f"[DEBUG][CAMERA] Requested {backend.name} decoder is unavailable; "
+                    "trying the available fallback"
+                )
 
     if not available:
+        if requested in BACKENDS and requested_missing:
+            raise RuntimeError(
+                f"The selected {requested} camera pipeline is unavailable. "
+                "Missing GStreamer element(s): " + ", ".join(requested_missing)
+            )
         raise RuntimeError("No usable GStreamer H.264 decoder backend is available")
     return tuple(available)
 

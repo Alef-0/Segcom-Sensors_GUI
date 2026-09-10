@@ -630,17 +630,21 @@ def analyze_output_directory(
     for row in evidence:
         validation_counts[row.validation] = validation_counts.get(row.validation, 0) + 1
     display = source.get("display") if isinstance(source.get("display"), dict) else {}
+    incomplete_frames = (
+        validation_counts.get("skipped_incomplete", 0)
+        + validation_counts.get("skipped_no_readable_qr", 0)
+    )
     quality = {
         "processed_frames": len(evidence),
         "clean_frames": len(clean),
         "clean_pct": 100 * len(clean) / len(evidence),
         "timing_suspect_frames": validation_counts.get("accepted_timing_suspect", 0),
         "unknown_timing_frames": validation_counts.get("accepted_unknown", 0),
-        "incomplete_frames": validation_counts.get("skipped_incomplete", 0),
+        "incomplete_frames": incomplete_frames,
         "other_excluded_frames": len(evidence) - len(clean)
         - validation_counts.get("accepted_timing_suspect", 0)
         - validation_counts.get("accepted_unknown", 0)
-        - validation_counts.get("skipped_incomplete", 0),
+        - incomplete_frames,
         "validation_counts": validation_counts,
         "display_late_submissions": int(display.get("late_submissions", 0)),
         "display_irregular_intervals": int(display.get("irregular_intervals", 0)),

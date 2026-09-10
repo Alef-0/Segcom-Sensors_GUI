@@ -10,6 +10,15 @@ import main
 
 
 class CalibrationWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        validation = patch.object(
+            main,
+            "_validate_calibration_decoder",
+            return_value="rtx",
+        )
+        validation.start()
+        self.addCleanup(validation.stop)
+
     def fixture(self):
         process = Mock()
         process.is_alive.return_value = True
@@ -31,8 +40,12 @@ class CalibrationWorkflowTests(unittest.TestCase):
             destination = Path(runtime.calibration_prepared_folder)
             self.assertTrue(destination.is_dir())
             arguments = runtime.process_context.Process.call_args.kwargs
-            self.assertEqual(arguments["kwargs"]["journal_path"], str(destination / "display_timestamps.jsonl"))
-            self.assertNotIn("visible_frames", arguments["kwargs"])
+            display_options = arguments["args"][2]
+            self.assertEqual(display_options["journal_path"], str(destination / "display_timestamps.jsonl"))
+            self.assertEqual(display_options["screen_index"], 0)
+            self.assertEqual(display_options["visible_qrs"], 2)
+            self.assertEqual(display_options["grid_qrs"], 4)
+            self.assertNotIn("visible_frames", display_options)
             main._service_calibration(config, runtime, camera)
             camera.send.assert_not_called()
             with patch.object(main.time, "monotonic", return_value=103):
@@ -82,6 +95,143 @@ class CalibrationWorkflowTests(unittest.TestCase):
         button = next(element for element in controls
                       if getattr(element, "Key", None) == "calibration_clock_start")
         self.assertEqual(button.ButtonText, "START QR CALIBRATION")
+        self.assertTrue(any(getattr(element, "Key", None) == "calibration_decoder"
+                            for element in controls))
+        self.assertTrue(any(getattr(element, "Key", None) == "calibration_screen"
+                            for element in controls))
+        self.assertTrue(any(getattr(element, "Key", None) == "calibration_visible_qrs"
+                            for element in controls))
+        self.assertTrue(any(getattr(element, "Key", None) == "calibration_grid_qrs"
+                            for element in controls))
+        self.assertFalse(any(type(element).__name__ == "VerticalSeparator"
+                             for element in controls))
+
+    def test_calibration_settings_use_narrow_grouped_rows(self):
+        layout = main.Configurations._create_calibration_layout()
+        first_row_keys = {getattr(element, "Key", None) for element in layout[0]}
+        second_row_keys = {getattr(element, "Key", None) for element in layout[1]}
+        third_row_keys = {getattr(element, "Key", None) for element in layout[2]}
+
+        self.assertTrue({
+            "calibration_latency_apply",
+        }.issubset(first_row_keys))
+        self.assertTrue({
+            "calibration_latency_status",
+            "calibration_decoder",
+        }.issubset(second_row_keys))
+        self.assertTrue({
+            "calibration_screen",
+            "calibration_grid_qrs",
+            "calibration_visible_qrs",
+        }.issubset(third_row_keys))
+
+    def test_transposition_control_selects_group_b_and_notifies_both_workers(self):
+        config = SimpleNamespace(
+            window={"choose_2": Mock()},
+            change_transposition=Mock(),
+        )
+        radar = Mock()
+        camera = Mock()
+
+        main._set_transposition(True, config, radar, camera)
+
+        config.window["choose_2"].update.assert_called_once_with(value=True)
+        self.assertEqual(radar.send.call_args_list[0].args[0], ("choose", 2))
+        self.assertEqual(camera.send.call_args_list[0].args[0], ("choose", 2))
+        radar.send.assert_called_with(("transposition", {"active": True}))
+        camera.send.assert_called_with(("transposition", {"active": True}))
+        config.change_transposition.assert_called_once_with(True, None)
+
+    def test_radar_controls_include_transposition_tab(self):
+        config = main.Configurations.__new__(main.Configurations)
+        config.create_filters()
+
+        self.assertEqual(config.filters.Title, "Radar controls")
+        controls = [
+            element
+            for row in config._create_transposition_layout()
+            for element in row
+        ]
+        self.assertTrue(any(
+            getattr(element, "Key", None) == "transposition_toggle"
+            for element in controls
+        ))
+
+    def test_monitor_choices_only_show_index_name_and_refresh_rate(self):
+        catalog = [{
+            "index": 1,
+            "name": "HDMI-1",
+            "width": 1920,
+            "height": 1080,
+            "refresh_hz": 144.0,
+            "primary": True,
+        }]
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout=f"{main.json.dumps(catalog)}\n",
+        )
+
+        with patch.object(main.subprocess, "run", return_value=completed):
+            self.assertEqual(
+                main._qt_screen_choices(),
+                ["1: HDMI-1 @ 144.000 Hz"],
+            )
+
+    def test_selected_decoder_is_sent_before_opening_calibration_camera(self):
+        config = SimpleNamespace(
+            connected_radar=False,
+            recording=False,
+            recording_pending=False,
+            playback=False,
+            playback_pending=False,
+            snapshot_playback=False,
+            snapshot_playback_pending=False,
+        )
+        runtime = main.RuntimeState(pending_calibration_camera={
+            "pipeline_latency_ms": 145,
+            "latency_adjustment_ms": 109.0,
+            "recording_frames_per_30": 30,
+            "decoder_backend": "orin",
+        })
+        camera = Mock()
+
+        main._maybe_open_calibration_camera(config, runtime, camera)
+
+        self.assertEqual(camera.send.call_args_list[0].args[0], (
+            "camera_decoder_backend", {"backend": "orin"}
+        ))
+        self.assertEqual(camera.send.call_args_list[-1].args[0], (
+            "calibration_camera", {"active": True}
+        ))
+
+    def test_monitor_label_is_converted_to_qt_screen_index(self):
+        self.assertEqual(main._calibration_screen_index({
+            "calibration_screen": "1: HDMI-1 — 1920×1080 @ 144.000 Hz"
+        }), 1)
+
+    def test_grid_and_visible_qr_selections_are_validated_together(self):
+        self.assertEqual(main._calibration_grid_qrs({
+            "calibration_grid_qrs": 12,
+        }), 12)
+        self.assertEqual(main._calibration_visible_qrs({
+            "calibration_visible_qrs": 10,
+        }, 12), 10)
+        with self.assertRaisesRegex(ValueError, "from 1 to 6"):
+            main._calibration_visible_qrs({"calibration_visible_qrs": 7}, 6)
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            main._calibration_grid_qrs({"calibration_grid_qrs": 5})
+
+    def test_grid_change_limits_the_visible_qr_choices(self):
+        config = main.Configurations.__new__(main.Configurations)
+        visible = Mock()
+        config.window = {"calibration_visible_qrs": visible}
+
+        config.change_calibration_qr_grid(6, 10)
+
+        visible.update.assert_called_once_with(
+            values=(1, 2, 3, 4, 5, 6),
+            value=6,
+        )
 
     def test_visualization_launches_single_analyzer_with_only_the_folder(self):
         with TemporaryDirectory(prefix="qr calibration ") as folder:

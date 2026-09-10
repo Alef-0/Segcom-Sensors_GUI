@@ -20,11 +20,14 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from calibration.display import DISPLAY_JOURNAL_NAME, timing_issues
+from calibration.display_qt import DISPLAY_JOURNAL_NAME, timing_issues
 from calibration.qr import (
     create_qreader,
-    decode_qrs_with_quadrant_retries,
-    order_by_quadrant,
+    decode_qrs_with_grid_retries,
+    grid_cell_names,
+    grid_positions,
+    grid_shape,
+    order_by_cell,
     timestamp_payload,
 )
 from processing.recording.paths import IMAGE_DIRECTORY_NAME, resolve_recording_file
@@ -33,9 +36,11 @@ from processing.recording.paths import IMAGE_DIRECTORY_NAME, resolve_recording_f
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INTRINSICS = PROJECT_ROOT / "calibration" / "intrinsics.json"
 CAMERA_JOURNALS = ("camera_timestamps.jsonl", "camera_timestamps.json")
-QUADRANT_COLORS = ("#47d9ff", "#ffc857", "#b8ee69", "#ed9cff")
+CELL_COLORS = (
+    "#47d9ff", "#ffc857", "#b8ee69", "#ed9cff", "#ff8f70", "#8de0a6",
+    "#9eb8ff", "#f4a8d8", "#d8c66b", "#74d8c8", "#c4a4ff", "#ffb36b",
+)
 LATEST_COLOR = "#fff176"
-QUADRANT_NAMES = ("Top-left", "Top-right", "Bottom-right", "Bottom-left")
 
 
 def read_json_rows(path: Path) -> list[dict]:
@@ -83,12 +88,12 @@ def parse_seconds(value: str, label: str) -> int | None:
         raise ValueError(f"{label} must be seconds written as a number") from error
 
 
-def parse_qr_value(value: str, quadrant: str) -> str | None:
+def parse_qr_value(value: str, cell: str) -> str | None:
     text = value.strip()
     if not text:
         return None
     if not text.isdigit() or len(text) > 12:
-        raise ValueError(f"{quadrant} QR must be the integer milliseconds stored in the QR")
+        raise ValueError(f"{cell} QR must be the integer milliseconds stored in the QR")
     return text.zfill(12)
 
 
@@ -145,9 +150,22 @@ class DisplayTimeline:
             raise ValueError(f"Missing {DISPLAY_JOURNAL_NAME}")
         rows = read_json_rows(path)
         self.metadata = next((row for row in rows if row.get("kind") == "session"), None)
-        self.frames = [row for row in rows if row.get("kind") == "frame"]
-        if self.metadata is None or not self.frames:
+        raw_frames = [row for row in rows if row.get("kind") == "frame"]
+        if self.metadata is None or not raw_frames:
             raise ValueError("Display timing journal has no session or frame entries")
+        self.grid_qrs = int(self.metadata.get("grid_qrs", 4))
+        self.grid_rows, self.grid_columns = grid_shape(self.grid_qrs)
+        self.cell_names = grid_cell_names(self.grid_qrs)
+        self.cell_positions = grid_positions(self.grid_qrs)
+        self.visible_qrs = int(self.metadata.get("visible_qrs", min(2, self.grid_qrs)))
+        if not 1 <= self.visible_qrs <= self.grid_qrs:
+            raise ValueError("Display journal has an invalid visible QR count")
+        self.frames = []
+        for frame in raw_frames:
+            cell = frame.get("cell", frame.get("corner"))
+            if not isinstance(cell, int) or not 0 <= cell < self.grid_qrs:
+                raise ValueError("Display journal contains an invalid QR grid cell")
+            self.frames.append({**frame, "cell": cell})
         self.paused = {
             row.get("last_frame_index")
             for row in rows
@@ -173,9 +191,16 @@ class DisplayTimeline:
 
     def marker_status(self, index: int) -> tuple[str, list[str]]:
         current = self.frames[index]
-        following = self.frames[index + 1] if index + 1 < len(self.frames) else None
+        replacement_index = index + self.visible_qrs
+        following = (
+            self.frames[replacement_index]
+            if replacement_index < len(self.frames) else None
+        )
         issues = ["marker_" + issue for issue in timing_issues(current)]
-        if index in self.paused:
+        if any(
+            isinstance(paused_at, int) and index <= paused_at < replacement_index
+            for paused_at in self.paused
+        ):
             issues.append("marker_held_for_pause")
         if following is None:
             issues.append("replacement_evidence_missing")
@@ -194,6 +219,10 @@ class DisplayTimeline:
             "missed_period_candidates": sum(int(row.get("skipped_periods", 0)) for row in self.frames),
             "late_submissions": sum(bool(row.get("late_submit")) for row in self.frames),
             "irregular_intervals": sum(bool(row.get("irregular_interval")) for row in self.frames),
+            "grid_qrs": self.grid_qrs,
+            "grid_rows": self.grid_rows,
+            "grid_columns": self.grid_columns,
+            "visible_qrs": self.visible_qrs,
         }
 
 
@@ -220,6 +249,9 @@ class RecordingAnalyzer:
         if not self.rows:
             raise ValueError("Camera timestamp journal is empty")
         self.timeline = DisplayTimeline(self.folder)
+        self.grid_qrs = self.timeline.grid_qrs
+        self.cell_names = self.timeline.cell_names
+        self.cell_positions = self.timeline.cell_positions
         session_path = self.folder / "camera_timing_session.json"
         self.session = json.loads(session_path.read_text(encoding="utf-8")) if session_path.is_file() else {}
         self.epochs = {
@@ -251,13 +283,24 @@ class RecordingAnalyzer:
             return int(epoch["pipeline_zero_monotonic_ns"]) + int(pts_ns)
         return None
 
-    @staticmethod
-    def detected_qr_values(result: dict) -> tuple[str | None, ...]:
-        by_quadrant = [[] for _ in range(4)]
+    def detected_qr_values(self, result: dict) -> tuple[str | None, ...]:
+        by_cell = [[] for _ in range(self.grid_qrs)]
         for item in result["observations"]:
             if item["raw"] is not None:
-                by_quadrant[item["quadrant"]].append(item["raw"])
-        return tuple(values[0] if len(values) == 1 else None for values in by_quadrant)
+                by_cell[item["cell"]].append(item)
+        values = []
+        for observations in by_cell:
+            matched = [
+                item for item in observations
+                if item["display_index"] is not None and not item["mismatch"]
+            ]
+            if matched:
+                values.append(max(matched, key=lambda item: item["display_index"])["raw"])
+            elif len(observations) == 1:
+                values.append(observations[0]["raw"])
+            else:
+                values.append(None)
+        return tuple(values)
 
     def frame_values(self, result: dict) -> dict:
         if result["index"] in self.manual_values:
@@ -271,6 +314,8 @@ class RecordingAnalyzer:
         }
 
     def set_manual_values(self, index: int, values: dict) -> None:
+        if len(values.get("qrs", ())) != self.grid_qrs:
+            raise ValueError(f"Manual QR values must contain {self.grid_qrs} grid cells")
         self.manual_values[index] = {**values, "manual": True}
 
     def reset_manual_values(self, index: int) -> None:
@@ -282,41 +327,49 @@ class RecordingAnalyzer:
 
     def check_frame(self, result: dict) -> dict:
         values = self.frame_values(result)
-        qrs = values["qrs"]
-        for quadrant, raw in zip(QUADRANT_NAMES, qrs):
-            if raw is None:
-                return {
-                    "valid": False,
-                    "skippable": True,
-                    "reason": f"Missing or multiple {quadrant} QR values",
-                    "values": values,
-                }
-            if not raw.isdigit() or len(raw) != 12:
-                return {"valid": False, "reason": f"Invalid {quadrant} QR value: {raw}", "values": values}
         reference_ns = self.pts_monotonic_for_value(result["row"], values["pts_ns"])
-        markers = []
-        for quadrant, raw in enumerate(qrs):
+        candidates = []
+        ignored = []
+        if values["manual"]:
+            source_values = [
+                {"cell": cell, "raw": raw}
+                for cell, raw in enumerate(values["qrs"])
+                if raw is not None
+            ]
+        else:
+            source_values = result["observations"]
+
+        for item in source_values:
+            raw = item.get("raw")
+            cell = item["cell"]
+            if raw is None:
+                continue
+            if not isinstance(raw, str) or not raw.isdigit() or len(raw) != 12:
+                ignored.append({"cell": cell, "raw": raw, "reason": "invalid_payload"})
+                continue
             marker = self.timeline.match(raw, reference_ns)
             if marker is None:
-                return {"valid": False, "reason": f"{QUADRANT_NAMES[quadrant]} QR is not in the display journal", "values": values}
-            if marker["corner"] != quadrant:
-                return {
-                    "valid": False,
-                    "reason": f"{QUADRANT_NAMES[quadrant]} contains a QR recorded for {QUADRANT_NAMES[marker['corner']]}",
-                    "values": values,
-                }
-            markers.append(marker)
-        indices = [int(marker["index"]) for marker in markers]
-        ordered = sorted(indices)
-        if len(set(indices)) != 4 or ordered != list(range(ordered[0], ordered[0] + 4)):
+                ignored.append({"cell": cell, "raw": raw, "reason": "not_in_display_journal"})
+                continue
+            if marker["cell"] != cell:
+                ignored.append({"cell": cell, "raw": raw, "reason": "cell_mismatch"})
+                continue
+            candidates.append({"cell": cell, "raw": raw, "marker": marker})
+
+        if not candidates:
             return {
                 "valid": False,
-                "reason": "The four QR timings are not one consecutive clockwise sequence",
+                "skippable": True,
+                "reason": "No readable QR matched the display journal and grid cell",
                 "values": values,
-                "indices": indices,
+                "indices": [],
+                "matched_readable_qrs": 0,
+                "ignored_readable_qrs": len(ignored),
+                "decode_issues": ignored,
             }
-        latest_quadrant = max(range(4), key=lambda quadrant: indices[quadrant])
-        latest_marker = markers[latest_quadrant]
+
+        latest = max(candidates, key=lambda item: int(item["marker"]["index"]))
+        latest_marker = latest["marker"]
         timing_status, issues = self.timeline.marker_status(latest_marker["index"])
         offset_ms = None
         if reference_ns is not None:
@@ -326,9 +379,12 @@ class RecordingAnalyzer:
             "reason": None,
             "skippable": False,
             "values": values,
-            "indices": indices,
-            "latest_quadrant": latest_quadrant,
-            "latest_raw": qrs[latest_quadrant],
+            "indices": sorted({int(item["marker"]["index"]) for item in candidates}),
+            "matched_readable_qrs": len(candidates),
+            "ignored_readable_qrs": len(ignored),
+            "decode_issues": ignored,
+            "latest_cell": latest["cell"],
+            "latest_raw": latest["raw"],
             "latest_marker": latest_marker,
             "timing_status": timing_status,
             "issues": issues,
@@ -349,9 +405,10 @@ class RecordingAnalyzer:
         if original is None:
             raise ValueError("Could not read " + row["filename"])
         undistorted = self.undistorter.image(original, alpha)
-        detections = order_by_quadrant(
-            decode_qrs_with_quadrant_retries(self.reader, undistorted),
+        detections = order_by_cell(
+            decode_qrs_with_grid_retries(self.reader, undistorted, self.grid_qrs),
             (undistorted.shape[1], undistorted.shape[0]),
+            self.grid_qrs,
         )
         reference_ns = self.pts_monotonic_ns(row)
         observations = []
@@ -367,12 +424,12 @@ class RecordingAnalyzer:
             offset_ms = None
             mismatch = False
             if marker is not None:
-                mismatch = marker["corner"] != detection["quadrant"]
+                mismatch = marker["cell"] != detection["cell"]
                 status, issues = self.timeline.marker_status(marker["index"])
                 timing_status = status
                 if mismatch:
-                    status = "Quadrant mismatch"
-                    issues = ["decoded_quadrant_does_not_match_journal", *issues]
+                    status = "Grid cell mismatch"
+                    issues = ["decoded_cell_does_not_match_journal", *issues]
                 if reference_ns is not None:
                     offset_ms = (reference_ns - int(marker["marker_ns"])) / 1e6
             observations.append({
@@ -403,6 +460,7 @@ class RecordingAnalyzer:
 
     def summarize(self, alpha: float, cancel: threading.Event, progress) -> dict:
         counts = Counter()
+        readable_counts = Counter()
         clean_offsets = []
         frame_reports = []
         processed = 0
@@ -417,6 +475,9 @@ class RecordingAnalyzer:
             counts["detections"] += len(observations)
             counts["unreadable"] += sum(item["raw"] is None for item in observations)
             counts["mismatches"] += sum(item["mismatch"] for item in observations)
+            counts["journal_matched_readable"] += check.get("matched_readable_qrs", 0)
+            counts["ignored_readable"] += check.get("ignored_readable_qrs", 0)
+            readable_counts[check.get("matched_readable_qrs", 0)] += 1
             counts["timing_suspect"] += sum(
                 item["timing_status"] == "Timing suspect" for item in observations
             )
@@ -424,10 +485,10 @@ class RecordingAnalyzer:
             if check["valid"]:
                 validation = "accepted_" + check["timing_status"].lower().replace(" ", "_")
             elif check.get("skippable"):
-                validation = "skipped_incomplete"
+                validation = "skipped_no_readable_qr"
             else:
                 validation = "stopped_invalid"
-            frame_reports.append({
+            frame_report = {
                 "frame_number": index + 1,
                 "filename": result["row"]["filename"],
                 "validation": validation,
@@ -435,16 +496,20 @@ class RecordingAnalyzer:
                 "manual_values": bool(values["manual"]),
                 "pts_ns": values["pts_ns"],
                 "ntp_ns": values["ntp_ns"],
-                "qr_top_left_ms": values["qrs"][0],
-                "qr_top_right_ms": values["qrs"][1],
-                "qr_bottom_right_ms": values["qrs"][2],
-                "qr_bottom_left_ms": values["qrs"][3],
+                "grid_qrs": self.grid_qrs,
+                "qr_values_ms": list(values["qrs"]),
                 "decoded_detections": len(observations),
+                "matched_readable_qrs": check.get("matched_readable_qrs", 0),
+                "ignored_readable_qrs": check.get("ignored_readable_qrs", 0),
+                "decode_issues": check.get("decode_issues", []),
                 "display_indices": check.get("indices", []),
                 "latest_qr_ms": check.get("latest_raw"),
-                "latest_quadrant": (
-                    QUADRANT_NAMES[check["latest_quadrant"]]
-                    if check.get("latest_quadrant") is not None else None
+                "latest_cell": (
+                    check["latest_cell"] if check.get("latest_cell") is not None else None
+                ),
+                "latest_cell_name": (
+                    self.cell_names[check["latest_cell"]]
+                    if check.get("latest_cell") is not None else None
                 ),
                 "latest_display_index": (
                     check["latest_marker"]["index"] if check.get("latest_marker") else None
@@ -452,11 +517,20 @@ class RecordingAnalyzer:
                 "timing_status": check.get("timing_status"),
                 "timing_issues": check.get("issues", []),
                 "pts_minus_latest_qr_ms": check.get("offset_ms"),
-            })
+            }
+            if self.grid_qrs == 4:
+                frame_report.update({
+                    "qr_top_left_ms": values["qrs"][0],
+                    "qr_top_right_ms": values["qrs"][1],
+                    "qr_bottom_right_ms": values["qrs"][2],
+                    "qr_bottom_left_ms": values["qrs"][3],
+                    "latest_quadrant": frame_report["latest_cell_name"],
+                })
+            frame_reports.append(frame_report)
             progress(processed, len(self.rows))
             if not check["valid"]:
                 if check.get("skippable"):
-                    counts["skipped_incomplete_frames"] += 1
+                    counts["frames_without_readable_qr"] += 1
                     continue
                 stopped = {"index": index, "reason": check["reason"]}
                 break
@@ -473,6 +547,24 @@ class RecordingAnalyzer:
             "counts": dict(counts),
             "clean_offsets": len(clean_offsets),
             "median_offset_ms": statistics.median(clean_offsets) if clean_offsets else None,
+            "readability": {
+                "frames_by_matched_readable_qr_count": {
+                    str(count): readable_counts[count]
+                    for count in sorted(readable_counts)
+                },
+                "mean_matched_readable_qrs_per_frame": (
+                    sum(count * frames for count, frames in readable_counts.items()) / processed
+                    if processed else 0.0
+                ),
+                "maximum_matched_readable_qrs_in_frame": max(readable_counts, default=0),
+            },
+            "grid": {
+                "qr_count": self.grid_qrs,
+                "rows": self.timeline.grid_rows,
+                "columns": self.timeline.grid_columns,
+                "visible_qrs": self.timeline.visible_qrs,
+                "cell_order": list(self.cell_names),
+            },
             "display": self.timeline.totals(),
             "frames": frame_reports,
         }
@@ -566,7 +658,7 @@ class CalibrationWindow:
         self.title = tk.StringVar(value="Loading first frame…")
         self.pts_edit = tk.StringVar()
         self.ntp_edit = tk.StringVar()
-        self.qr_edits = [tk.StringVar() for _ in range(4)]
+        self.qr_edits = [tk.StringVar() for _ in range(model.grid_qrs)]
         self.exhibited = tk.StringVar(value="LATEST EXHIBITED TIME\nLoading…")
         self.codes = tk.StringVar(value="")
         self.status = tk.StringVar(value="QReader uses the undistorted image at alpha 0.25.")
@@ -635,19 +727,42 @@ class CalibrationWindow:
         ttk.Entry(information, textvariable=self.pts_edit).grid(row=1, column=0, sticky="ew", padx=(0, 4))
         ttk.Label(information, text="NTP Unix time (seconds)").grid(row=0, column=1, sticky="w")
         ttk.Entry(information, textvariable=self.ntp_edit).grid(row=1, column=1, sticky="ew", padx=4)
-        for column, (name, variable) in enumerate(zip(QUADRANT_NAMES, self.qr_edits), start=2):
-            ttk.Label(information, text=name + " QR (ms)").grid(row=0, column=column, sticky="w")
-            ttk.Entry(information, textvariable=variable, width=15).grid(
-                row=1, column=column, sticky="ew", padx=4
-            )
         ttk.Button(information, text="APPLY AND CONTINUE", command=self.apply_edits).grid(
-            row=1, column=6, padx=(8, 4)
+            row=1, column=2, padx=(8, 4)
         )
         ttk.Button(information, text="RESTORE DETECTED", command=self.restore_detected).grid(
-            row=1, column=7, padx=(4, 0)
+            row=1, column=3, padx=(4, 0)
         )
-        for column in range(6):
+        for column in range(2):
             information.columnconfigure(column, weight=1)
+
+        qr_information = ttk.LabelFrame(
+            outer,
+            text=f"QR grid values ({self.model.grid_qrs} cells)",
+            padding=6,
+        )
+        qr_information.pack(fill="x", pady=(0, 5))
+        for cell, (name, variable, position) in enumerate(zip(
+            self.model.cell_names,
+            self.qr_edits,
+            self.model.cell_positions,
+        )):
+            row, column = position
+            ttk.Label(qr_information, text=name + " (ms)").grid(
+                row=row * 2,
+                column=column,
+                sticky="w",
+                padx=4,
+            )
+            ttk.Entry(qr_information, textvariable=variable, width=15).grid(
+                row=row * 2 + 1,
+                column=column,
+                sticky="ew",
+                padx=4,
+                pady=(0, 3),
+            )
+        for column in range(self.model.timeline.grid_columns):
+            qr_information.columnconfigure(column, weight=1)
         style = ttk.Style(self.root)
         style.configure("Latest.TLabel", background=LATEST_COLOR, foreground="#191600")
         ttk.Label(
@@ -706,8 +821,8 @@ class CalibrationWindow:
                 "pts_ns": parse_seconds(self.pts_edit.get(), "PTS"),
                 "ntp_ns": parse_seconds(self.ntp_edit.get(), "NTP"),
                 "qrs": tuple(
-                    parse_qr_value(variable.get(), quadrant)
-                    for variable, quadrant in zip(self.qr_edits, QUADRANT_NAMES)
+                    parse_qr_value(variable.get(), cell_name)
+                    for variable, cell_name in zip(self.qr_edits, self.model.cell_names)
                 ),
             }
         except ValueError as error:
@@ -769,11 +884,11 @@ class CalibrationWindow:
             )
             self.exhibited.set(
                 f"LATEST VALID DISPLAYED QR TIME\n{payload_time(check['latest_raw'])} · "
-                f"{QUADRANT_NAMES[check['latest_quadrant']]} · {check['timing_status']}{offset}"
+                f"{self.model.cell_names[check['latest_cell']]} · {check['timing_status']}{offset}"
             )
         code_lines = [
             f"{name}: {payload_time(raw)}"
-            for name, raw in zip(QUADRANT_NAMES, values["qrs"])
+            for name, raw in zip(self.model.cell_names, values["qrs"])
         ]
         self.codes.set("   |   ".join(code_lines) if code_lines else "No QR code detected.")
         if not check["valid"]:
@@ -782,7 +897,11 @@ class CalibrationWindow:
             self.status.set(f"{action} on {source}: {check['reason']}")
         else:
             self.status.set(
-                ("Manual values accepted. " if values["manual"] else "Four QReader values accepted. ")
+                (
+                    "Manual values accepted. "
+                    if values["manual"]
+                    else f"{check['matched_readable_qrs']} journal-matched QR value(s) accepted; latest selected. "
+                )
                 + "Latest display timing: " + (
                     ", ".join(check["issues"])
                     if check["issues"] else "clean."
@@ -818,8 +937,10 @@ class CalibrationWindow:
         self.summary.set(
             f"{state}: {report['processed']} / {report['total']} frames; {offset}. "
             f"QR detections {counts.get('detections', 0)}, unreadable {counts.get('unreadable', 0)}, "
-            f"incomplete frames skipped {counts.get('skipped_incomplete_frames', 0)}, "
-            f"quadrant mismatches {counts.get('mismatches', 0)}, timing-suspect markers "
+            f"matched readable {counts.get('journal_matched_readable', 0)}, "
+            f"frames without a readable journal match {counts.get('frames_without_readable_qr', 0)}, "
+            f"ignored readable detections {counts.get('ignored_readable', 0)}, "
+            f"grid-cell mismatches {counts.get('mismatches', 0)}, timing-suspect markers "
             f"{counts.get('timing_suspect', 0)}. Display: {display['late_submissions']} late, "
             f"{display['irregular_intervals']} irregular, "
             f"{display['missed_period_candidates']} missed-period candidates. "
@@ -850,22 +971,28 @@ class CalibrationWindow:
         left, top = (width - size[0]) / 2, (height - size[1]) / 2
         self.canvas.create_image(left, top, image=self.photo, anchor="nw")
         check = self.current_check or self.model.check_frame(self.current)
-        latest_quadrant = check.get("latest_quadrant") if check["valid"] else None
+        latest_display_index = (
+            check["latest_marker"]["index"]
+            if check["valid"] and check.get("latest_marker") else None
+        )
         values = check["values"]
         for item in self.current["observations"]:
-            is_latest = item["quadrant"] == latest_quadrant
+            is_latest = (
+                item["display_index"] == latest_display_index
+                and not item["mismatch"]
+            )
             if not is_latest and not self.draw_all_boxes.get() and not self.show_all_times.get():
                 continue
             points = item[
                 "undistorted_points" if self.variant.get() == "Undistorted" else "original_points"
             ] * scale + np.array([left, top])
-            color = LATEST_COLOR if is_latest else QUADRANT_COLORS[item["quadrant"]]
+            color = LATEST_COLOR if is_latest else CELL_COLORS[item["cell"] % len(CELL_COLORS)]
             if is_latest or self.draw_all_boxes.get():
                 self.canvas.create_polygon(
                     points.ravel().tolist(), fill="", outline=color, width=4 if is_latest else 2
                 )
             if is_latest or self.show_all_times.get():
-                text = ("LATEST · " if is_latest else "") + payload_time(values["qrs"][item["quadrant"]])
+                text = ("LATEST · " if is_latest else "") + payload_time(item["raw"])
                 label = self.canvas.create_text(
                     points[:, 0].min() + 4, max(4, points[:, 1].min() - 26), text=text, fill=color,
                     anchor="nw", font=("TkDefaultFont", 10, "bold"),
