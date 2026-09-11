@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import time
 
+import numpy as np
+
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame
 
@@ -26,7 +28,7 @@ from calibration.qr import (
 
 
 DISPLAY_JOURNAL_NAME = "display_timestamps.jsonl"
-DISPLAY_FORMAT = "segcom-qr-display-pygame-v2"
+DISPLAY_FORMAT = "segcom-qr-display-pygame-v3"
 WINDOW_NAME = "QR Calibration Clock — Pygame/SDL"
 BACKGROUND = (50, 50, 50)
 FOREGROUND = (255, 255, 255)
@@ -35,6 +37,10 @@ DEFAULT_GRID_QRS = 4
 VISIBLE_QRS = 2
 REFRESH_HZ = 60.0
 UNDERLINE_HEIGHT = 4
+TIMESTAMP_MODES = ("paint-start", "predicted-flip")
+DEFAULT_TIMESTAMP_MODE = "predicted-flip"
+QR_DRAW_MODES = ("surface", "modules")
+DEFAULT_QR_DRAW_MODE = "surface"
 
 
 def format_timestamp(timestamp_ns: int) -> str:
@@ -84,6 +90,10 @@ class QRClockRenderer:
         self.underlines = tuple(self._underline(area) for area in self.areas)
         self.timestamps: list[int | None] = [None] * grid_qrs
         self.display_indices: list[int | None] = [None] * grid_qrs
+        self._qr_surfaces: dict[
+            tuple[int, int],
+            tuple[pygame.Surface, pygame.Surface],
+        ] = {}
         self.next_cell = 0
         self.newest_cell: int | None = None
         target.fill(BACKGROUND)
@@ -107,8 +117,7 @@ class QRClockRenderer:
         y = area.top + margin + self.font.get_linesize() + 6
         return pygame.Rect(area.centerx - width // 2, y, width, UNDERLINE_HEIGHT)
 
-    def _draw_qr(self, rect: pygame.Rect, payload: str) -> pygame.Rect:
-        matrix = qr_matrix(payload)
+    def _draw_qr_modules(self, rect: pygame.Rect, matrix) -> pygame.Rect:
         modules = matrix.shape[0]
         scale = max(1, min(rect.width, rect.height) // modules)
         side = modules * scale
@@ -121,7 +130,36 @@ class QRClockRenderer:
             self.target.fill(BLACK, dark)
         return bounds
 
-    def render_next(self, timestamp_ns: int, display_index: int) -> int:
+    def _draw_qr_surface(self, rect: pygame.Rect, matrix) -> pygame.Rect:
+        modules = matrix.shape[0]
+        scale = max(1, min(rect.width, rect.height) // modules)
+        key = (modules, scale)
+        surfaces = self._qr_surfaces.get(key)
+        if surfaces is None:
+            side = modules * scale
+            surfaces = (
+                pygame.Surface((modules, modules), depth=24),
+                pygame.Surface((side, side), depth=24),
+            )
+            self._qr_surfaces[key] = surfaces
+        source, image = surfaces
+        source_pixels = pygame.surfarray.pixels3d(source)
+        source_pixels[...] = (255 - matrix.T * 255)[:, :, None]
+        del source_pixels
+        pygame.transform.scale(source, image.get_size(), image)
+        bounds = image.get_rect(center=rect.center)
+        self.target.blit(image, bounds)
+        return bounds
+
+    def render_next(
+        self,
+        timestamp_ns: int,
+        display_index: int,
+        *,
+        qr_draw_mode: str = DEFAULT_QR_DRAW_MODE,
+    ) -> int:
+        if qr_draw_mode not in QR_DRAW_MODES:
+            raise ValueError(f"QR draw mode must be one of: {', '.join(QR_DRAW_MODES)}")
         cell = self.next_cell
         if self.newest_cell is not None:
             self.target.fill(BACKGROUND, self.underlines[self.newest_cell])
@@ -131,7 +169,11 @@ class QRClockRenderer:
             self.timestamps[expired] = None
             self.display_indices[expired] = None
         self.target.fill(BACKGROUND, self.areas[cell])
-        bounds = self._draw_qr(self.qr_rects[cell], timestamp_payload(timestamp_ns))
+        matrix = qr_matrix(timestamp_payload(timestamp_ns))
+        if qr_draw_mode == "surface":
+            bounds = self._draw_qr_surface(self.qr_rects[cell], matrix)
+        else:
+            bounds = self._draw_qr_modules(self.qr_rects[cell], matrix)
         text = self.font.render(
             f"#{display_index}  {format_timestamp(timestamp_ns)}",
             True,
@@ -176,7 +218,10 @@ class QRClockRenderer:
                 ["top-left", "top-right", "bottom-right", "bottom-left"]
                 if self.grid_qrs == 4 else None
             ),
-            "timestamp_semantics": "monotonic time sampled before drawing, not physical scanout",
+            "timestamp_semantics": (
+                "marker_ns is the timestamp encoded in the QR; session metadata "
+                "states whether it is paint-start or predicted-flip time"
+            ),
             "frame_index_semantics": (
                 "display index is shown as text and recorded in the journal; "
                 "the QR payload remains timestamp-only for decoder compatibility"
@@ -208,6 +253,17 @@ class FramePacer:
         self.deadline_ns += skipped * self.period_ns
         return skipped
 
+    def predict_next_flip(self, paint_start_ns: int) -> int:
+        """Predict the first nominal flip boundary after painting begins."""
+        if self.last_flip_ns is None:
+            return self.deadline_ns
+
+        predicted_ns = self.last_flip_ns + self.period_ns
+        if predicted_ns <= paint_start_ns:
+            elapsed_periods = (paint_start_ns - predicted_ns) // self.period_ns + 1
+            predicted_ns += elapsed_periods * self.period_ns
+        return predicted_ns
+
     def wait(self, should_stop) -> tuple[bool, int]:
         skipped = self._skip_expired(time.monotonic_ns())
         while True:
@@ -227,7 +283,17 @@ class FramePacer:
                 while time.monotonic_ns() < target:
                     pass
 
-    def observe(self, marker_ns: int, submit_ns: int, flip_return_ns: int, skipped: int) -> dict:
+    def observe(
+        self,
+        marker_ns: int,
+        submit_ns: int,
+        flip_return_ns: int,
+        skipped: int,
+        *,
+        paint_start_ns: int | None = None,
+    ) -> dict:
+        if paint_start_ns is None:
+            paint_start_ns = marker_ns
         interval = None if self.last_flip_ns is None else flip_return_ns - self.last_flip_ns
         irregular = interval is not None and not 0.75 * self.period_ns <= interval <= 1.25 * self.period_ns
         missed_after_submit = max(
@@ -235,6 +301,7 @@ class FramePacer:
         )
         result = {
             "marker_ns": marker_ns,
+            "paint_start_ns": paint_start_ns,
             "deadline_ns": self.deadline_ns,
             "submit_ns": submit_ns,
             "flip_return_ns": flip_return_ns,
@@ -245,8 +312,11 @@ class FramePacer:
             "missed_after_submit": missed_after_submit,
             "skipped_periods": skipped + missed_after_submit,
             "irregular_interval": irregular,
+            "render_ns": max(0, submit_ns - paint_start_ns),
+            "swap_wait_ns": max(0, flip_return_ns - submit_ns),
+            "marker_to_flip_ns": flip_return_ns - marker_ns,
         }
-        self.render_times.append(max(0, submit_ns - marker_ns))
+        self.render_times.append(max(0, submit_ns - paint_start_ns))
         ordered = sorted(self.render_times)
         p95 = ordered[math.ceil(len(ordered) * 0.95) - 1]
         self.render_budget_ns = min(self.period_ns // 2, max(500_000, p95 + 750_000))
@@ -349,6 +419,8 @@ def run_calibration_display(
     screen_index: int = 0,
     visible_qrs: int = VISIBLE_QRS,
     grid_qrs: int = DEFAULT_GRID_QRS,
+    timestamp_mode: str = DEFAULT_TIMESTAMP_MODE,
+    qr_draw_mode: str = DEFAULT_QR_DRAW_MODE,
 ) -> None:
     """Sample, draw, and flip on one thread without queued display frames."""
     if width < 320 or height < 240:
@@ -356,6 +428,10 @@ def run_calibration_display(
     grid_shape(grid_qrs)
     if not 1 <= visible_qrs <= grid_qrs:
         raise ValueError(f"Visible QR codes must be from 1 to {grid_qrs}")
+    if timestamp_mode not in TIMESTAMP_MODES:
+        raise ValueError(f"Timestamp mode must be one of: {', '.join(TIMESTAMP_MODES)}")
+    if qr_draw_mode not in QR_DRAW_MODES:
+        raise ValueError(f"QR draw mode must be one of: {', '.join(QR_DRAW_MODES)}")
 
     pygame.display.init()
     pygame.font.init()
@@ -397,6 +473,14 @@ def run_calibration_display(
             "sdl_version": list(pygame.get_sdl_version()),
             "display_driver": pygame.display.get_driver(),
             "vsync_requested": True,
+            "timestamp_mode": timestamp_mode,
+            "timestamp_semantics": (
+                "marker_ns and the QR payload predict the current pacing deadline"
+                if timestamp_mode == "predicted-flip"
+                else "marker_ns and the QR payload contain paint-start time"
+            ),
+            "prediction_period_ns": pacer.period_ns,
+            "qr_draw_mode": qr_draw_mode,
         })
         paused = False
         exit_requested = False
@@ -437,12 +521,35 @@ def run_calibration_display(
                 if exit_requested:
                     break
                 continue
-            marker_ns = time.monotonic_ns()
-            cell = renderer.render_next(marker_ns, len(journal.frames))
+            paint_start_ns = time.monotonic_ns()
+            marker_ns = (
+                pacer.predict_next_flip(paint_start_ns)
+                if timestamp_mode == "predicted-flip"
+                else paint_start_ns
+            )
+            cell = renderer.render_next(
+                marker_ns,
+                len(journal.frames),
+                qr_draw_mode=qr_draw_mode,
+            )
             submit_ns = time.monotonic_ns()
             pygame.display.flip()
             flip_return_ns = time.monotonic_ns()
-            timing = pacer.observe(marker_ns, submit_ns, flip_return_ns, skipped)
+            timing = pacer.observe(
+                marker_ns,
+                submit_ns,
+                flip_return_ns,
+                skipped,
+                paint_start_ns=paint_start_ns,
+            )
+            timing["prediction_error_ns"] = (
+                flip_return_ns - marker_ns
+                if timestamp_mode == "predicted-flip"
+                else None
+            )
+            timing["predicted_flip_ns"] = (
+                marker_ns if timestamp_mode == "predicted-flip" else None
+            )
             timing["resumed_after_pause"] = resumed_after_pause
             resumed_after_pause = False
             journal.append(cell, timing)
@@ -479,6 +586,21 @@ def main() -> None:
         default=0,
         help="SDL display index to use (default: 0)",
     )
+    parser.add_argument(
+        "--timestamp-mode",
+        choices=TIMESTAMP_MODES,
+        default=DEFAULT_TIMESTAMP_MODE,
+        help=(
+            "QR timestamp source: predict the pacing deadline by default, or "
+            "retain the former paint-start timestamp"
+        ),
+    )
+    parser.add_argument(
+        "--qr-draw-mode",
+        choices=QR_DRAW_MODES,
+        default=DEFAULT_QR_DRAW_MODE,
+        help="Draw each QR as one scaled surface or as individual modules",
+    )
     arguments = parser.parse_args()
     run_calibration_display(
         width=arguments.width,
@@ -489,6 +611,8 @@ def main() -> None:
         screen_index=arguments.screen,
         visible_qrs=arguments.visible_qrs,
         grid_qrs=arguments.grid_qrs,
+        timestamp_mode=arguments.timestamp_mode,
+        qr_draw_mode=arguments.qr_draw_mode,
     )
 
 

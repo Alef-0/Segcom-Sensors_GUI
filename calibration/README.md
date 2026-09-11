@@ -14,13 +14,16 @@ alignment.
 - `display_qt.py` creates one persistent Qt/OpenGL window. It advances
   timestamped QR codes through a selectable 4, 6, 8, 9, 10, or 12-cell grid at
   the selected monitor's refresh rate, keeps the selected number of recent QR
-  codes visible,
-  underlines the newest code, and records swap timing in
+  codes visible, retains unchanged cells while repainting only changed regions,
+  predicts the next swap timestamp for the new QR, underlines the newest code,
+  and records both predicted and actual swap timing in
   `display_timestamps.jsonl`. Press `P` to
   pause or resume; `Q`, Escape, and Ctrl+C close it.
 - `display.py` provides the selectable Pygame/SDL clock with the same grid,
-  visible-code, snake-order, newest-marker, monitor-index, and journal behavior.
-  It retains Pygame's paced presentation loop and supports `P`, `Q`, and Escape.
+  visible-code, snake-order, newest-marker, monitor-index, predicted-presentation
+  timestamp, and journal behavior. It updates only changed cells, draws each QR
+  through one scaled surface by default, retains Pygame's paced presentation
+  loop, and supports `P`, `Q`, and Escape.
 - `qr.py` creates the 12-digit monotonic-millisecond QR payloads and provides
   QReader decoding, per-cell retries, and snake-grid ordering.
 - `recording_display.py` opens the recording inspection window. It decodes the
@@ -99,11 +102,13 @@ python3 -m calibration.display_qt --list-screens
 python3 -m calibration.display_qt --screen 1
 python3 -m calibration.display_qt --screen 1 --grid-qrs 12 --visible-qrs 8
 python3 -m calibration.display_qt --screen 1 --windowed --width 1280 --height 720
+python3 -m calibration.display_qt --screen 1 --timestamp-mode paint-start
 
 # Pygame/SDL
 python3 -m calibration.display --screen 1
 python3 -m calibration.display --screen 1 --grid-qrs 12 --visible-qrs 8
 python3 -m calibration.display --screen 1 --windowed --width 1280 --height 720
+python3 -m calibration.display --screen 1 --timestamp-mode paint-start
 ```
 
 ## Required recording inputs

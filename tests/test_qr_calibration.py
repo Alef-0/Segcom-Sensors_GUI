@@ -16,11 +16,20 @@ import cv2
 import numpy as np
 import pygame
 
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QGuiApplication, QImage, QPainter
 
 import analyze_calibration_recording as recording_launcher
-from calibration.display import QRClockRenderer as PygameQRClockRenderer
-from calibration.display_qt import QRClockRenderer, VISIBLE_QRS
+from calibration.display import (
+    FramePacer,
+    QRClockRenderer as PygameQRClockRenderer,
+)
+from calibration.display_qt import (
+    BACKGROUND as QT_BACKGROUND,
+    FOREGROUND as QT_FOREGROUND,
+    QRClockRenderer,
+    SwapTimingMonitor,
+    VISIBLE_QRS,
+)
 from calibration.quantitative_analysis import analyze_output_directory
 from calibration.qr import (
     DETECTION_BATCH_SIZE,
@@ -190,6 +199,57 @@ class QRHelpersTests(unittest.TestCase):
         self.assertEqual(renderer.metadata()["grid_qrs"], 12)
         self.assertEqual(renderer.metadata()["grid_columns"], 6)
 
+    def test_qt_renderer_retains_unchanged_cells_and_clears_expired_cell(self):
+        self.qt_app = QGuiApplication.instance() or QGuiApplication(["qr-test"])
+        renderer = QRClockRenderer(960, 540)
+        canvas = QImage(960, 540, QImage.Format.Format_RGB32)
+
+        renderer.render_next(10_000_000_000, 0)
+        painter = QPainter(canvas)
+        renderer.paint(painter)
+        painter.end()
+        first_qr = canvas.copy(renderer.qr_rects[0])
+
+        renderer.render_next(10_020_000_000, 1)
+        painter = QPainter(canvas)
+        renderer.paint(painter)
+        painter.end()
+
+        self.assertEqual(canvas.copy(renderer.qr_rects[0]), first_qr)
+        self.assertEqual(
+            canvas.pixelColor(renderer.underlines[0].center()),
+            QT_BACKGROUND,
+        )
+        self.assertEqual(
+            canvas.pixelColor(renderer.underlines[1].center()),
+            QT_FOREGROUND,
+        )
+
+        renderer.render_next(10_040_000_000, 2)
+        painter = QPainter(canvas)
+        renderer.paint(painter)
+        painter.end()
+        self.assertEqual(
+            canvas.pixelColor(renderer.qr_rects[0].center()),
+            QT_BACKGROUND,
+        )
+
+    def test_next_swap_prediction_uses_last_swap_and_skips_elapsed_periods(self):
+        monitor = SwapTimingMonitor(60.0)
+        period = monitor.period_ns
+        first_paint = 10_000_000_000
+        self.assertEqual(monitor.predict_next_swap(first_paint), first_paint + period)
+
+        monitor.observe(first_paint, first_paint + 1_000_000, first_paint + period)
+        self.assertEqual(
+            monitor.predict_next_swap(first_paint + period + 2_000_000),
+            first_paint + 2 * period,
+        )
+        self.assertEqual(
+            monitor.predict_next_swap(first_paint + 3 * period + 2_000_000),
+            first_paint + 4 * period,
+        )
+
     def test_qr_areas_are_shifted_away_from_timestamp_labels(self):
         self.qt_app = QGuiApplication.instance() or QGuiApplication(["qr-test"])
         renderer = QRClockRenderer(1920, 1080)
@@ -227,6 +287,52 @@ class QRHelpersTests(unittest.TestCase):
         ):
             self.assertGreater(qr.top, underline.bottom)
             self.assertTrue(area.contains(qr))
+
+    def test_pygame_surface_qr_matches_module_drawing(self):
+        pygame.font.init()
+        surface_target = pygame.Surface((960, 540), depth=32)
+        module_target = pygame.Surface((960, 540), depth=32)
+        surface_renderer = PygameQRClockRenderer(surface_target)
+        module_renderer = PygameQRClockRenderer(module_target)
+
+        surface_renderer.render_next(
+            10_000_000_000,
+            0,
+            qr_draw_mode="surface",
+        )
+        module_renderer.render_next(
+            10_000_000_000,
+            0,
+            qr_draw_mode="modules",
+        )
+
+        self.assertEqual(
+            pygame.image.tobytes(surface_target, "RGB"),
+            pygame.image.tobytes(module_target, "RGB"),
+        )
+
+    def test_pygame_pacer_keeps_predicted_marker_separate_from_render_timing(self):
+        anchor = 10_000_000_000
+        pacer = FramePacer(anchor, 60.0)
+        paint_start = anchor + 2_000_000
+        submit = paint_start + 1_000_000
+        flip_return = pacer.deadline_ns + 100_000
+
+        timing = pacer.observe(
+            pacer.deadline_ns,
+            submit,
+            flip_return,
+            0,
+            paint_start_ns=paint_start,
+        )
+
+        self.assertEqual(timing["render_ns"], 1_000_000)
+        self.assertEqual(timing["marker_to_flip_ns"], 100_000)
+        self.assertFalse(timing["late_submit"])
+        self.assertEqual(
+            pacer.predict_next_flip(flip_return + 2_000_000),
+            flip_return + pacer.period_ns,
+        )
 
 
 class RecordingTests(unittest.TestCase):

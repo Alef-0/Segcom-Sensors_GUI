@@ -12,7 +12,16 @@ import time
 
 try:
     from PySide6.QtCore import QRect, QTimer, Qt
-    from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter, QSurfaceFormat
+    from PySide6.QtGui import (
+        QColor,
+        QFont,
+        QFontMetrics,
+        QGuiApplication,
+        QImage,
+        QPainter,
+        QPixmap,
+        QSurfaceFormat,
+    )
     from PySide6.QtOpenGL import QOpenGLWindow
 except ImportError as error:
     raise SystemExit(
@@ -46,7 +55,7 @@ except ModuleNotFoundError:
 
 
 DISPLAY_JOURNAL_NAME = "display_timestamps.jsonl"
-DISPLAY_FORMAT = "segcom-qr-display-qt-v2"
+DISPLAY_FORMAT = "segcom-qr-display-qt-v3"
 WINDOW_NAME = "QR Calibration Clock — Qt/OpenGL"
 BACKGROUND = QColor(50, 50, 50)
 FOREGROUND = QColor(255, 255, 255)
@@ -55,6 +64,8 @@ DEFAULT_GRID_QRS = 4
 VISIBLE_QRS = 2
 UNDERLINE_HEIGHT = 4
 DEFAULT_REFRESH_HZ = 60.0
+TIMESTAMP_MODES = ("paint-start", "predicted-flip")
+DEFAULT_TIMESTAMP_MODE = "predicted-flip"
 
 
 def format_timestamp(timestamp_ns: int) -> str:
@@ -70,7 +81,7 @@ def grid_areas(width: int, height: int, grid_qrs: int) -> tuple[QRect, ...]:
 
 
 class QRClockRenderer:
-    """Keep the requested newest QR markers and redraw the OpenGL back buffer."""
+    """Keep recent QR markers and update only changed retained-buffer regions."""
 
     def __init__(
         self,
@@ -88,6 +99,10 @@ class QRClockRenderer:
         self.timestamps: list[int | None] = [None] * grid_qrs
         self.display_indices: list[int | None] = [None] * grid_qrs
         self.matrices: dict[int, object] = {}
+        self.images: dict[int, QPixmap] = {}
+        self._dirty_cells: set[int] = set()
+        self._dirty_underlines: set[int] = set()
+        self._force_full_redraw = True
         self.next_cell = 0
         self.newest_cell: int | None = None
         self.resize(width, height)
@@ -113,6 +128,13 @@ class QRClockRenderer:
             self._underline(area)
             for area in self.areas
         )
+        self.images = {
+            timestamp_ns: self._qr_image(self.qr_rects[cell], self.matrices[timestamp_ns])
+            for cell, timestamp_ns in enumerate(self.timestamps)
+            if timestamp_ns is not None
+        }
+        self._force_full_redraw = True
+        self._dirty_cells.update(range(self.grid_qrs))
 
     def _qr_rect(self, area: QRect) -> QRect:
         margin = max(4, min(12, area.width() // 24, area.height() // 24))
@@ -135,33 +157,67 @@ class QRClockRenderer:
         y = area.y() + margin + label_height + 2
         return QRect(area.center().x() - width // 2, y, width, UNDERLINE_HEIGHT)
 
-    def render_next(self, timestamp_ns: int, display_index: int) -> int:
+    def render_next(
+        self,
+        timestamp_ns: int,
+        display_index: int,
+        *,
+        cache_pixmap: bool = True,
+    ) -> int:
         cell = self.next_cell
         expired = (cell - self.visible_qrs) % self.grid_qrs
+
+        if self.newest_cell is not None:
+            self._dirty_underlines.add(self.newest_cell)
 
         expired_timestamp = self.timestamps[expired]
         if expired_timestamp is not None:
             self.matrices.pop(expired_timestamp, None)
+            self.images.pop(expired_timestamp, None)
             self.timestamps[expired] = None
             self.display_indices[expired] = None
+            self._dirty_cells.add(expired)
 
         self.timestamps[cell] = timestamp_ns
         self.display_indices[cell] = display_index
-        self.matrices[timestamp_ns] = qr_matrix(timestamp_payload(timestamp_ns))
+        matrix = qr_matrix(timestamp_payload(timestamp_ns))
+        self.matrices[timestamp_ns] = matrix
+        if cache_pixmap:
+            self.images[timestamp_ns] = self._qr_image(self.qr_rects[cell], matrix)
+        self._dirty_cells.add(cell)
 
         self.newest_cell = cell
         self.next_cell = (cell + 1) % self.grid_qrs
         return cell
 
     @staticmethod
-    def _draw_qr(painter: QPainter, rect: QRect, matrix) -> QRect:
+    def _qr_image(rect: QRect, matrix) -> QPixmap:
         modules = matrix.shape[0]
         scale = max(1, min(rect.width(), rect.height()) // modules)
-        side = modules * scale
+        pixels = (255 - matrix * 255).repeat(scale, axis=0).repeat(scale, axis=1)
+        image = QImage(
+            pixels.data,
+            pixels.shape[1],
+            pixels.shape[0],
+            pixels.strides[0],
+            QImage.Format.Format_Grayscale8,
+        )
+        # Detach from the temporary NumPy storage before returning.
+        return QPixmap.fromImage(image.copy())
 
-        bounds = QRect(0, 0, side, side)
+    @staticmethod
+    def _draw_qr(painter: QPainter, rect: QRect, image: QPixmap) -> QRect:
+        bounds = QRect(0, 0, image.width(), image.height())
         bounds.moveCenter(rect.center())
+        painter.drawPixmap(bounds, image)
+        return bounds
 
+    @staticmethod
+    def _draw_qr_modules(painter: QPainter, rect: QRect, matrix) -> QRect:
+        modules = matrix.shape[0]
+        scale = max(1, min(rect.width(), rect.height()) // modules)
+        bounds = QRect(0, 0, modules * scale, modules * scale)
+        bounds.moveCenter(rect.center())
         painter.fillRect(bounds, FOREGROUND)
         for row, column in zip(*matrix.nonzero()):
             painter.fillRect(
@@ -173,35 +229,70 @@ class QRClockRenderer:
             )
         return bounds
 
-    def paint(self, painter: QPainter) -> None:
-        # NoPartialUpdate does not preserve the previous back buffer, so redraw
-        # the complete scene every frame. QR matrices themselves are cached.
-        painter.fillRect(0, 0, self.size[0], self.size[1], BACKGROUND)
+    def _paint_cell(
+        self,
+        painter: QPainter,
+        cell: int,
+        *,
+        cached_pixmaps: bool,
+    ) -> None:
+        timestamp_ns = self.timestamps[cell]
+        if timestamp_ns is None:
+            return
+
+        if cached_pixmaps:
+            self._draw_qr(painter, self.qr_rects[cell], self.images[timestamp_ns])
+        else:
+            self._draw_qr_modules(
+                painter,
+                self.qr_rects[cell],
+                self.matrices[timestamp_ns],
+            )
+
+        display_index = self.display_indices[cell]
+        label = f"#{display_index}  {format_timestamp(timestamp_ns)}"
+        text_height = self.font_metrics.height() + 4
+        area = self.areas[cell]
+        margin = max(4, min(12, area.width() // 24, area.height() // 24))
+        text_y = area.y() + margin
+        text_rect = QRect(area.x(), text_y, area.width(), text_height)
+        painter.setPen(FOREGROUND)
+        painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+            label,
+        )
+
+    def paint(
+        self,
+        painter: QPainter,
+        *,
+        force_full_redraw: bool = False,
+        cached_pixmaps: bool = True,
+    ) -> None:
+        full_redraw = force_full_redraw or self._force_full_redraw
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.setFont(self.font)
 
-        for cell, timestamp_ns in enumerate(self.timestamps):
-            if timestamp_ns is None:
-                continue
+        if full_redraw:
+            painter.fillRect(0, 0, self.size[0], self.size[1], BACKGROUND)
+            cells_to_paint = range(self.grid_qrs)
+        else:
+            for cell in self._dirty_underlines - self._dirty_cells:
+                painter.fillRect(self.underlines[cell], BACKGROUND)
+            for cell in self._dirty_cells:
+                painter.fillRect(self.areas[cell], BACKGROUND)
+            cells_to_paint = sorted(self._dirty_cells)
 
-            self._draw_qr(painter, self.qr_rects[cell], self.matrices[timestamp_ns])
-
-            display_index = self.display_indices[cell]
-            label = f"#{display_index}  {format_timestamp(timestamp_ns)}"
-            text_height = self.font_metrics.height() + 4
-            area = self.areas[cell]
-            margin = max(4, min(12, area.width() // 24, area.height() // 24))
-            text_y = area.y() + margin
-            text_rect = QRect(area.x(), text_y, area.width(), text_height)
-            painter.setPen(FOREGROUND)
-            painter.drawText(
-                text_rect,
-                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                label,
-            )
+        for cell in cells_to_paint:
+            self._paint_cell(painter, cell, cached_pixmaps=cached_pixmaps)
 
         if self.newest_cell is not None:
             painter.fillRect(self.underlines[self.newest_cell], FOREGROUND)
+
+        self._dirty_cells.clear()
+        self._dirty_underlines.clear()
+        self._force_full_redraw = False
 
     def metadata(self) -> dict:
         return {
@@ -221,8 +312,8 @@ class QRClockRenderer:
                 if self.grid_qrs == 4 else None
             ),
             "timestamp_semantics": (
-                "monotonic time sampled at the start of paintGL before QR generation; "
-                "not physical display scanout"
+                "marker_ns is the timestamp encoded in the QR; session metadata "
+                "states whether it is paint-start or predicted-flip time"
             ),
             "frame_index_semantics": (
                 "display index is shown as text and recorded in the journal; "
@@ -245,12 +336,27 @@ class SwapTimingMonitor:
     def reset(self) -> None:
         self.last_swap_ns = None
 
+    def predict_next_swap(self, paint_start_ns: int) -> int:
+        """Predict the first nominal refresh boundary after painting begins."""
+        if self.last_swap_ns is None:
+            return paint_start_ns + self.period_ns
+
+        predicted_ns = self.last_swap_ns + self.period_ns
+        if predicted_ns <= paint_start_ns:
+            elapsed_periods = (paint_start_ns - predicted_ns) // self.period_ns + 1
+            predicted_ns += elapsed_periods * self.period_ns
+        return predicted_ns
+
     def observe(
         self,
         marker_ns: int,
         submit_ns: int,
         swap_return_ns: int,
+        *,
+        paint_start_ns: int | None = None,
     ) -> dict:
+        if paint_start_ns is None:
+            paint_start_ns = marker_ns
         interval_ns = (
             None
             if self.last_swap_ns is None
@@ -270,12 +376,14 @@ class SwapTimingMonitor:
 
         return {
             "marker_ns": marker_ns,
+            "paint_start_ns": paint_start_ns,
             "submit_ns": submit_ns,
             "flip_return_ns": swap_return_ns,
             "frame_period_ns": self.period_ns,
             "interval_ns": interval_ns,
-            "render_ns": max(0, submit_ns - marker_ns),
+            "render_ns": max(0, submit_ns - paint_start_ns),
             "swap_wait_ns": max(0, swap_return_ns - submit_ns),
+            "marker_to_flip_ns": swap_return_ns - marker_ns,
             "late_submit": False,
             "skipped_before_render": 0,
             "missed_after_submit": skipped_periods,
@@ -366,6 +474,9 @@ class DisplayJournal:
             "irregular_intervals": sum(
                 bool(row.get("irregular_interval")) for row in self.frames
             ),
+            "late_submissions": sum(
+                bool(row.get("late_submit")) for row in self.frames
+            ),
         }
         self._write({"kind": "summary", "frames": len(self.frames), **counts})
 
@@ -375,7 +486,8 @@ class DisplayJournal:
         print(
             f"[CALIBRATION] Presented {len(self.frames)} QR markers; "
             f"{counts['missed_period_candidates']} missed-period candidate(s), "
-            f"{counts['irregular_intervals']} irregular interval(s).",
+            f"{counts['irregular_intervals']} irregular interval(s), "
+            f"{counts['late_submissions']} late predicted submission(s).",
             flush=True,
         )
 
@@ -391,14 +503,19 @@ class QRClockWindow(QOpenGLWindow):
         screen_metadata: dict,
         visible_qrs: int,
         grid_qrs: int,
+        timestamp_mode: str,
     ):
-        super().__init__(QOpenGLWindow.UpdateBehavior.NoPartialUpdate)
+        super().__init__(QOpenGLWindow.UpdateBehavior.PartialUpdateBlit)
 
         self.expected_refresh_hz = expected_refresh_hz
         self.journal_path = journal_path
         self.screen_metadata = screen_metadata
         self.visible_qrs = visible_qrs
         self.grid_qrs = grid_qrs
+        if timestamp_mode not in TIMESTAMP_MODES:
+            choices = ", ".join(TIMESTAMP_MODES)
+            raise ValueError(f"Timestamp mode must be one of: {choices}")
+        self.timestamp_mode = timestamp_mode
 
         self.renderer: QRClockRenderer | None = None
         self.monitor = SwapTimingMonitor(expected_refresh_hz)
@@ -437,7 +554,14 @@ class QRClockWindow(QOpenGLWindow):
                 actual_format.minorVersion(),
             ],
             "opengl_profile": str(actual_format.profile()),
-            "update_behavior": "NoPartialUpdate",
+            "update_behavior": "PartialUpdateBlit",
+            "timestamp_mode": self.timestamp_mode,
+            "timestamp_semantics": (
+                "marker_ns and the QR payload predict the next frameSwapped time"
+                if self.timestamp_mode == "predicted-flip"
+                else "marker_ns and the QR payload contain paint-start time"
+            ),
+            "prediction_period_ns": self.monitor.period_ns,
             "presentation_semantics": (
                 "flip_return_ns is sampled from Qt frameSwapped, emitted after the "
                 "potentially blocking buffer swap; it is still not a measurement "
@@ -464,7 +588,12 @@ class QRClockWindow(QOpenGLWindow):
         if self.pending_frame is not None:
             return
 
-        marker_ns = time.monotonic_ns()
+        paint_start_ns = time.monotonic_ns()
+        marker_ns = (
+            self.monitor.predict_next_swap(paint_start_ns)
+            if self.timestamp_mode == "predicted-flip"
+            else paint_start_ns
+        )
         display_index = self.next_display_index
         cell = self.renderer.render_next(marker_ns, display_index)
 
@@ -479,6 +608,7 @@ class QRClockWindow(QOpenGLWindow):
             "cell": cell,
             "display_index": display_index,
             "marker_ns": marker_ns,
+            "paint_start_ns": paint_start_ns,
             "submit_ns": submit_ns,
         }
 
@@ -497,6 +627,21 @@ class QRClockWindow(QOpenGLWindow):
             pending["marker_ns"],
             pending["submit_ns"],
             swap_return_ns,
+            paint_start_ns=pending["paint_start_ns"],
+        )
+        timing["prediction_error_ns"] = (
+            swap_return_ns - pending["marker_ns"]
+            if self.timestamp_mode == "predicted-flip"
+            else None
+        )
+        timing["predicted_flip_ns"] = (
+            pending["marker_ns"]
+            if self.timestamp_mode == "predicted-flip"
+            else None
+        )
+        timing["late_submit"] = (
+            self.timestamp_mode == "predicted-flip"
+            and pending["submit_ns"] > pending["marker_ns"]
         )
         timing["resumed_after_pause"] = self.resumed_after_pause
         self.resumed_after_pause = False
@@ -599,6 +744,7 @@ def run_calibration_display(
     screen_index: int = 0,
     visible_qrs: int = VISIBLE_QRS,
     grid_qrs: int = DEFAULT_GRID_QRS,
+    timestamp_mode: str = DEFAULT_TIMESTAMP_MODE,
     list_screens: bool = False,
 ) -> int:
     if width < 320 or height < 240:
@@ -653,6 +799,7 @@ def run_calibration_display(
         screen_metadata=screen_metadata,
         visible_qrs=visible_qrs,
         grid_qrs=grid_qrs,
+        timestamp_mode=timestamp_mode,
     )
     window.setScreen(screen)
 
@@ -735,6 +882,15 @@ def main() -> None:
         help="Qt screen index to use (default: 0)",
     )
     parser.add_argument(
+        "--timestamp-mode",
+        choices=TIMESTAMP_MODES,
+        default=DEFAULT_TIMESTAMP_MODE,
+        help=(
+            "QR timestamp source: predict the next swap by default, or retain "
+            "the former paint-start timestamp"
+        ),
+    )
+    parser.add_argument(
         "--list-screens",
         action="store_true",
         help="Print detected monitors and refresh rates, then exit",
@@ -762,6 +918,7 @@ def main() -> None:
             screen_index=arguments.screen,
             visible_qrs=arguments.visible_qrs,
             grid_qrs=arguments.grid_qrs,
+            timestamp_mode=arguments.timestamp_mode,
             list_screens=arguments.list_screens,
         )
     )
