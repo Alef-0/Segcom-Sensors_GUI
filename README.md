@@ -186,27 +186,29 @@ pair into another snapshot folder.
 ## Calibration
 
 The Calibration tab lets you require the desktop NVIDIA, ARM/Jetson, or CPU
-camera pipeline and choose the monitor used by the Qt/OpenGL fullscreen clock.
+camera pipeline, select either the Qt/OpenGL or Pygame/SDL fullscreen clock,
+and choose its monitor.
 The selected pipeline is validated before the clock starts and does not silently
-fall back to another decoder. The right side of the tab selects a 4, 6, 8, 9,
-10, or 12-code grid and independently controls how many of its latest QR codes
-remain visible. The clock presents QR timestamps in a snake path through the
-grid at the refresh rate reported for the selected monitor. An underline
-below the time identifies the newest marker. Press **P** to pause/resume, or use
-**Q**, Escape, or Ctrl+C to close it. Paused markers are excluded from timing
+fall back to another decoder. Both clock implementations accept a 4, 6, 8, 9,
+10, or 12-code grid and independently control how many of its latest QR codes
+remain visible. They present QR timestamps in a snake path through the grid,
+show the display index beside each timestamp, and underline the newest marker.
+Press **P** to pause/resume, or use **Q** or Escape to close either clock; the Qt
+clock also handles Ctrl+C directly. Paused markers are excluded from timing
 analysis.
 
 The Visualization tab opens the single analyzer with the project's copied
 camera intrinsics, an undistorted image, and alpha 0.25 by default. QReader
 detects every QR bounding box, retries grid cells without a readable result,
-and orders detections by grid cell. Analysis starts immediately and accepts any
-frame with at least one readable QR that matches its journal entry and grid
-cell. Unreadable and invalid detections are retained as diagnostics while the
-latest valid readable QR supplies the offset. The PTS, NTP, and configured grid
-values are editable in the viewer; applying a valid correction
-restarts the scan using the corrected values without changing the recording.
-The **Create analysis files** button only writes `calibration_analysis.json`
-and `calibration_frames.csv` to a sibling
+and orders detections by grid cell. The first frame is decoded when the viewer
+opens; full-folder decoding begins only after **GO — DECODE FULL FOLDER** is
+pressed, and each completed frame is shown. A frame is accepted when at least
+one readable QR matches its journal; camera-grid position disagreements remain
+visible as warnings. Unreadable and invalid detections are retained as
+diagnostics while the latest journal-matched QR supplies the offset. The PTS,
+NTP, and configured grid values are editable without automatically starting a
+scan. Finishing the full scan writes `calibration_analysis.json` and
+`calibration_frames.csv` to a sibling
 `<recording-folder-name>_analysis` directory. After the inspection window is
 closed, the root launcher reads those files and writes a quantitative verdict,
 per-frame strategy predictions, and five Matplotlib graphs as PNG files.

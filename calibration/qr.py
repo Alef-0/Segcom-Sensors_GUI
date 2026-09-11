@@ -13,6 +13,7 @@ from qrcode.constants import ERROR_CORRECT_L
 PAYLOAD_DIGITS = 12
 PAYLOAD_MODULUS_MS = 10**PAYLOAD_DIGITS
 QUIET_ZONE_MODULES = 2
+DETECTION_BATCH_SIZE = 4
 GRID_LAYOUTS = {
     4: (2, 2),
     6: (2, 3),
@@ -59,6 +60,61 @@ def decode_qrs(reader, image: np.ndarray) -> list[dict]:
             "confidence": float(detection.get("confidence", 0.0)),
         })
     return results
+
+
+def decode_qrs_batch(reader, images: list[np.ndarray]) -> list[list[dict]]:
+    """Detect several frames together, then decode their QR results in order."""
+    if not images:
+        return []
+    detector = getattr(reader, "detector", None)
+    model = getattr(detector, "model", None)
+    if len(images) == 1 or model is None or not hasattr(reader, "decode"):
+        return [decode_qrs(reader, image) for image in images]
+
+    try:
+        from qrdet import _prepare_input, _yolo_v8_results_to_dict
+    except ImportError as error:
+        raise RuntimeError("Installed QRDet does not provide batched detection helpers") from error
+
+    prepared = [_prepare_input(source=image, is_bgr=True) for image in images]
+    predictions = model.predict(
+        source=prepared,
+        conf=detector._conf_th,
+        iou=detector._nms_iou,
+        device=None,
+        max_det=100,
+        augment=False,
+        agnostic_nms=True,
+        classes=None,
+        verbose=False,
+    )
+    if len(predictions) != len(images):
+        raise RuntimeError(
+            f"QRDet batch returned {len(predictions)} results for {len(images)} images"
+        )
+
+    batches = []
+    for image, prepared_image, prediction in zip(images, prepared, predictions):
+        detections = _yolo_v8_results_to_dict(
+            results=prediction,
+            image=prepared_image,
+        )
+        decoded = [
+            reader.decode(image=image, detection_result=detection)
+            for detection in detections
+        ]
+        batch = []
+        for raw, detection in zip(decoded, detections):
+            box = np.asarray(detection["bbox_xyxy"], dtype=float).reshape(4)
+            x1, y1, x2, y2 = box.tolist()
+            batch.append({
+                "raw": raw,
+                "bbox": box,
+                "center": ((x1 + x2) / 2, (y1 + y2) / 2),
+                "confidence": float(detection.get("confidence", 0.0)),
+            })
+        batches.append(batch)
+    return batches
 
 
 def grid_shape(grid_qrs: int) -> tuple[int, int]:
@@ -126,26 +182,56 @@ def decode_qrs_with_grid_retries(
     grid_qrs: int,
 ) -> list[dict]:
     """Decode the full image, then retry cells with no readable QR value."""
-    height, width = image.shape[:2]
-    results = decode_qrs(reader, image)
-    found = {
-        cell_index_for(result["center"], (width, height), grid_qrs)
-        for result in results
-        if result["raw"] is not None
-    }
-    for cell, (left, top, right, bottom) in enumerate(
-        grid_bounds(width, height, grid_qrs)
-    ):
-        if cell in found:
-            continue
-        for detection in decode_qrs(reader, image[top:bottom, left:right]):
-            detection["bbox"] += np.array((left, top, left, top), dtype=float)
-            detection["center"] = (
-                detection["center"][0] + left,
-                detection["center"][1] + top,
-            )
-            if cell_index_for(detection["center"], (width, height), grid_qrs) == cell:
-                results.append(detection)
+    return decode_qrs_with_grid_retries_batch(reader, [image], grid_qrs)[0]
+
+
+def decode_qrs_with_grid_retries_batch(
+    reader,
+    images: list[np.ndarray],
+    grid_qrs: int,
+    batch_size: int = DETECTION_BATCH_SIZE,
+) -> list[list[dict]]:
+    """Batch full frames and every required per-cell recovery pass."""
+    if batch_size < 1:
+        raise ValueError("QR detection batch size must be positive")
+    results = []
+    for start in range(0, len(images), batch_size):
+        results.extend(decode_qrs_batch(reader, images[start:start + batch_size]))
+
+    retry_jobs = []
+    for image_index, (image, detections) in enumerate(zip(images, results)):
+        height, width = image.shape[:2]
+        found = {
+            cell_index_for(detection["center"], (width, height), grid_qrs)
+            for detection in detections
+            if detection["raw"] is not None
+        }
+        for cell, (left, top, right, bottom) in enumerate(
+            grid_bounds(width, height, grid_qrs)
+        ):
+            if cell not in found:
+                retry_jobs.append({
+                    "image_index": image_index,
+                    "cell": cell,
+                    "bounds": (left, top, right, bottom),
+                    "crop": image[top:bottom, left:right],
+                })
+
+    for start in range(0, len(retry_jobs), batch_size):
+        jobs = retry_jobs[start:start + batch_size]
+        decoded = decode_qrs_batch(reader, [job["crop"] for job in jobs])
+        for job, detections in zip(jobs, decoded):
+            image = images[job["image_index"]]
+            height, width = image.shape[:2]
+            left, top, _, _ = job["bounds"]
+            for detection in detections:
+                detection["bbox"] += np.array((left, top, left, top), dtype=float)
+                detection["center"] = (
+                    detection["center"][0] + left,
+                    detection["center"][1] + top,
+                )
+                if cell_index_for(detection["center"], (width, height), grid_qrs) == job["cell"]:
+                    results[job["image_index"]].append(detection)
     return results
 
 

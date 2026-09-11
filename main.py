@@ -29,6 +29,10 @@ CALIBRATION_DECODER_BACKENDS = {
     "ARM / Jetson": "orin",
     "CPU": "cpu",
 }
+CALIBRATION_DISPLAY_BACKENDS = {
+    "Qt / OpenGL": "qt",
+    "Pygame / SDL": "pygame",
+}
 
 
 @dataclass
@@ -126,6 +130,15 @@ def _calibration_decoder_backend(values):
         raise ValueError(f"Select a camera pipeline: {choices}") from error
 
 
+def _calibration_display_backend(values):
+    label = str(values.get("calibration_display", "Qt / OpenGL")).strip()
+    try:
+        return CALIBRATION_DISPLAY_BACKENDS[label]
+    except KeyError as error:
+        choices = ", ".join(CALIBRATION_DISPLAY_BACKENDS)
+        raise ValueError(f"Select a QR display: {choices}") from error
+
+
 def _calibration_screen_index(values):
     selection = str(values.get("calibration_screen", "0")).strip()
     try:
@@ -135,6 +148,22 @@ def _calibration_screen_index(values):
     if index < 0:
         raise ValueError("Select a valid QR display monitor")
     return index
+
+
+def _calibration_screen_refresh_hz(values):
+    selection = str(values.get("calibration_screen", "")).strip()
+    if "@" not in selection:
+        return None
+    refresh_text = selection.rsplit("@", 1)[1].strip()
+    if refresh_text.lower().endswith("hz"):
+        refresh_text = refresh_text[:-2].strip()
+    try:
+        refresh_hz = float(refresh_text)
+    except ValueError:
+        return None
+    if not math.isfinite(refresh_hz) or not 1 <= refresh_hz <= 1000:
+        return None
+    return refresh_hz
 
 
 def _calibration_grid_qrs(values):
@@ -216,11 +245,18 @@ def _qt_screen_choices():
 
 def _run_calibration_clock_process(stop_event, error_queue, display_options):
     try:
-        from calibration.display_qt import run_calibration_display
+        options = dict(display_options)
+        display_backend = options.pop("display_backend", "qt")
+        if display_backend == "qt":
+            from calibration.display_qt import run_calibration_display
+        elif display_backend == "pygame":
+            from calibration.display import run_calibration_display
+        else:
+            raise ValueError(f"Unknown QR display backend: {display_backend}")
 
-        exit_code = run_calibration_display(stop_event, **display_options)
+        exit_code = run_calibration_display(stop_event, **options)
         if exit_code:
-            raise RuntimeError(f"Qt display exited with status {exit_code}")
+            raise RuntimeError(f"QR display exited with status {exit_code}")
     except KeyboardInterrupt:
         return
     except BaseException as error:
@@ -314,6 +350,7 @@ def _start_calibration_clock(values, config, runtime):
         return
 
     try:
+        display_backend = _calibration_display_backend(values)
         screen_index = _calibration_screen_index(values)
         grid_qrs = _calibration_grid_qrs(values)
         visible_qrs = _calibration_visible_qrs(values, grid_qrs)
@@ -347,14 +384,20 @@ def _start_calibration_clock(values, config, runtime):
 
     stop_event = runtime.process_context.Event()
     error_queue = runtime.process_context.Queue(1)
+    display_options = {
+        "display_backend": display_backend,
+        "journal_path": journal_path,
+        "screen_index": screen_index,
+        "visible_qrs": visible_qrs,
+        "grid_qrs": grid_qrs,
+    }
+    if display_backend == "pygame":
+        refresh_hz = _calibration_screen_refresh_hz(values)
+        if refresh_hz is not None:
+            display_options["refresh_hz"] = refresh_hz
     process = runtime.process_context.Process(
         target=_run_calibration_clock_process,
-        args=(stop_event, error_queue, {
-            "journal_path": journal_path,
-            "screen_index": screen_index,
-            "visible_qrs": visible_qrs,
-            "grid_qrs": grid_qrs,
-        }),
+        args=(stop_event, error_queue, display_options),
         name="calibration-clock",
     )
     try:

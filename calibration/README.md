@@ -18,14 +18,23 @@ alignment.
   underlines the newest code, and records swap timing in
   `display_timestamps.jsonl`. Press `P` to
   pause or resume; `Q`, Escape, and Ctrl+C close it.
+- `display.py` provides the selectable Pygame/SDL clock with the same grid,
+  visible-code, snake-order, newest-marker, monitor-index, and journal behavior.
+  It retains Pygame's paced presentation loop and supports `P`, `Q`, and Escape.
 - `qr.py` creates the 12-digit monotonic-millisecond QR payloads and provides
   QReader decoding, per-cell retries, and snake-grid ordering.
 - `recording_display.py` opens the recording inspection window. It decodes the
   undistorted frames, allows PTS, NTP, and QR values to be corrected, validates
-  every readable value against the display journal and cell, selects the latest
-  valid readable QR, and labels suspect or unknown timing evidence. Missing or
-  unreadable QR codes do not reject a frame when another valid QR is available.
-  The default undistortion alpha is `0.25`.
+  every readable value against the display journal, selects the latest valid
+  readable QR, and reports camera-grid position disagreements without rejecting
+  an otherwise unambiguous journal match. Missing or unreadable QR codes do not
+  reject a frame when another valid QR is available. The default undistortion
+  alpha is `0.25`. Full-folder scans use two isolated frame workers, each with
+  its own CUDA-capable QReader model; within each frame, recovery crops are sent
+  through QRDet in groups of four. Every configured cell is covered by the
+  full-frame pass or a missing-cell retry. The image cache is bounded to eight
+  frames so long recordings do not retain every original and undistorted image
+  in memory.
 - `quantitative_analysis.py` compares correction strategies on clean evidence,
   writes the verdict, and creates all graphs with Matplotlib. PNG is the default;
   vector SVG copies are optional.
@@ -42,11 +51,12 @@ alignment.
    the complete recording, then close it so its journal is flushed.
 2. Open **Visualization** for the recording, or start the root analyzer from a
    terminal.
-3. Review the automatically decoded frames. Frames without any valid readable
-   QR are skipped; other readable values remain usable even when several grid
-   cells are unreadable. Correct editable PTS, NTP, or QR values only when the
-   recording visibly supports the correction.
-4. Select **Create analysis files**. The button creates only
+3. Review the initially decoded frame. Correct editable PTS, NTP, or QR values
+   only when the recording visibly supports the correction.
+4. Select **GO — DECODE FULL FOLDER**. Each frame is shown as it finishes
+   decoding. Frames without any valid readable QR are skipped; other readable
+   values remain usable even when several grid cells are unreadable. When the
+   scan finishes, it automatically creates
    `calibration_analysis.json` and `calibration_frames.csv` in a sibling folder
    named `<recording>_analysis`.
 5. Close the inspection window. The root analyzer then creates the quantitative
@@ -84,10 +94,16 @@ PNG-only default.
 The QR display can also be started directly:
 
 ```bash
+# Qt/OpenGL
 python3 -m calibration.display_qt --list-screens
 python3 -m calibration.display_qt --screen 1
 python3 -m calibration.display_qt --screen 1 --grid-qrs 12 --visible-qrs 8
 python3 -m calibration.display_qt --screen 1 --windowed --width 1280 --height 720
+
+# Pygame/SDL
+python3 -m calibration.display --screen 1
+python3 -m calibration.display --screen 1 --grid-qrs 12 --visible-qrs 8
+python3 -m calibration.display --screen 1 --windowed --width 1280 --height 720
 ```
 
 ## Required recording inputs

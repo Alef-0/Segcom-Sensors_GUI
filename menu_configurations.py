@@ -32,6 +32,7 @@ class Configurations(BaseConfigurations):
         super().centralize_combos()
         for key in (
             "calibration_decoder",
+            "calibration_display",
             "calibration_screen",
             "calibration_grid_qrs",
             "calibration_visible_qrs",
@@ -299,6 +300,14 @@ class Configurations(BaseConfigurations):
             [
                 sg.Push(),
                 sg.Text("Current latencies: 145 ms / 109 ms", key="calibration_latency_status"),
+                sg.Text("QR display"),
+                sg.Combo(
+                    ("Qt / OpenGL", "Pygame / SDL"),
+                    "Qt / OpenGL",
+                    key="calibration_display",
+                    readonly=True,
+                    size=(14, 1),
+                ),
                 sg.Text("Camera pipeline"),
                 sg.Combo(
                     ("Usual NVIDIA", "ARM / Jetson", "CPU"),
@@ -341,7 +350,7 @@ class Configurations(BaseConfigurations):
             [sg.HorizontalSeparator()],
             [
                 sg.Push(),
-                sg.Text("Qt/OpenGL QR calibration clock"),
+                sg.Text("Selectable Qt/OpenGL or Pygame/SDL QR calibration clock"),
                 sg.Button(
                     "OPEN CALIBRATION CAMERA 4",
                     key="calibration_camera_toggle",
@@ -553,6 +562,7 @@ class Configurations(BaseConfigurations):
         )
         settings_disabled = self.calibration_camera or self.calibration_camera_pending
         self.window["calibration_decoder"].update(disabled=settings_disabled)
+        self.window["calibration_display"].update(disabled=self.calibration_clock)
         self.window["calibration_screen"].update(disabled=self.calibration_clock)
         self.window["calibration_grid_qrs"].update(disabled=self.calibration_clock)
         self.window["calibration_visible_qrs"].update(disabled=self.calibration_clock)

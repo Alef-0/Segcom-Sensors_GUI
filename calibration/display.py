@@ -13,15 +13,25 @@ import time
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame
 
-from calibration.qr import QUIET_ZONE_MODULES, qr_matrix, timestamp_payload
+from calibration.qr import (
+    GRID_LAYOUTS,
+    QUIET_ZONE_MODULES,
+    grid_bounds,
+    grid_cell_names,
+    grid_positions,
+    grid_shape,
+    qr_matrix,
+    timestamp_payload,
+)
 
 
 DISPLAY_JOURNAL_NAME = "display_timestamps.jsonl"
-DISPLAY_FORMAT = "segcom-qr-display-v1"
-WINDOW_NAME = "QR Calibration Clock"
+DISPLAY_FORMAT = "segcom-qr-display-pygame-v2"
+WINDOW_NAME = "QR Calibration Clock — Pygame/SDL"
 BACKGROUND = (50, 50, 50)
 FOREGROUND = (255, 255, 255)
-QUADRANT_COUNT = 4
+BLACK = (0, 0, 0)
+DEFAULT_GRID_QRS = 4
 VISIBLE_QRS = 2
 REFRESH_HZ = 60.0
 UNDERLINE_HEIGHT = 4
@@ -32,51 +42,69 @@ def format_timestamp(timestamp_ns: int) -> str:
     return f"{seconds:,}".replace(",", " ") + f".{nanoseconds // 1_000_000:03d}"
 
 
-def quadrant_areas(width: int, height: int) -> tuple[pygame.Rect, ...]:
-    left, top = width // 2, height // 2
-    return (
-        pygame.Rect(0, 0, left, top),
-        pygame.Rect(left, 0, width - left, top),
-        pygame.Rect(left, top, width - left, height - top),
-        pygame.Rect(0, top, left, height - top),
+def grid_areas(width: int, height: int, grid_qrs: int) -> tuple[pygame.Rect, ...]:
+    return tuple(
+        pygame.Rect(left, top, right - left, bottom - top)
+        for left, top, right, bottom in grid_bounds(width, height, grid_qrs)
     )
 
 
-class QRClockRenderer:
-    """Draw two successive QR timestamps on one persistent display surface."""
+def quadrant_areas(width: int, height: int) -> tuple[pygame.Rect, ...]:
+    """Compatibility wrapper for the original four-cell renderer."""
+    return grid_areas(width, height, DEFAULT_GRID_QRS)
 
-    def __init__(self, target: pygame.Surface):
+
+class QRClockRenderer:
+    """Draw the requested newest QR timestamps on one persistent surface."""
+
+    def __init__(
+        self,
+        target: pygame.Surface,
+        visible_qrs: int = VISIBLE_QRS,
+        grid_qrs: int = DEFAULT_GRID_QRS,
+    ):
         width, height = target.get_size()
         if width < 320 or height < 240:
             raise ValueError("Canvas must be at least 320 by 240 pixels")
+        grid_shape(grid_qrs)
+        if not 1 <= visible_qrs <= grid_qrs:
+            raise ValueError(f"Visible QR codes must be from 1 to {grid_qrs}")
         if not pygame.font.get_init():
             pygame.font.init()
         self.target = target
         self.size = target.get_size()
-        self.areas = quadrant_areas(width, height)
-        font_size = max(22, min(width // 32, height // 18))
+        self.grid_qrs = grid_qrs
+        self.visible_qrs = visible_qrs
+        self.cell_names = grid_cell_names(grid_qrs)
+        self.areas = grid_areas(width, height, grid_qrs)
+        rows, columns = grid_shape(grid_qrs)
+        font_size = max(10, min(width // (columns * 14), height // (rows * 10)))
         self.font = pygame.font.Font(None, font_size)
         self.qr_rects = tuple(self._qr_rect(area) for area in self.areas)
-        self.underlines = tuple(self._underline(area, corner) for corner, area in enumerate(self.areas))
-        self.timestamps: list[int | None] = [None] * QUADRANT_COUNT
-        self.next_corner = 0
-        self.newest_corner: int | None = None
+        self.underlines = tuple(self._underline(area) for area in self.areas)
+        self.timestamps: list[int | None] = [None] * grid_qrs
+        self.display_indices: list[int | None] = [None] * grid_qrs
+        self.next_cell = 0
+        self.newest_cell: int | None = None
         target.fill(BACKGROUND)
 
     def _qr_rect(self, area: pygame.Rect) -> pygame.Rect:
-        text_height = self.font.get_linesize() + 12
-        available_height = area.height - text_height - 22
-        side = min(area.width - 48, available_height)
-        side = max(80, side)
+        margin = max(4, min(12, area.width // 24, area.height // 24))
+        text_height = self.font.get_linesize() + 4
+        label_gap = max(4, margin)
+        content_top = area.top + margin + text_height + label_gap + UNDERLINE_HEIGHT
+        content_bottom = area.bottom - margin
+        available_height = max(1, content_bottom - content_top)
+        side = max(25, min(area.width - 2 * margin, available_height))
         rect = pygame.Rect(0, 0, side, side)
         rect.centerx = area.centerx
-        rect.centery = area.centery
+        rect.top = content_top + max(0, (available_height - side) // 2)
         return rect
 
-    @staticmethod
-    def _underline(area: pygame.Rect, corner: int) -> pygame.Rect:
-        width = max(40, area.width // 3)
-        y = area.y + 47 if corner in (0, 1) else area.bottom - 6
+    def _underline(self, area: pygame.Rect) -> pygame.Rect:
+        width = max(24, area.width // 3)
+        margin = max(4, min(12, area.width // 24, area.height // 24))
+        y = area.top + margin + self.font.get_linesize() + 6
         return pygame.Rect(area.centerx - width // 2, y, width, UNDERLINE_HEIGHT)
 
     def _draw_qr(self, rect: pygame.Rect, payload: str) -> pygame.Rect:
@@ -90,40 +118,69 @@ class QRClockRenderer:
         dark = pygame.Rect(0, 0, scale, scale)
         for row, column in zip(*matrix.nonzero()):
             dark.topleft = bounds.x + int(column) * scale, bounds.y + int(row) * scale
-            self.target.fill((0, 0, 0), dark)
+            self.target.fill(BLACK, dark)
         return bounds
 
-    def render_next(self, timestamp_ns: int) -> int:
-        corner = self.next_corner
-        if self.newest_corner is not None:
-            self.target.fill(BACKGROUND, self.underlines[self.newest_corner])
-        expired = (corner - VISIBLE_QRS) % QUADRANT_COUNT
+    def render_next(self, timestamp_ns: int, display_index: int) -> int:
+        cell = self.next_cell
+        if self.newest_cell is not None:
+            self.target.fill(BACKGROUND, self.underlines[self.newest_cell])
+        expired = (cell - self.visible_qrs) % self.grid_qrs
         if self.timestamps[expired] is not None:
             self.target.fill(BACKGROUND, self.areas[expired])
             self.timestamps[expired] = None
-        self.target.fill(BACKGROUND, self.areas[corner])
-        bounds = self._draw_qr(self.qr_rects[corner], timestamp_payload(timestamp_ns))
-        text = self.font.render(format_timestamp(timestamp_ns), True, FOREGROUND, BACKGROUND)
-        text_rect = text.get_rect(centerx=self.areas[corner].centerx)
-        text_rect.y = 10 if corner in (0, 1) else self.areas[corner].bottom - text_rect.height - 10
+            self.display_indices[expired] = None
+        self.target.fill(BACKGROUND, self.areas[cell])
+        bounds = self._draw_qr(self.qr_rects[cell], timestamp_payload(timestamp_ns))
+        text = self.font.render(
+            f"#{display_index}  {format_timestamp(timestamp_ns)}",
+            True,
+            FOREGROUND,
+            BACKGROUND,
+        )
+        text_rect = text.get_rect(centerx=self.areas[cell].centerx)
+        margin = max(
+            4,
+            min(12, self.areas[cell].width // 24, self.areas[cell].height // 24),
+        )
+        text_rect.y = self.areas[cell].top + margin
         self.target.blit(text, text_rect)
-        self.target.fill(FOREGROUND, self.underlines[corner])
-        self.qr_rects = tuple(bounds if index == corner else value for index, value in enumerate(self.qr_rects))
-        self.timestamps[corner] = timestamp_ns
-        self.newest_corner = corner
-        self.next_corner = (corner + 1) % QUADRANT_COUNT
-        return corner
+        underline = self.underlines[cell]
+        underline.top = text_rect.bottom + 2
+        self.target.fill(FOREGROUND, underline)
+        self.qr_rects = tuple(
+            bounds if index == cell else value
+            for index, value in enumerate(self.qr_rects)
+        )
+        self.timestamps[cell] = timestamp_ns
+        self.display_indices[cell] = display_index
+        self.newest_cell = cell
+        self.next_cell = (cell + 1) % self.grid_qrs
+        return cell
 
     def metadata(self) -> dict:
         return {
             "size": list(self.size),
             "code_format": "qr",
             "qr_border_modules": QUIET_ZONE_MODULES,
-            "visible_qrs": VISIBLE_QRS,
+            "display_backend": "pygame-sdl",
+            "grid_qrs": self.grid_qrs,
+            "grid_rows": grid_shape(self.grid_qrs)[0],
+            "grid_columns": grid_shape(self.grid_qrs)[1],
+            "cell_order": list(self.cell_names),
+            "cell_positions": [list(position) for position in grid_positions(self.grid_qrs)],
+            "visible_qrs": self.visible_qrs,
             "indicator_style": "underline",
             "indicator_width": UNDERLINE_HEIGHT,
-            "corner_order": ["top-left", "top-right", "bottom-right", "bottom-left"],
+            "corner_order": (
+                ["top-left", "top-right", "bottom-right", "bottom-left"]
+                if self.grid_qrs == 4 else None
+            ),
             "timestamp_semantics": "monotonic time sampled before drawing, not physical scanout",
+            "frame_index_semantics": (
+                "display index is shown as text and recorded in the journal; "
+                "the QR payload remains timestamp-only for decoder compatibility"
+            ),
             "layouts": [
                 {"area": list(area), "qr": list(qr), "underline": list(underline)}
                 for area, qr, underline in zip(self.areas, self.qr_rects, self.underlines)
@@ -216,6 +273,7 @@ class DisplayJournal:
         self.file = None if path is None else Path(path).open("x", encoding="utf-8", buffering=65536)
         self.frames: list[dict] = []
         self.last_flush_ns = time.monotonic_ns()
+        self._closed = False
         self._write({"kind": "session", "format": DISPLAY_FORMAT, **metadata})
         if self.file:
             self.file.flush()
@@ -224,8 +282,16 @@ class DisplayJournal:
         if self.file:
             self.file.write(json.dumps(value, separators=(",", ":")) + "\n")
 
-    def append(self, corner: int, timing: dict) -> None:
-        row = {"kind": "frame", "index": len(self.frames), "corner": corner, **timing}
+    def append(self, cell: int, timing: dict) -> None:
+        row = {
+            "kind": "frame",
+            "index": len(self.frames),
+            "display_frame": len(self.frames),
+            "cell": cell,
+            # Retained so older readers can still interpret four-cell journals.
+            "corner": cell,
+            **timing,
+        }
         self.frames.append(row)
         self._write(row)
         issues = timing_issues(row)
@@ -252,6 +318,9 @@ class DisplayJournal:
             self.file.flush()
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         counts = {
             "missed_period_candidates": sum(row.get("skipped_periods", 0) for row in self.frames),
             "irregular_intervals": sum(bool(row.get("irregular_interval")) for row in self.frames),
@@ -277,23 +346,52 @@ def run_calibration_display(
     windowed: bool = False,
     refresh_hz: float = REFRESH_HZ,
     journal_path: str | None = None,
+    screen_index: int = 0,
+    visible_qrs: int = VISIBLE_QRS,
+    grid_qrs: int = DEFAULT_GRID_QRS,
 ) -> None:
     """Sample, draw, and flip on one thread without queued display frames."""
+    if width < 320 or height < 240:
+        raise ValueError("Canvas must be at least 320 by 240 pixels")
+    grid_shape(grid_qrs)
+    if not 1 <= visible_qrs <= grid_qrs:
+        raise ValueError(f"Visible QR codes must be from 1 to {grid_qrs}")
+
     pygame.display.init()
     pygame.font.init()
     journal = None
     try:
+        display_count = pygame.display.get_num_displays()
+        if not 0 <= screen_index < display_count:
+            raise ValueError(
+                f"Invalid --screen {screen_index}; available displays: 0..{display_count - 1}"
+            )
         flags = pygame.SCALED | (0 if windowed else pygame.FULLSCREEN)
         try:
-            screen = pygame.display.set_mode((width, height), flags, vsync=1)
+            requested_size = (
+                (width, height)
+                if windowed
+                else pygame.display.get_desktop_sizes()[screen_index]
+            )
+            screen = pygame.display.set_mode(
+                requested_size,
+                flags,
+                display=screen_index,
+                vsync=1,
+            )
         except pygame.error as error:
             raise RuntimeError("Pygame could not create the QR calibration display") from error
         pygame.display.set_caption(WINDOW_NAME)
-        renderer = QRClockRenderer(screen)
+        renderer = QRClockRenderer(
+            screen,
+            visible_qrs=visible_qrs,
+            grid_qrs=grid_qrs,
+        )
         pygame.display.flip()
         pacer = FramePacer(time.monotonic_ns(), refresh_hz)
         journal = DisplayJournal(journal_path, {
             **renderer.metadata(),
+            "screen_index": screen_index,
             "requested_refresh_hz": refresh_hz,
             "pygame_version": pygame.version.ver,
             "sdl_version": list(pygame.get_sdl_version()),
@@ -340,14 +438,14 @@ def run_calibration_display(
                     break
                 continue
             marker_ns = time.monotonic_ns()
-            corner = renderer.render_next(marker_ns)
+            cell = renderer.render_next(marker_ns, len(journal.frames))
             submit_ns = time.monotonic_ns()
             pygame.display.flip()
             flip_return_ns = time.monotonic_ns()
             timing = pacer.observe(marker_ns, submit_ns, flip_return_ns, skipped)
             timing["resumed_after_pause"] = resumed_after_pause
             resumed_after_pause = False
-            journal.append(corner, timing)
+            journal.append(cell, timing)
     finally:
         if journal is not None:
             journal.close()
@@ -361,6 +459,26 @@ def main() -> None:
     parser.add_argument("--windowed", action="store_true")
     parser.add_argument("--refresh-hz", type=float, default=REFRESH_HZ)
     parser.add_argument("--journal", help="New display timing journal path")
+    parser.add_argument(
+        "--grid-qrs",
+        type=int,
+        choices=tuple(GRID_LAYOUTS),
+        default=DEFAULT_GRID_QRS,
+        help="Total QR cells in the display grid (default: 4)",
+    )
+    parser.add_argument(
+        "--visible-qrs",
+        type=int,
+        choices=range(1, max(GRID_LAYOUTS) + 1),
+        default=VISIBLE_QRS,
+        help="Number of recent QR codes left visible (default: 2)",
+    )
+    parser.add_argument(
+        "--screen",
+        type=int,
+        default=0,
+        help="SDL display index to use (default: 0)",
+    )
     arguments = parser.parse_args()
     run_calibration_display(
         width=arguments.width,
@@ -368,6 +486,9 @@ def main() -> None:
         windowed=arguments.windowed,
         refresh_hz=arguments.refresh_hz,
         journal_path=arguments.journal,
+        screen_index=arguments.screen,
+        visible_qrs=arguments.visible_qrs,
+        grid_qrs=arguments.grid_qrs,
     )
 
 

@@ -9,19 +9,25 @@ import threading
 import unittest
 from unittest.mock import patch
 
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import cv2
 import numpy as np
+import pygame
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtGui import QGuiApplication
 
 import analyze_calibration_recording as recording_launcher
+from calibration.display import QRClockRenderer as PygameQRClockRenderer
 from calibration.display_qt import QRClockRenderer, VISIBLE_QRS
 from calibration.quantitative_analysis import analyze_output_directory
 from calibration.qr import (
+    DETECTION_BATCH_SIZE,
     GRID_LAYOUTS,
     QUIET_ZONE_MODULES,
     cell_index_for,
+    decode_qrs_batch,
     decode_qrs_with_quadrant_retries,
     grid_bounds,
     grid_cell_names,
@@ -119,6 +125,49 @@ class QRHelpersTests(unittest.TestCase):
         self.assertEqual(cell_index_for((90, 75), (120, 100), 6), 3)
         self.assertEqual(grid_cell_names(4)[2], "Bottom-right")
 
+    def test_batch_detection_uses_one_model_prediction_and_keeps_image_order(self):
+        class FakeModel:
+            def __init__(self):
+                self.calls = []
+
+            def predict(self, **kwargs):
+                self.calls.append(kwargs)
+                return [f"prediction-{index}" for index in range(len(kwargs["source"]))]
+
+        class BatchReader:
+            def __init__(self):
+                self.detector = type("Detector", (), {
+                    "model": FakeModel(),
+                    "_conf_th": 0.3,
+                    "_nms_iou": 0.3,
+                })()
+
+            @staticmethod
+            def decode(image, detection_result):
+                return detection_result["raw"]
+
+        reader = BatchReader()
+        images = [np.full((20, 20, 3), index, np.uint8) for index in range(3)]
+
+        with (
+            patch("qrdet._prepare_input", side_effect=lambda source, is_bgr: source),
+            patch(
+                "qrdet._yolo_v8_results_to_dict",
+                side_effect=lambda results, image: [{
+                    "raw": results,
+                    "bbox_xyxy": np.asarray((1, 2, 11, 12), dtype=float),
+                    "confidence": 0.9,
+                }],
+            ),
+        ):
+            batches = decode_qrs_batch(reader, images)
+
+        self.assertEqual(len(reader.detector.model.calls), 1)
+        self.assertEqual(
+            [[item["raw"] for item in batch] for batch in batches],
+            [["prediction-0"], ["prediction-1"], ["prediction-2"]],
+        )
+
     def test_renderer_keeps_exactly_two_quadrants(self):
         self.qt_app = QGuiApplication.instance() or QGuiApplication(["qr-test"])
         renderer = QRClockRenderer(960, 540)
@@ -153,6 +202,31 @@ class QRHelpersTests(unittest.TestCase):
             self.assertGreaterEqual(qr.left(), area.left())
             self.assertLessEqual(qr.right(), area.right())
             self.assertLessEqual(qr.bottom(), area.bottom())
+
+    def test_pygame_renderer_matches_variable_qr_grid_behavior(self):
+        target = pygame.Surface((1920, 1080))
+        renderer = PygameQRClockRenderer(
+            target,
+            visible_qrs=6,
+            grid_qrs=12,
+        )
+
+        for index in range(14):
+            renderer.render_next(10_000_000_000 + index * 20_000_000, index)
+
+        self.assertEqual(sum(value is not None for value in renderer.timestamps), 6)
+        self.assertEqual(renderer.display_indices[1], 13)
+        self.assertEqual(renderer.metadata()["display_backend"], "pygame-sdl")
+        self.assertEqual(renderer.metadata()["grid_qrs"], 12)
+        self.assertEqual(renderer.metadata()["grid_columns"], 6)
+        self.assertEqual(renderer.metadata()["visible_qrs"], 6)
+        for area, underline, qr in zip(
+            renderer.areas,
+            renderer.underlines,
+            renderer.qr_rects,
+        ):
+            self.assertGreater(qr.top, underline.bottom)
+            self.assertTrue(area.contains(qr))
 
 
 class RecordingTests(unittest.TestCase):
@@ -263,6 +337,55 @@ class RecordingTests(unittest.TestCase):
             self.assertEqual(check["latest_cell"], 11)
             self.assertEqual(check["latest_marker"]["index"], 11)
 
+    def test_automatic_selection_uses_journal_cell_when_camera_grid_is_shifted(self):
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            rows = self.fixture(folder, count=8, grid_qrs=10, visible_qrs=5)
+            frames = rows[1:]
+            selected_indices = (1, 2, 3, 4, 5, 6)
+            boxes = (
+                [25, 10, 35, 30],
+                [45, 10, 55, 30],
+                [48, 10, 58, 30],
+                [65, 10, 75, 30],
+                [65, 60, 75, 80],
+                [45, 60, 55, 80],
+            )
+            reader = FakeReader(
+                [timestamp_payload(frames[index]["marker_ns"]) for index in selected_indices],
+                boxes,
+            )
+            model = RecordingAnalyzer(folder, DEFAULT_INTRINSICS, reader=reader)
+
+            result = model.analyze(0)
+            check = model.check_frame(result)
+
+            self.assertTrue(check["valid"])
+            self.assertEqual(check["matched_readable_qrs"], len(selected_indices))
+            self.assertEqual(check["latest_cell"], frames[6]["cell"])
+            self.assertEqual(check["latest_marker"]["index"], 6)
+            self.assertTrue(any(item["mismatch"] for item in result["observations"]))
+            self.assertEqual(len(check["position_warnings"]), 4)
+
+    def test_scan_progress_passes_each_decoded_frame(self):
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            self.fixture(folder)
+            model = RecordingAnalyzer(
+                folder,
+                DEFAULT_INTRINSICS,
+                reader=FakeReader([], []),
+            )
+            progress = []
+
+            model.summarize(
+                0.25,
+                threading.Event(),
+                lambda done, total, frame: progress.append((done, total, frame["index"])),
+            )
+
+            self.assertEqual(progress, [(1, 1, 0)])
+
     def test_scan_accepts_any_amount_of_missing_qrs_when_one_matches(self):
         with TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -320,6 +443,7 @@ class RecordingTests(unittest.TestCase):
             self.assertTrue(json_path.is_file())
             self.assertTrue(csv_path.is_file())
             loaded = json.loads(json_path.read_text(encoding="utf-8"))
+            self.assertEqual(loaded["detection_batch_size"], DETECTION_BATCH_SIZE)
             self.assertEqual(loaded["counts"]["accepted_frames"], 1)
             self.assertEqual(loaded["frames"][0]["validation"], "accepted_unknown")
             self.assertIn("qr_values_ms", csv_path.read_text(encoding="utf-8"))

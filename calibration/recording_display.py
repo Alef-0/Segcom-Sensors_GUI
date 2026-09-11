@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, OrderedDict
+from concurrent.futures import ProcessPoolExecutor
 import csv
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import json
+import multiprocessing
 from pathlib import Path
 from queue import Empty, Queue
 import statistics
@@ -22,8 +24,9 @@ from PIL import Image, ImageTk
 
 from calibration.display_qt import DISPLAY_JOURNAL_NAME, timing_issues
 from calibration.qr import (
+    DETECTION_BATCH_SIZE,
     create_qreader,
-    decode_qrs_with_grid_retries,
+    decode_qrs_with_grid_retries_batch,
     grid_cell_names,
     grid_positions,
     grid_shape,
@@ -41,6 +44,7 @@ CELL_COLORS = (
     "#9eb8ff", "#f4a8d8", "#d8c66b", "#74d8c8", "#c4a4ff", "#ffb36b",
 )
 LATEST_COLOR = "#fff176"
+PARALLEL_FRAME_WORKERS = 2
 
 
 def read_json_rows(path: Path) -> list[dict]:
@@ -141,6 +145,33 @@ class Undistorter:
         return cv2.projectPoints(
             rays, np.zeros(3), np.zeros(3), matrix, self.distortion
         )[0].reshape(-1, 2)
+
+
+_PROCESS_READER = None
+_PROCESS_UNDISTORTER = None
+_PROCESS_GRID_QRS = None
+
+
+def _initialize_decode_process(intrinsics: str, grid_qrs: int) -> None:
+    global _PROCESS_READER, _PROCESS_UNDISTORTER, _PROCESS_GRID_QRS
+    _PROCESS_READER = create_qreader()
+    _PROCESS_UNDISTORTER = Undistorter(Path(intrinsics))
+    _PROCESS_GRID_QRS = grid_qrs
+
+
+def _decode_recording_frame(task: tuple[int, str, float]) -> tuple[int, list[dict]]:
+    index, filename, alpha = task
+    image = cv2.imread(filename)
+    if image is None:
+        raise ValueError("Could not read " + filename)
+    undistorted = _PROCESS_UNDISTORTER.image(image, alpha)
+    decoded = decode_qrs_with_grid_retries_batch(
+        _PROCESS_READER,
+        [undistorted],
+        _PROCESS_GRID_QRS,
+        DETECTION_BATCH_SIZE,
+    )[0]
+    return index, decoded
 
 
 class DisplayTimeline:
@@ -261,9 +292,12 @@ class RecordingAnalyzer:
         }
         if not intrinsics.is_file():
             raise ValueError("Camera intrinsics file does not exist: " + str(intrinsics))
-        self.undistorter = Undistorter(intrinsics)
+        self.intrinsics = intrinsics.resolve()
+        self.undistorter = Undistorter(self.intrinsics)
+        self.parallel_scan = reader is None
         self.reader = reader or create_qreader()
-        self.cache: dict[tuple[int, float], dict] = {}
+        self.cache: OrderedDict[tuple[int, float], dict] = OrderedDict()
+        self.cache_limit = DETECTION_BATCH_SIZE * 2
         self.manual_values: dict[int, dict] = {}
 
     def pts_monotonic_ns(self, row: dict) -> int | None:
@@ -287,12 +321,14 @@ class RecordingAnalyzer:
         by_cell = [[] for _ in range(self.grid_qrs)]
         for item in result["observations"]:
             if item["raw"] is not None:
-                by_cell[item["cell"]].append(item)
+                marker = item.get("marker")
+                cell = int(marker["cell"]) if marker is not None else item["cell"]
+                by_cell[cell].append(item)
         values = []
         for observations in by_cell:
             matched = [
                 item for item in observations
-                if item["display_index"] is not None and not item["mismatch"]
+                if item["display_index"] is not None
             ]
             if matched:
                 values.append(max(matched, key=lambda item: item["display_index"])["raw"])
@@ -351,16 +387,21 @@ class RecordingAnalyzer:
             if marker is None:
                 ignored.append({"cell": cell, "raw": raw, "reason": "not_in_display_journal"})
                 continue
-            if marker["cell"] != cell:
+            if values["manual"] and marker["cell"] != cell:
                 ignored.append({"cell": cell, "raw": raw, "reason": "cell_mismatch"})
                 continue
-            candidates.append({"cell": cell, "raw": raw, "marker": marker})
+            candidates.append({
+                "cell": int(marker["cell"]),
+                "detected_cell": cell,
+                "raw": raw,
+                "marker": marker,
+            })
 
         if not candidates:
             return {
                 "valid": False,
                 "skippable": True,
-                "reason": "No readable QR matched the display journal and grid cell",
+                "reason": "No readable QR matched the display journal",
                 "values": values,
                 "indices": [],
                 "matched_readable_qrs": 0,
@@ -370,6 +411,16 @@ class RecordingAnalyzer:
 
         latest = max(candidates, key=lambda item: int(item["marker"]["index"]))
         latest_marker = latest["marker"]
+        position_warnings = [
+            {
+                "raw": item["raw"],
+                "detected_cell": item["detected_cell"],
+                "journal_cell": item["cell"],
+                "reason": "camera_grid_position_differs_from_journal",
+            }
+            for item in candidates
+            if item["detected_cell"] != item["cell"]
+        ]
         timing_status, issues = self.timeline.marker_status(latest_marker["index"])
         offset_ms = None
         if reference_ns is not None:
@@ -383,6 +434,7 @@ class RecordingAnalyzer:
             "matched_readable_qrs": len(candidates),
             "ignored_readable_qrs": len(ignored),
             "decode_issues": ignored,
+            "position_warnings": position_warnings,
             "latest_cell": latest["cell"],
             "latest_raw": latest["raw"],
             "latest_marker": latest_marker,
@@ -391,10 +443,7 @@ class RecordingAnalyzer:
             "offset_ms": offset_ms,
         }
 
-    def analyze(self, index: int, alpha: float = 0.25) -> dict:
-        key = index, alpha
-        if key in self.cache:
-            return self.cache[key]
+    def _load_frame(self, index: int, alpha: float) -> tuple[dict, np.ndarray, np.ndarray]:
         row = self.rows[index]
         image_path = resolve_recording_file(
             self.folder, row["filename"], IMAGE_DIRECTORY_NAME
@@ -405,8 +454,19 @@ class RecordingAnalyzer:
         if original is None:
             raise ValueError("Could not read " + row["filename"])
         undistorted = self.undistorter.image(original, alpha)
+        return row, original, undistorted
+
+    def _finish_analysis(
+        self,
+        index: int,
+        row: dict,
+        original: np.ndarray,
+        undistorted: np.ndarray,
+        decoded: list[dict],
+        alpha: float,
+    ) -> dict:
         detections = order_by_cell(
-            decode_qrs_with_grid_retries(self.reader, undistorted, self.grid_qrs),
+            decoded,
             (undistorted.shape[1], undistorted.shape[0]),
             self.grid_qrs,
         )
@@ -455,8 +515,63 @@ class RecordingAnalyzer:
             "latest": latest,
             "pts_monotonic_ns": reference_ns,
         }
+        key = index, alpha
         self.cache[key] = result
+        self.cache.move_to_end(key)
+        while len(self.cache) > self.cache_limit:
+            self.cache.popitem(last=False)
         return result
+
+    def analyze_batch(
+        self,
+        indices,
+        alpha: float = 0.25,
+        executor: ProcessPoolExecutor | None = None,
+    ) -> list[dict]:
+        indices = tuple(indices)
+        results = {}
+        pending = []
+        for index in indices:
+            key = index, alpha
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                results[index] = self.cache[key]
+            else:
+                pending.append(index)
+
+        if executor is None:
+            loaded = [self._load_frame(index, alpha) for index in pending]
+            decoded_batches = decode_qrs_with_grid_retries_batch(
+                self.reader,
+                [item[2] for item in loaded],
+                self.grid_qrs,
+                DETECTION_BATCH_SIZE,
+            )
+        else:
+            tasks = []
+            for index in pending:
+                row = self.rows[index]
+                image_path = resolve_recording_file(
+                    self.folder, row["filename"], IMAGE_DIRECTORY_NAME
+                )
+                if image_path is None:
+                    raise ValueError(
+                        "Missing image or image outside recording folder: " + row["filename"]
+                    )
+                tasks.append((index, str(image_path), alpha))
+            decoded_by_index = dict(executor.map(_decode_recording_frame, tasks))
+            loaded = [self._load_frame(index, alpha) for index in pending]
+            decoded_batches = [decoded_by_index[index] for index in pending]
+
+        for index, loaded_frame, decoded in zip(pending, loaded, decoded_batches):
+            row, original, undistorted = loaded_frame
+            results[index] = self._finish_analysis(
+                index, row, original, undistorted, decoded, alpha
+            )
+        return [results[index] for index in indices]
+
+    def analyze(self, index: int, alpha: float = 0.25) -> dict:
+        return self.analyze_batch((index,), alpha)[0]
 
     def summarize(self, alpha: float, cancel: threading.Event, progress) -> dict:
         counts = Counter()
@@ -465,81 +580,106 @@ class RecordingAnalyzer:
         frame_reports = []
         processed = 0
         stopped = None
-        for index in range(len(self.rows)):
-            if cancel.is_set():
-                break
-            result = self.analyze(index, alpha)
-            processed += 1
-            check = self.check_frame(result)
-            observations = result["observations"]
-            counts["detections"] += len(observations)
-            counts["unreadable"] += sum(item["raw"] is None for item in observations)
-            counts["mismatches"] += sum(item["mismatch"] for item in observations)
-            counts["journal_matched_readable"] += check.get("matched_readable_qrs", 0)
-            counts["ignored_readable"] += check.get("ignored_readable_qrs", 0)
-            readable_counts[check.get("matched_readable_qrs", 0)] += 1
-            counts["timing_suspect"] += sum(
-                item["timing_status"] == "Timing suspect" for item in observations
+        executor = None
+        frame_group = DETECTION_BATCH_SIZE
+        if self.parallel_scan:
+            frame_group = PARALLEL_FRAME_WORKERS
+            executor = ProcessPoolExecutor(
+                max_workers=PARALLEL_FRAME_WORKERS,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_initialize_decode_process,
+                initargs=(str(self.intrinsics), self.grid_qrs),
             )
-            values = check["values"]
-            if check["valid"]:
-                validation = "accepted_" + check["timing_status"].lower().replace(" ", "_")
-            elif check.get("skippable"):
-                validation = "skipped_no_readable_qr"
-            else:
-                validation = "stopped_invalid"
-            frame_report = {
-                "frame_number": index + 1,
-                "filename": result["row"]["filename"],
-                "validation": validation,
-                "reason": check["reason"],
-                "manual_values": bool(values["manual"]),
-                "pts_ns": values["pts_ns"],
-                "ntp_ns": values["ntp_ns"],
-                "grid_qrs": self.grid_qrs,
-                "qr_values_ms": list(values["qrs"]),
-                "decoded_detections": len(observations),
-                "matched_readable_qrs": check.get("matched_readable_qrs", 0),
-                "ignored_readable_qrs": check.get("ignored_readable_qrs", 0),
-                "decode_issues": check.get("decode_issues", []),
-                "display_indices": check.get("indices", []),
-                "latest_qr_ms": check.get("latest_raw"),
-                "latest_cell": (
-                    check["latest_cell"] if check.get("latest_cell") is not None else None
-                ),
-                "latest_cell_name": (
-                    self.cell_names[check["latest_cell"]]
-                    if check.get("latest_cell") is not None else None
-                ),
-                "latest_display_index": (
-                    check["latest_marker"]["index"] if check.get("latest_marker") else None
-                ),
-                "timing_status": check.get("timing_status"),
-                "timing_issues": check.get("issues", []),
-                "pts_minus_latest_qr_ms": check.get("offset_ms"),
-            }
-            if self.grid_qrs == 4:
-                frame_report.update({
-                    "qr_top_left_ms": values["qrs"][0],
-                    "qr_top_right_ms": values["qrs"][1],
-                    "qr_bottom_right_ms": values["qrs"][2],
-                    "qr_bottom_left_ms": values["qrs"][3],
-                    "latest_quadrant": frame_report["latest_cell_name"],
-                })
-            frame_reports.append(frame_report)
-            progress(processed, len(self.rows))
-            if not check["valid"]:
-                if check.get("skippable"):
-                    counts["frames_without_readable_qr"] += 1
-                    continue
-                stopped = {"index": index, "reason": check["reason"]}
-                break
-            counts["accepted_frames"] += 1
-            if check["timing_status"] == "Clean" and check["offset_ms"] is not None:
-                clean_offsets.append(check["offset_ms"])
+        try:
+            for index in range(len(self.rows)):
+                if cancel.is_set():
+                    break
+                if index % frame_group == 0:
+                    self.analyze_batch(
+                        range(index, min(index + frame_group, len(self.rows))),
+                        alpha,
+                        executor,
+                    )
+                result = self.analyze(index, alpha)
+                processed += 1
+                check = self.check_frame(result)
+                observations = result["observations"]
+                counts["detections"] += len(observations)
+                counts["unreadable"] += sum(item["raw"] is None for item in observations)
+                counts["mismatches"] += sum(item["mismatch"] for item in observations)
+                counts["journal_matched_readable"] += check.get("matched_readable_qrs", 0)
+                counts["ignored_readable"] += check.get("ignored_readable_qrs", 0)
+                readable_counts[check.get("matched_readable_qrs", 0)] += 1
+                counts["timing_suspect"] += sum(
+                    item["timing_status"] == "Timing suspect" for item in observations
+                )
+                values = check["values"]
+                if check["valid"]:
+                    validation = "accepted_" + check["timing_status"].lower().replace(" ", "_")
+                elif check.get("skippable"):
+                    validation = "skipped_no_readable_qr"
+                else:
+                    validation = "stopped_invalid"
+                frame_report = {
+                    "frame_number": index + 1,
+                    "filename": result["row"]["filename"],
+                    "validation": validation,
+                    "reason": check["reason"],
+                    "manual_values": bool(values["manual"]),
+                    "pts_ns": values["pts_ns"],
+                    "ntp_ns": values["ntp_ns"],
+                    "grid_qrs": self.grid_qrs,
+                    "qr_values_ms": list(values["qrs"]),
+                    "decoded_detections": len(observations),
+                    "matched_readable_qrs": check.get("matched_readable_qrs", 0),
+                    "ignored_readable_qrs": check.get("ignored_readable_qrs", 0),
+                    "decode_issues": check.get("decode_issues", []),
+                    "position_warnings": check.get("position_warnings", []),
+                    "display_indices": check.get("indices", []),
+                    "latest_qr_ms": check.get("latest_raw"),
+                    "latest_cell": (
+                        check["latest_cell"]
+                        if check.get("latest_cell") is not None else None
+                    ),
+                    "latest_cell_name": (
+                        self.cell_names[check["latest_cell"]]
+                        if check.get("latest_cell") is not None else None
+                    ),
+                    "latest_display_index": (
+                        check["latest_marker"]["index"]
+                        if check.get("latest_marker") else None
+                    ),
+                    "timing_status": check.get("timing_status"),
+                    "timing_issues": check.get("issues", []),
+                    "pts_minus_latest_qr_ms": check.get("offset_ms"),
+                }
+                if self.grid_qrs == 4:
+                    frame_report.update({
+                        "qr_top_left_ms": values["qrs"][0],
+                        "qr_top_right_ms": values["qrs"][1],
+                        "qr_bottom_right_ms": values["qrs"][2],
+                        "qr_bottom_left_ms": values["qrs"][3],
+                        "latest_quadrant": frame_report["latest_cell_name"],
+                    })
+                frame_reports.append(frame_report)
+                progress(processed, len(self.rows), result)
+                if not check["valid"]:
+                    if check.get("skippable"):
+                        counts["frames_without_readable_qr"] += 1
+                        continue
+                    stopped = {"index": index, "reason": check["reason"]}
+                    break
+                counts["accepted_frames"] += 1
+                if check["timing_status"] == "Clean" and check["offset_ms"] is not None:
+                    clean_offsets.append(check["offset_ms"])
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
         return {
             "recording_directory": str(self.folder),
             "analysis_alpha": alpha,
+            "detection_batch_size": DETECTION_BATCH_SIZE,
+            "parallel_frame_workers": PARALLEL_FRAME_WORKERS if self.parallel_scan else 1,
             "processed": processed,
             "total": len(self.rows),
             "cancelled": cancel.is_set() and stopped is None,
@@ -619,7 +759,9 @@ class AnalysisWorker(threading.Thread):
                     self.cancel.clear()
                     result = self.model.summarize(
                         payload["alpha"], self.cancel,
-                        lambda done, total: self.results.put(("progress", request, (done, total))),
+                        lambda done, total, frame: self.results.put(
+                            ("progress", request, (done, total, frame))
+                        ),
                     )
                     result = self.model.save_report(result)
                     self.results.put((kind, request, result))
@@ -645,6 +787,7 @@ class CalibrationWindow:
         self.index = 0
         self.request = 0
         self.scan_request = 0
+        self.scan_active = False
         self.current = None
         self.photo = None
         self.resize_job = None
@@ -662,15 +805,16 @@ class CalibrationWindow:
         self.exhibited = tk.StringVar(value="LATEST EXHIBITED TIME\nLoading…")
         self.codes = tk.StringVar(value="")
         self.status = tk.StringVar(value="QReader uses the undistorted image at alpha 0.25.")
-        self.summary = tk.StringVar(value="Folder analysis starts automatically.")
-        self.scan_progress = tk.StringVar(value=f"Analysis: 0 / {len(model.rows)}")
+        self.summary = tk.StringVar(
+            value="Press GO to decode the full folder and create the analysis files."
+        )
+        self.scan_progress = tk.StringVar(value=f"Ready: 0 / {len(model.rows)}")
         self._build()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Left>", lambda event: self._keyboard_step(event, -1))
         root.bind("<Right>", lambda event: self._keyboard_step(event, 1))
         root.after(50, self._poll)
         self.show_frame()
-        root.after(150, self.scan)
 
     def _build(self) -> None:
         self.root.title("QR Calibration Analysis — " + self.model.folder.name)
@@ -686,11 +830,16 @@ class CalibrationWindow:
         entry = ttk.Entry(navigation, textvariable=self.position, width=7)
         entry.pack(side="left")
         entry.bind("<Return>", lambda _: self.go())
-        ttk.Button(navigation, text="Go", command=self.go).pack(side="left", padx=4)
+        ttk.Button(navigation, text="Show frame", command=self.go).pack(side="left", padx=4)
         self.slider = ttk.Scale(navigation, from_=1, to=len(self.model.rows))
         self.slider.pack(side="left", fill="x", expand=True, padx=6)
         self.slider.bind("<ButtonRelease-1>", lambda _: self.go(round(self.slider.get())))
-        ttk.Button(navigation, text="Create analysis files", command=self.scan).pack(side="left", padx=4)
+        self.scan_button = ttk.Button(
+            navigation,
+            text="GO — DECODE FULL FOLDER",
+            command=self.scan,
+        )
+        self.scan_button.pack(side="left", padx=4)
         ttk.Button(navigation, text="Cancel", command=self.worker.cancel.set).pack(side="left")
         ttk.Label(
             navigation, textvariable=self.scan_progress, anchor="e",
@@ -807,8 +956,12 @@ class CalibrationWindow:
         self.worker.submit("frame", self.request, index=self.index, alpha=float(self.alpha.get()))
 
     def scan(self) -> None:
+        if self.scan_active:
+            return
+        self.scan_active = True
+        self.scan_button.configure(state="disabled")
         self.scan_request += 1
-        self.summary.set("Analyzing recording…")
+        self.summary.set("Decoding the full recording; each completed frame will be shown here.")
         total = len(self.model.rows)
         self.scan_progress.set(f"Analysis: 0 / {total} · {total} remaining")
         self.worker.submit("scan", self.scan_request, alpha=float(self.alpha.get()))
@@ -830,8 +983,6 @@ class CalibrationWindow:
             return
         self.model.set_manual_values(self.index, values)
         self.populate()
-        if self.current_check["valid"]:
-            self.scan()
 
     def restore_detected(self) -> None:
         if self.current is None:
@@ -847,15 +998,26 @@ class CalibrationWindow:
                     self.current = payload
                     self.populate()
                 elif kind == "progress" and request == self.scan_request:
-                    done, total = payload
+                    done, total, frame = payload
+                    self.index = frame["index"]
+                    self.current = frame
+                    self.current_check = None
+                    self.position.set(str(self.index + 1))
+                    self.slider.set(self.index + 1)
+                    self.populate()
                     progress = f"Analysis: {done} / {total} · {max(0, total - done)} remaining"
                     self.scan_progress.set(progress)
                     self.summary.set(progress)
+                    break
                 elif kind == "scan" and request == self.scan_request:
+                    self.scan_active = False
+                    self.scan_button.configure(state="normal")
                     self.show_summary(payload)
                 elif kind == "error" and request in (self.request, self.scan_request):
                     self.status.set(payload)
                     if request == self.scan_request:
+                        self.scan_active = False
+                        self.scan_button.configure(state="normal")
                         self.scan_progress.set("Analysis stopped with an error")
         except Empty:
             pass
@@ -896,12 +1058,17 @@ class CalibrationWindow:
             action = "Skipped" if check.get("skippable") else "Stopped"
             self.status.set(f"{action} on {source}: {check['reason']}")
         else:
+            position_warning = (
+                f"{len(check.get('position_warnings', []))} camera-grid position warning(s). "
+                if check.get("position_warnings") else ""
+            )
             self.status.set(
                 (
                     "Manual values accepted. "
                     if values["manual"]
                     else f"{check['matched_readable_qrs']} journal-matched QR value(s) accepted; latest selected. "
                 )
+                + position_warning
                 + "Latest display timing: " + (
                     ", ".join(check["issues"])
                     if check["issues"] else "clean."
@@ -979,7 +1146,6 @@ class CalibrationWindow:
         for item in self.current["observations"]:
             is_latest = (
                 item["display_index"] == latest_display_index
-                and not item["mismatch"]
             )
             if not is_latest and not self.draw_all_boxes.get() and not self.show_all_times.get():
                 continue

@@ -45,6 +45,7 @@ class CalibrationWorkflowTests(unittest.TestCase):
             self.assertEqual(display_options["screen_index"], 0)
             self.assertEqual(display_options["visible_qrs"], 2)
             self.assertEqual(display_options["grid_qrs"], 4)
+            self.assertEqual(display_options["display_backend"], "qt")
             self.assertNotIn("visible_frames", display_options)
             main._service_calibration(config, runtime, camera)
             camera.send.assert_not_called()
@@ -81,6 +82,24 @@ class CalibrationWorkflowTests(unittest.TestCase):
         self.assertIsNone(runtime.calibration_recording_deadline)
         config.show_calibration_error.assert_called_once()
 
+    def test_pygame_selection_reuses_grid_monitor_and_reported_refresh(self):
+        config, runtime, _ = self.fixture()
+        with TemporaryDirectory() as folder:
+            main._start_calibration_clock({
+                "record_folder": folder,
+                "calibration_display": "Pygame / SDL",
+                "calibration_screen": "1: HDMI-1 @ 144.000 Hz",
+                "calibration_grid_qrs": 12,
+                "calibration_visible_qrs": 8,
+            }, config, runtime)
+
+        display_options = runtime.process_context.Process.call_args.kwargs["args"][2]
+        self.assertEqual(display_options["display_backend"], "pygame")
+        self.assertEqual(display_options["screen_index"], 1)
+        self.assertEqual(display_options["grid_qrs"], 12)
+        self.assertEqual(display_options["visible_qrs"], 8)
+        self.assertEqual(display_options["refresh_hz"], 144.0)
+
     def test_calibration_layout_has_fixed_qr_mode_without_amount_control(self):
         def elements(rows):
             for row in rows:
@@ -96,6 +115,8 @@ class CalibrationWorkflowTests(unittest.TestCase):
                       if getattr(element, "Key", None) == "calibration_clock_start")
         self.assertEqual(button.ButtonText, "START QR CALIBRATION")
         self.assertTrue(any(getattr(element, "Key", None) == "calibration_decoder"
+                            for element in controls))
+        self.assertTrue(any(getattr(element, "Key", None) == "calibration_display"
                             for element in controls))
         self.assertTrue(any(getattr(element, "Key", None) == "calibration_screen"
                             for element in controls))
@@ -118,6 +139,7 @@ class CalibrationWorkflowTests(unittest.TestCase):
         self.assertTrue({
             "calibration_latency_status",
             "calibration_decoder",
+            "calibration_display",
         }.issubset(second_row_keys))
         self.assertTrue({
             "calibration_screen",
@@ -208,6 +230,44 @@ class CalibrationWorkflowTests(unittest.TestCase):
         self.assertEqual(main._calibration_screen_index({
             "calibration_screen": "1: HDMI-1 — 1920×1080 @ 144.000 Hz"
         }), 1)
+        self.assertEqual(main._calibration_screen_refresh_hz({
+            "calibration_screen": "1: HDMI-1 — 1920×1080 @ 144.000 Hz"
+        }), 144.0)
+        self.assertIsNone(main._calibration_screen_refresh_hz({
+            "calibration_screen": "0: Primary @ unknown Hz"
+        }))
+
+    def test_display_backend_selection_is_validated(self):
+        self.assertEqual(main._calibration_display_backend({}), "qt")
+        self.assertEqual(main._calibration_display_backend({
+            "calibration_display": "Pygame / SDL",
+        }), "pygame")
+        with self.assertRaisesRegex(ValueError, "Select a QR display"):
+            main._calibration_display_backend({"calibration_display": "Other"})
+
+    def test_pygame_backend_is_dispatched_without_backend_only_option(self):
+        stop_event = Mock()
+        error_queue = Mock()
+        options = {
+            "display_backend": "pygame",
+            "screen_index": 1,
+            "grid_qrs": 12,
+            "visible_qrs": 8,
+        }
+
+        with patch(
+            "calibration.display.run_calibration_display",
+            return_value=None,
+        ) as run_display:
+            main._run_calibration_clock_process(stop_event, error_queue, options)
+
+        run_display.assert_called_once_with(
+            stop_event,
+            screen_index=1,
+            grid_qrs=12,
+            visible_qrs=8,
+        )
+        error_queue.put.assert_not_called()
 
     def test_grid_and_visible_qr_selections_are_validated_together(self):
         self.assertEqual(main._calibration_grid_qrs({
