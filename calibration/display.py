@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import gc
 import json
 import math
 import os
@@ -86,7 +87,7 @@ class QRClockRenderer:
         rows, columns = grid_shape(grid_qrs)
         font_size = max(10, min(width // (columns * 14), height // (rows * 10)))
         self.font = pygame.font.Font(None, font_size)
-        self.qr_rects = tuple(self._qr_rect(area) for area in self.areas)
+        self.qr_rects = [self._qr_rect(area) for area in self.areas]
         self.underlines = tuple(self._underline(area) for area in self.areas)
         self.timestamps: list[int | None] = [None] * grid_qrs
         self.display_indices: list[int | None] = [None] * grid_qrs
@@ -190,10 +191,7 @@ class QRClockRenderer:
         underline = self.underlines[cell]
         underline.top = text_rect.bottom + 2
         self.target.fill(FOREGROUND, underline)
-        self.qr_rects = tuple(
-            bounds if index == cell else value
-            for index, value in enumerate(self.qr_rects)
-        )
+        self.qr_rects[cell] = bounds
         self.timestamps[cell] = timestamp_ns
         self.display_indices[cell] = display_index
         self.newest_cell = cell
@@ -341,7 +339,12 @@ def timing_issues(row: dict) -> list[str]:
 class DisplayJournal:
     def __init__(self, path: str | Path | None, metadata: dict):
         self.file = None if path is None else Path(path).open("x", encoding="utf-8", buffering=65536)
-        self.frames: list[dict] = []
+        self.frame_count = 0
+        self.counts = {
+            "missed_period_candidates": 0,
+            "irregular_intervals": 0,
+            "late_submissions": 0,
+        }
         self.last_flush_ns = time.monotonic_ns()
         self._closed = False
         self._write({"kind": "session", "format": DISPLAY_FORMAT, **metadata})
@@ -355,14 +358,17 @@ class DisplayJournal:
     def append(self, cell: int, timing: dict) -> None:
         row = {
             "kind": "frame",
-            "index": len(self.frames),
-            "display_frame": len(self.frames),
+            "index": self.frame_count,
+            "display_frame": self.frame_count,
             "cell": cell,
             # Retained so older readers can still interpret four-cell journals.
             "corner": cell,
             **timing,
         }
-        self.frames.append(row)
+        self.frame_count += 1
+        self.counts["missed_period_candidates"] += row.get("skipped_periods", 0)
+        self.counts["irregular_intervals"] += bool(row.get("irregular_interval"))
+        self.counts["late_submissions"] += bool(row.get("late_submit"))
         self._write(row)
         issues = timing_issues(row)
         if issues:
@@ -382,7 +388,7 @@ class DisplayJournal:
             "kind": "pause",
             "paused": paused,
             "monotonic_ns": timestamp_ns,
-            "last_frame_index": len(self.frames) - 1,
+            "last_frame_index": self.frame_count - 1,
         })
         if self.file:
             self.file.flush()
@@ -391,19 +397,14 @@ class DisplayJournal:
         if self._closed:
             return
         self._closed = True
-        counts = {
-            "missed_period_candidates": sum(row.get("skipped_periods", 0) for row in self.frames),
-            "irregular_intervals": sum(bool(row.get("irregular_interval")) for row in self.frames),
-            "late_submissions": sum(bool(row.get("late_submit")) for row in self.frames),
-        }
-        self._write({"kind": "summary", "frames": len(self.frames), **counts})
+        self._write({"kind": "summary", "frames": self.frame_count, **self.counts})
         if self.file:
             self.file.close()
         print(
-            f"[CALIBRATION] Presented {len(self.frames)} QR markers; "
-            f"{counts['missed_period_candidates']} missed-period candidate(s), "
-            f"{counts['irregular_intervals']} irregular interval(s), "
-            f"{counts['late_submissions']} late submission(s).",
+            f"[CALIBRATION] Presented {self.frame_count} QR markers; "
+            f"{self.counts['missed_period_candidates']} missed-period candidate(s), "
+            f"{self.counts['irregular_intervals']} irregular interval(s), "
+            f"{self.counts['late_submissions']} late submission(s).",
             flush=True,
         )
 
@@ -479,6 +480,12 @@ def run_calibration_display(
                 if timestamp_mode == "predicted-flip"
                 else "marker_ns and the QR payload contain paint-start time"
             ),
+            "presentation_semantics": (
+                "presentation_return_ns is sampled immediately after "
+                "pygame.display.flip returns; it is a software presentation "
+                "boundary, not a physical panel scanout measurement"
+            ),
+            "python_gc_policy": "automatic-disabled-no-manual-collection",
             "prediction_period_ns": pacer.period_ns,
             "qr_draw_mode": qr_draw_mode,
         })
@@ -509,6 +516,8 @@ def run_calibration_display(
             return exit_requested or paused or toggled
 
         clock = pygame.time.Clock()
+        automatic_gc_was_enabled = gc.isenabled()
+        gc.disable()
         while True:
             if paused:
                 poll_controls()
@@ -529,7 +538,7 @@ def run_calibration_display(
             )
             cell = renderer.render_next(
                 marker_ns,
-                len(journal.frames),
+                journal.frame_count,
                 qr_draw_mode=qr_draw_mode,
             )
             submit_ns = time.monotonic_ns()
@@ -550,6 +559,9 @@ def run_calibration_display(
             timing["predicted_flip_ns"] = (
                 marker_ns if timestamp_mode == "predicted-flip" else None
             )
+            timing["presentation_event_kind"] = "pygame_display_flip_return"
+            timing["presentation_return_ns"] = flip_return_ns
+            timing["physical_presentation_measured"] = False
             timing["resumed_after_pause"] = resumed_after_pause
             resumed_after_pause = False
             journal.append(cell, timing)
@@ -557,6 +569,8 @@ def run_calibration_display(
         if journal is not None:
             journal.close()
         pygame.quit()
+        if 'automatic_gc_was_enabled' in locals() and automatic_gc_was_enabled:
+            gc.enable()
 
 
 def main() -> None:

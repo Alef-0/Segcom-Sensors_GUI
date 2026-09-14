@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 from collections import Counter, OrderedDict
 from concurrent.futures import ProcessPoolExecutor
 import csv
@@ -45,6 +46,7 @@ CELL_COLORS = (
 )
 LATEST_COLOR = "#fff176"
 PARALLEL_FRAME_WORKERS = 2
+PRESENTATIONS_CSV = "display_presentations.csv"
 
 
 def read_json_rows(path: Path) -> list[dict]:
@@ -196,7 +198,25 @@ class DisplayTimeline:
             cell = frame.get("cell", frame.get("corner"))
             if not isinstance(cell, int) or not 0 <= cell < self.grid_qrs:
                 raise ValueError("Display journal contains an invalid QR grid cell")
-            self.frames.append({**frame, "cell": cell})
+            presentation_ns = frame.get(
+                "presentation_return_ns",
+                frame.get("flip_return_ns", frame.get("marker_ns")),
+            )
+            if not isinstance(presentation_ns, int):
+                raise ValueError("Display journal contains an invalid presentation time")
+            self.frames.append({
+                **frame,
+                "cell": cell,
+                "presentation_return_ns": presentation_ns,
+                "presentation_event_kind": frame.get(
+                    "presentation_event_kind",
+                    "legacy_flip_return" if frame.get("flip_return_ns") is not None
+                    else "marker_time_fallback",
+                ),
+                "physical_presentation_measured": bool(
+                    frame.get("physical_presentation_measured", False)
+                ),
+            })
         self.paused = {
             row.get("last_frame_index")
             for row in rows
@@ -204,11 +224,19 @@ class DisplayTimeline:
         }
         self.by_payload: dict[str, list[dict]] = {}
         previous = -1
+        previous_presentation = -1
         for position, frame in enumerate(self.frames):
             if frame.get("index") != position or int(frame.get("marker_ns", -1)) <= previous:
                 raise ValueError("Display journal frames are missing, reordered, or non-monotonic")
             previous = int(frame["marker_ns"])
+            presentation_ns = int(frame["presentation_return_ns"])
+            if presentation_ns <= previous_presentation:
+                raise ValueError("Display journal presentation times are not monotonic")
+            previous_presentation = presentation_ns
             self.by_payload.setdefault(timestamp_payload(previous), []).append(frame)
+        self.presentation_times = [
+            int(frame["presentation_return_ns"]) for frame in self.frames
+        ]
 
     def match(self, raw: str | None, reference_ns: int | None) -> dict | None:
         if raw is None or len(raw) != 12 or not raw.isdigit():
@@ -219,6 +247,91 @@ class DisplayTimeline:
         if candidates and reference_ns is not None:
             return min(candidates, key=lambda row: abs(int(row["marker_ns"]) - reference_ns))
         return None
+
+    def presentation_event(self, index: int) -> dict:
+        frame = self.frames[index]
+        return {
+            "display_index": index,
+            "cell": int(frame["cell"]),
+            "marker_ns": int(frame["marker_ns"]),
+            "predicted_flip_ns": frame.get("predicted_flip_ns"),
+            "presentation_return_ns": int(frame["presentation_return_ns"]),
+            "presentation_event_kind": frame["presentation_event_kind"],
+            "physical_presentation_measured": bool(
+                frame["physical_presentation_measured"]
+            ),
+            "interval_ns": frame.get("interval_ns"),
+            "prediction_error_ns": frame.get("prediction_error_ns"),
+            "timing_issues": timing_issues(frame),
+        }
+
+    def active_index_at(self, timestamp_ns: int) -> int | None:
+        index = bisect_right(self.presentation_times, timestamp_ns) - 1
+        return index if index >= 0 else None
+
+    def events_between(self, start_ns: int, end_ns: int) -> list[dict]:
+        if end_ns < start_ns:
+            return []
+        first = bisect_right(self.presentation_times, start_ns)
+        stop = bisect_right(self.presentation_times, end_ns)
+        return [self.presentation_event(index) for index in range(first, stop)]
+
+    def observation_interval(self, index: int, reference_ns: int | None) -> dict:
+        current = self.frames[index]
+        following = self.frames[index + 1] if index + 1 < len(self.frames) else None
+        current_ns = int(current["presentation_return_ns"])
+        following_ns = (
+            int(following["presentation_return_ns"])
+            if following is not None else None
+        )
+        lower_ms = (
+            (reference_ns - following_ns) / 1e6
+            if reference_ns is not None and following_ns is not None else None
+        )
+        upper_ms = (
+            (reference_ns - current_ns) / 1e6
+            if reference_ns is not None else None
+        )
+        uncertainty_ns = max(
+            1_000_000,
+            abs(int(current.get("prediction_error_ns") or 0)),
+            abs(int(following.get("prediction_error_ns") or 0))
+            if following is not None else 0,
+        )
+        period_ns = int(current.get("frame_period_ns") or self.metadata.get(
+            "prediction_period_ns", 0
+        ) or (following_ns - current_ns if following_ns is not None else 0))
+        if period_ns > 0:
+            uncertainty_ns = min(uncertainty_ns, period_ns // 2)
+        boundary_issues = [
+            "interval_start_" + issue for issue in timing_issues(current)
+        ]
+        if following is None:
+            boundary_status = "Unknown"
+            boundary_issues.append("interval_end_evidence_missing")
+        else:
+            boundary_issues.extend(
+                "interval_end_" + issue for issue in timing_issues(following)
+            )
+            boundary_status = "Timing suspect" if boundary_issues else "Clean"
+        return {
+            "observed_display_index": index,
+            "active_interval_start_ns": current_ns,
+            "active_interval_end_ns": following_ns,
+            "offset_interval_lower_ms": lower_ms,
+            "offset_interval_upper_ms": upper_ms,
+            "offset_interval_width_ms": (
+                upper_ms - lower_ms
+                if lower_ms is not None and upper_ms is not None else None
+            ),
+            "software_transition_margin_ms": uncertainty_ns / 1e6,
+            "boundary_timing_status": boundary_status,
+            "boundary_timing_issues": boundary_issues,
+            "current_presentation": self.presentation_event(index),
+            "next_presentation": (
+                self.presentation_event(index + 1) if following is not None else None
+            ),
+        }
 
     def marker_status(self, index: int) -> tuple[str, list[str]]:
         current = self.frames[index]
@@ -254,7 +367,60 @@ class DisplayTimeline:
             "grid_rows": self.grid_rows,
             "grid_columns": self.grid_columns,
             "visible_qrs": self.visible_qrs,
+            "presentation_events": len(self.frames),
+            "physical_presentation_measured": any(
+                bool(frame["physical_presentation_measured"])
+                for frame in self.frames
+            ),
+            "presentation_semantics": self.metadata.get(
+                "presentation_semantics",
+                "presentation_return_ns is a software callback/return boundary, "
+                "not a physical panel scanout measurement",
+            ),
         }
+
+
+def _maximum_interval_consensus(intervals: list[tuple[float, float]]) -> dict | None:
+    usable = [(lower, upper) for lower, upper in intervals if lower <= upper]
+    if not usable:
+        return None
+    boundaries = sorted({value for interval in usable for value in interval})
+    candidates: list[tuple[float, float, float, int]] = []
+    for index, boundary in enumerate(boundaries):
+        coverage = sum(lower <= boundary <= upper for lower, upper in usable)
+        candidates.append((boundary, boundary, boundary, coverage))
+        if index + 1 < len(boundaries):
+            following = boundaries[index + 1]
+            midpoint = (boundary + following) / 2
+            coverage = sum(lower <= midpoint <= upper for lower, upper in usable)
+            candidates.append((boundary, following, midpoint, coverage))
+    maximum = max(candidate[3] for candidate in candidates)
+    preferred = statistics.median((lower + upper) / 2 for lower, upper in usable)
+    winners = [candidate for candidate in candidates if candidate[3] == maximum]
+    regions: list[list[float]] = []
+    for start, end, _midpoint, _coverage in winners:
+        if regions and start <= regions[-1][1]:
+            regions[-1][1] = max(regions[-1][1], end)
+        else:
+            regions.append([start, end])
+    chosen = min(
+        regions,
+        key=lambda region: (
+            0 if region[0] <= preferred <= region[1]
+            else min(abs(preferred - region[0]), abs(preferred - region[1])),
+            -(region[1] - region[0]),
+        ),
+    )
+    estimate = min(max(preferred, chosen[0]), chosen[1])
+    return {
+        "method": "maximum overlapping presentation-offset intervals",
+        "offset_range_lower_ms": chosen[0],
+        "offset_range_upper_ms": chosen[1],
+        "estimated_offset_ms": estimate,
+        "contributing_frames": len(usable),
+        "maximum_consistent_frames": maximum,
+        "maximum_consistent_pct": 100 * maximum / len(usable),
+    }
 
 
 class RecordingAnalyzer:
@@ -364,6 +530,8 @@ class RecordingAnalyzer:
     def check_frame(self, result: dict) -> dict:
         values = self.frame_values(result)
         reference_ns = self.pts_monotonic_for_value(result["row"], values["pts_ns"])
+        received_ns = result["row"].get("received_monotonic_ns")
+        received_ns = int(received_ns) if received_ns is not None else None
         candidates = []
         ignored = []
         if values["manual"]:
@@ -407,6 +575,8 @@ class RecordingAnalyzer:
                 "matched_readable_qrs": 0,
                 "ignored_readable_qrs": len(ignored),
                 "decode_issues": ignored,
+                "camera_reference_monotonic_ns": reference_ns,
+                "received_monotonic_ns": received_ns,
             }
 
         latest = max(candidates, key=lambda item: int(item["marker"]["index"]))
@@ -425,6 +595,21 @@ class RecordingAnalyzer:
         offset_ms = None
         if reference_ns is not None:
             offset_ms = (reference_ns - int(latest_marker["marker_ns"])) / 1e6
+        presentation_interval = self.timeline.observation_interval(
+            int(latest_marker["index"]), reference_ns
+        )
+        arrival_interval = self.timeline.observation_interval(
+            int(latest_marker["index"]), received_ns
+        )
+        boundary_status = presentation_interval["boundary_timing_status"]
+        if boundary_status == "Timing suspect":
+            timing_status = "Timing suspect"
+        elif boundary_status == "Unknown" and timing_status == "Clean":
+            timing_status = "Unknown"
+        issues = [
+            *issues,
+            *presentation_interval["boundary_timing_issues"],
+        ]
         return {
             "valid": True,
             "reason": None,
@@ -441,6 +626,151 @@ class RecordingAnalyzer:
             "timing_status": timing_status,
             "issues": issues,
             "offset_ms": offset_ms,
+            "camera_reference_monotonic_ns": reference_ns,
+            "received_monotonic_ns": received_ns,
+            "presentation_interval": presentation_interval,
+            "arrival_presentation_interval": arrival_interval,
+        }
+
+    def _annotate_interval_analysis(self, frame_reports: list[dict]) -> dict:
+        clean = [
+            frame for frame in frame_reports
+            if frame["validation"] == "accepted_clean"
+        ]
+        pts_intervals = [
+            (
+                float(frame["offset_interval_lower_ms"]),
+                float(frame["offset_interval_upper_ms"]),
+            )
+            for frame in clean
+            if frame.get("offset_interval_lower_ms") is not None
+            and frame.get("offset_interval_upper_ms") is not None
+        ]
+        arrival_intervals = [
+            (
+                float(frame["arrival_offset_interval_lower_ms"]),
+                float(frame["arrival_offset_interval_upper_ms"]),
+            )
+            for frame in clean
+            if frame.get("arrival_offset_interval_lower_ms") is not None
+            and frame.get("arrival_offset_interval_upper_ms") is not None
+        ]
+        primary = _maximum_interval_consensus(pts_intervals)
+        arrival = _maximum_interval_consensus(arrival_intervals)
+        classifications = Counter()
+        previous_exposure_ns = None
+
+        for frame in frame_reports:
+            reference_ns = frame.get("camera_reference_monotonic_ns")
+            observed_index = frame.get("latest_display_index")
+            if primary is None or reference_ns is None:
+                classification = "unavailable"
+                frame.update({
+                    "estimated_exposure_monotonic_ns": None,
+                    "expected_display_index": None,
+                    "expected_visible_display_indices": [],
+                    "display_events_since_previous_camera": [],
+                    "presentation_classification": classification,
+                    "phase_after_presentation_ms": None,
+                    "phase_before_next_presentation_ms": None,
+                })
+                classifications[classification] += 1
+                continue
+
+            exposure_ns = int(reference_ns) - round(
+                float(primary["estimated_offset_ms"]) * 1_000_000
+            )
+            events = (
+                self.timeline.events_between(previous_exposure_ns, exposure_ns)
+                if previous_exposure_ns is not None else []
+            )
+            previous_exposure_ns = exposure_ns
+            expected_index = self.timeline.active_index_at(exposure_ns)
+            expected_visible = (
+                list(range(
+                    max(0, expected_index - self.timeline.visible_qrs + 1),
+                    expected_index + 1,
+                ))
+                if expected_index is not None else []
+            )
+            phase_after_ms = None
+            phase_before_ms = None
+            expected_issues: list[str] = []
+            margin_ms = float(frame.get("software_transition_margin_ms") or 1.0)
+
+            if expected_index is None:
+                classification = "before_display_timeline"
+            elif observed_index is None:
+                classification = "no_readable_qr"
+            else:
+                expected_event_ns = self.timeline.presentation_times[expected_index]
+                phase_after_ms = (exposure_ns - expected_event_ns) / 1e6
+                if expected_index + 1 < len(self.timeline.presentation_times):
+                    next_event_ns = self.timeline.presentation_times[expected_index + 1]
+                    phase_before_ms = (next_event_ns - exposure_ns) / 1e6
+                expected_issues = timing_issues(self.timeline.frames[expected_index])
+
+                if int(observed_index) == expected_index:
+                    nearest_boundary_ms = min(
+                        value for value in (phase_after_ms, phase_before_ms)
+                        if value is not None
+                    )
+                    classification = (
+                        "expected_flip_boundary"
+                        if nearest_boundary_ms <= margin_ms else "stable_expected"
+                    )
+                elif int(observed_index) == expected_index - 1:
+                    boundary_distance_ms = abs(
+                        exposure_ns - self.timeline.presentation_times[expected_index]
+                    ) / 1e6
+                    classification = (
+                        "expected_flip_transition"
+                        if boundary_distance_ms <= margin_ms
+                        else "stale_after_expected_flip"
+                    )
+                elif int(observed_index) == expected_index + 1:
+                    boundary_distance_ms = abs(
+                        exposure_ns - self.timeline.presentation_times[int(observed_index)]
+                    ) / 1e6
+                    classification = (
+                        "expected_flip_transition"
+                        if boundary_distance_ms <= margin_ms
+                        else "future_before_expected_flip"
+                    )
+                elif int(observed_index) < expected_index:
+                    classification = "stale_after_expected_flip"
+                else:
+                    classification = "future_before_expected_flip"
+
+            frame.update({
+                "estimated_exposure_monotonic_ns": exposure_ns,
+                "expected_display_index": expected_index,
+                "expected_visible_display_indices": expected_visible,
+                "display_events_since_previous_camera": events,
+                "presentation_classification": classification,
+                "phase_after_presentation_ms": phase_after_ms,
+                "phase_before_next_presentation_ms": phase_before_ms,
+                "expected_presentation_timing_issues": expected_issues,
+            })
+            classifications[classification] += 1
+
+        return {
+            "method": (
+                "Interval-censored reconstruction using consecutive software "
+                "presentation-return events"
+            ),
+            "primary_reference": "host-anchored camera PTS in monotonic time",
+            "primary_pts": primary,
+            "arrival_reference": (
+                "host monotonic frame receipt; diagnostic only because it includes "
+                "transport, buffering, decoding, and callback delay"
+            ),
+            "arrival_diagnostic": arrival,
+            "classification_counts": dict(classifications),
+            "physical_boundary": (
+                "Presentation returns do not measure monitor processing, panel "
+                "scanout, photon output, camera exposure duration, or rolling shutter"
+            ),
         }
 
     def _load_frame(self, index: int, alpha: float) -> tuple[dict, np.ndarray, np.ndarray]:
@@ -620,6 +950,8 @@ class RecordingAnalyzer:
                     validation = "skipped_no_readable_qr"
                 else:
                     validation = "stopped_invalid"
+                presentation_interval = check.get("presentation_interval") or {}
+                arrival_interval = check.get("arrival_presentation_interval") or {}
                 frame_report = {
                     "frame_number": index + 1,
                     "filename": result["row"]["filename"],
@@ -652,6 +984,46 @@ class RecordingAnalyzer:
                     "timing_status": check.get("timing_status"),
                     "timing_issues": check.get("issues", []),
                     "pts_minus_latest_qr_ms": check.get("offset_ms"),
+                    "camera_reference_monotonic_ns": check.get(
+                        "camera_reference_monotonic_ns"
+                    ),
+                    "received_monotonic_ns": check.get("received_monotonic_ns"),
+                    "active_interval_start_ns": presentation_interval.get(
+                        "active_interval_start_ns"
+                    ),
+                    "active_interval_end_ns": presentation_interval.get(
+                        "active_interval_end_ns"
+                    ),
+                    "offset_interval_lower_ms": presentation_interval.get(
+                        "offset_interval_lower_ms"
+                    ),
+                    "offset_interval_upper_ms": presentation_interval.get(
+                        "offset_interval_upper_ms"
+                    ),
+                    "offset_interval_width_ms": presentation_interval.get(
+                        "offset_interval_width_ms"
+                    ),
+                    "software_transition_margin_ms": presentation_interval.get(
+                        "software_transition_margin_ms"
+                    ),
+                    "presentation_boundary_timing_status": presentation_interval.get(
+                        "boundary_timing_status"
+                    ),
+                    "presentation_boundary_timing_issues": presentation_interval.get(
+                        "boundary_timing_issues", []
+                    ),
+                    "current_presentation": presentation_interval.get(
+                        "current_presentation"
+                    ),
+                    "next_presentation": presentation_interval.get(
+                        "next_presentation"
+                    ),
+                    "arrival_offset_interval_lower_ms": arrival_interval.get(
+                        "offset_interval_lower_ms"
+                    ),
+                    "arrival_offset_interval_upper_ms": arrival_interval.get(
+                        "offset_interval_upper_ms"
+                    ),
                 }
                 if self.grid_qrs == 4:
                     frame_report.update({
@@ -675,6 +1047,7 @@ class RecordingAnalyzer:
         finally:
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=True)
+        interval_analysis = self._annotate_interval_analysis(frame_reports)
         return {
             "recording_directory": str(self.folder),
             "analysis_alpha": alpha,
@@ -706,6 +1079,7 @@ class RecordingAnalyzer:
                 "cell_order": list(self.cell_names),
             },
             "display": self.timeline.totals(),
+            "presentation_interval_analysis": interval_analysis,
             "frames": frame_reports,
         }
 
@@ -714,11 +1088,17 @@ class RecordingAnalyzer:
         output.mkdir(parents=False, exist_ok=True)
         json_path = output / "calibration_analysis.json"
         csv_path = output / "calibration_frames.csv"
+        presentations_path = output / PRESENTATIONS_CSV
         saved = {
             **report,
             "generated_at": datetime.now().astimezone().isoformat(),
             "output_directory": str(output),
-            "report_files": [json_path.name, csv_path.name],
+            "report_files": [
+                json_path.name,
+                csv_path.name,
+                presentations_path.name,
+            ],
+            "presentation_timeline_file": presentations_path.name,
         }
         json_path.write_text(json.dumps(saved, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         frames = saved["frames"]
@@ -734,6 +1114,22 @@ class RecordingAnalyzer:
                     })
         else:
             csv_path.write_text("", encoding="utf-8")
+        presentation_rows = [
+            self.timeline.presentation_event(index)
+            for index in range(len(self.timeline.frames))
+        ]
+        with presentations_path.open("w", encoding="utf-8", newline="") as destination:
+            writer = csv.DictWriter(
+                destination,
+                fieldnames=list(presentation_rows[0]),
+            )
+            writer.writeheader()
+            for row in presentation_rows:
+                writer.writerow({
+                    key: json.dumps(value, separators=(",", ":"))
+                    if isinstance(value, (list, dict)) else value
+                    for key, value in row.items()
+                })
         return saved
 
 
@@ -1101,8 +1497,23 @@ class CalibrationWindow:
             )
         )
         display = report["display"]
+        interval_analysis = report.get("presentation_interval_analysis") or {}
+        primary_interval = interval_analysis.get("primary_pts")
+        interval_text = (
+            "no clean presentation-offset interval"
+            if primary_interval is None
+            else (
+                "presentation-offset range "
+                f"{primary_interval['offset_range_lower_ms']:.3f}–"
+                f"{primary_interval['offset_range_upper_ms']:.3f} ms; "
+                f"representative {primary_interval['estimated_offset_ms']:.3f} ms; "
+                f"consistent {primary_interval['maximum_consistent_frames']} / "
+                f"{primary_interval['contributing_frames']}"
+            )
+        )
         self.summary.set(
-            f"{state}: {report['processed']} / {report['total']} frames; {offset}. "
+            f"{state}: {report['processed']} / {report['total']} frames; {offset}; "
+            f"{interval_text}. "
             f"QR detections {counts.get('detections', 0)}, unreadable {counts.get('unreadable', 0)}, "
             f"matched readable {counts.get('journal_matched_readable', 0)}, "
             f"frames without a readable journal match {counts.get('frames_without_readable_qr', 0)}, "
@@ -1113,8 +1524,10 @@ class CalibrationWindow:
             f"{display['missed_period_candidates']} missed-period candidates. "
             f"Results saved in {report['output_directory']}"
         )
-        self.status.set("Saved calibration_analysis.json and calibration_frames.csv in "
-                        + report["output_directory"])
+        self.status.set(
+            "Saved calibration_analysis.json, calibration_frames.csv, and "
+            "display_presentations.csv in " + report["output_directory"]
+        )
         if report["stopped"]:
             self.root.after(0, lambda: self.go(report["stopped"]["index"] + 1))
 

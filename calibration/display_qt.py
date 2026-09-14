@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 from pathlib import Path
@@ -413,7 +414,12 @@ class DisplayJournal:
             if path is None
             else Path(path).open("x", encoding="utf-8", buffering=65536)
         )
-        self.frames: list[dict] = []
+        self.frame_count = 0
+        self.counts = {
+            "missed_period_candidates": 0,
+            "irregular_intervals": 0,
+            "late_submissions": 0,
+        }
         self.last_flush_ns = time.monotonic_ns()
         self._closed = False
 
@@ -428,14 +434,17 @@ class DisplayJournal:
     def append(self, cell: int, timing: dict) -> None:
         row = {
             "kind": "frame",
-            "index": len(self.frames),
-            "display_frame": len(self.frames),
+            "index": self.frame_count,
+            "display_frame": self.frame_count,
             "cell": cell,
             # Retained so older readers can still interpret four-cell journals.
             "corner": cell,
             **timing,
         }
-        self.frames.append(row)
+        self.frame_count += 1
+        self.counts["missed_period_candidates"] += row.get("skipped_periods", 0)
+        self.counts["irregular_intervals"] += bool(row.get("irregular_interval"))
+        self.counts["late_submissions"] += bool(row.get("late_submit"))
         self._write(row)
 
         issues = timing_issues(row)
@@ -457,7 +466,7 @@ class DisplayJournal:
             "kind": "pause",
             "paused": paused,
             "monotonic_ns": timestamp_ns,
-            "last_frame_index": len(self.frames) - 1,
+            "last_frame_index": self.frame_count - 1,
         })
         if self.file:
             self.file.flush()
@@ -467,27 +476,16 @@ class DisplayJournal:
             return
         self._closed = True
 
-        counts = {
-            "missed_period_candidates": sum(
-                row.get("skipped_periods", 0) for row in self.frames
-            ),
-            "irregular_intervals": sum(
-                bool(row.get("irregular_interval")) for row in self.frames
-            ),
-            "late_submissions": sum(
-                bool(row.get("late_submit")) for row in self.frames
-            ),
-        }
-        self._write({"kind": "summary", "frames": len(self.frames), **counts})
+        self._write({"kind": "summary", "frames": self.frame_count, **self.counts})
 
         if self.file:
             self.file.close()
 
         print(
-            f"[CALIBRATION] Presented {len(self.frames)} QR markers; "
-            f"{counts['missed_period_candidates']} missed-period candidate(s), "
-            f"{counts['irregular_intervals']} irregular interval(s), "
-            f"{counts['late_submissions']} late predicted submission(s).",
+            f"[CALIBRATION] Presented {self.frame_count} QR markers; "
+            f"{self.counts['missed_period_candidates']} missed-period candidate(s), "
+            f"{self.counts['irregular_intervals']} irregular interval(s), "
+            f"{self.counts['late_submissions']} late predicted submission(s).",
             flush=True,
         )
 
@@ -563,10 +561,11 @@ class QRClockWindow(QOpenGLWindow):
             ),
             "prediction_period_ns": self.monitor.period_ns,
             "presentation_semantics": (
-                "flip_return_ns is sampled from Qt frameSwapped, emitted after the "
-                "potentially blocking buffer swap; it is still not a measurement "
-                "of physical panel scanout"
+                "presentation_return_ns is sampled from Qt frameSwapped, emitted "
+                "after the potentially blocking buffer swap; it is a software "
+                "presentation boundary, not a physical panel scanout measurement"
             ),
+            "python_gc_policy": "automatic-disabled-no-manual-collection",
         }
 
         self.journal = DisplayJournal(self.journal_path, metadata)
@@ -639,6 +638,9 @@ class QRClockWindow(QOpenGLWindow):
             if self.timestamp_mode == "predicted-flip"
             else None
         )
+        timing["presentation_event_kind"] = "qt_frame_swapped_return"
+        timing["presentation_return_ns"] = swap_return_ns
+        timing["physical_presentation_measured"] = False
         timing["late_submit"] = (
             self.timestamp_mode == "predicted-flip"
             and pending["submit_ns"] > pending["marker_ns"]
@@ -836,6 +838,8 @@ def run_calibration_display(
         except (OSError, ValueError):
             pass
 
+    automatic_gc_was_enabled = gc.isenabled()
+    gc.disable()
     try:
         return app.exec()
     finally:
@@ -843,6 +847,8 @@ def run_calibration_display(
         window.close_journal()
         for signal_number, handler in previous_handlers.items():
             signal.signal(signal_number, handler)
+        if automatic_gc_was_enabled:
+            gc.enable()
 
 
 def main() -> None:

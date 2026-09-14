@@ -24,6 +24,11 @@ alignment.
   timestamp, and journal behavior. It updates only changed cells, draws each QR
   through one scaled surface by default, retains Pygame's paced presentation
   loop, and supports `P`, `Q`, and Escape.
+- Both display loops disable Python's automatic cyclic garbage collector only
+  while presenting frames and never force a collection. Pygame updates its QR
+  rectangle and reusable QR surfaces in place; Qt retains only the configured
+  visible QR matrices and pixmaps. The display journal streams frame rows to
+  disk and keeps only running summary counters in memory.
 - `qr.py` creates the 12-digit monotonic-millisecond QR payloads and provides
   QReader decoding, per-cell retries, and snake-grid ordering.
 - `recording_display.py` opens the recording inspection window. It decodes the
@@ -37,7 +42,10 @@ alignment.
   through QRDet in groups of four. Every configured cell is covered by the
   full-frame pass or a missing-cell retry. The image cache is bounded to eight
   frames so long recordings do not retain every original and undistorted image
-  in memory.
+  in memory. It also reconstructs the software presentation interval in which
+  each decoded newest QR was active, lists intervening display events between
+  camera frames, and classifies stable, boundary-transition, stale, and future
+  observations. Frame-arrival intervals remain separate transport diagnostics.
 - `quantitative_analysis.py` compares correction strategies on clean evidence,
   writes the verdict, and creates all graphs with Matplotlib. PNG is the default;
   vector SVG copies are optional.
@@ -60,8 +68,9 @@ alignment.
    decoding. Frames without any valid readable QR are skipped; other readable
    values remain usable even when several grid cells are unreadable. When the
    scan finishes, it automatically creates
-   `calibration_analysis.json` and `calibration_frames.csv` in a sibling folder
-   named `<recording>_analysis`.
+   `calibration_analysis.json`, `calibration_frames.csv`, and
+   `display_presentations.csv` in a sibling folder named
+   `<recording>_analysis`.
 5. Close the inspection window. The root analyzer then creates the quantitative
    verdict and graphs from those saved files.
 
@@ -166,7 +175,10 @@ large errors that an average can hide.
 The inspection window creates:
 
 - `calibration_analysis.json` — complete per-frame evidence and scan summary;
-- `calibration_frames.csv` — the same per-frame evidence in tabular form.
+- `calibration_frames.csv` — the same per-frame evidence in tabular form;
+- `display_presentations.csv` — every predicted marker and observed software
+  presentation return, including display index, cell, interval, prediction
+  error, and timing issues.
 
 The quantitative analyzer then creates:
 
@@ -204,6 +216,13 @@ bins. Residual ranges are symmetric around zero.
   strategy and confirm it on a later, independently recorded calibration first.
 - Keep the software-marker result separate from claims about physical exposure
   timing, RTSP transport delay, or radar alignment.
+- Treat each decoded newest QR as an interval constraint: its state is active
+  from its software presentation return until the following presentation. The
+  host-anchored PTS interval is primary; receipt-time intervals include
+  transport, buffering, decoding, and callback delay and are diagnostic only.
+- `presentation_return_ns` is sampled at Qt `frameSwapped` or immediately after
+  `pygame.display.flip()` returns. It does not measure monitor processing,
+  physical scanout, photon output, exposure duration, or rolling shutter.
 
 ## Dependencies and checks
 

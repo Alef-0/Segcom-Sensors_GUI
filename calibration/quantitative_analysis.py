@@ -510,6 +510,40 @@ def _markdown(report: dict) -> str:
         f"- Display journal: {quality['display_late_submissions']} late submissions, "
         f"{quality['display_irregular_intervals']} irregular intervals, and "
         f"{quality['display_missed_period_candidates']} missed-period candidates",
+    ]
+    interval_analysis = report.get("presentation_interval_analysis")
+    primary_interval = (
+        interval_analysis.get("primary_pts")
+        if isinstance(interval_analysis, dict) else None
+    )
+    if isinstance(primary_interval, dict):
+        lines.extend([
+            "",
+            "## Presentation-interval reconstruction",
+            "",
+            "Each decoded newest QR constrains exposure to the software presentation interval "
+            "between that display event and the following one. This avoids treating the QR marker "
+            "as an exact physical exposure timestamp.",
+            "",
+            f"- Maximum-overlap offset range: "
+            f"{primary_interval['offset_range_lower_ms']:.3f} to "
+            f"{primary_interval['offset_range_upper_ms']:.3f} ms",
+            f"- Representative estimate inside that range: "
+            f"{primary_interval['estimated_offset_ms']:.3f} ms",
+            f"- Consistent clean frames: {primary_interval['maximum_consistent_frames']} / "
+            f"{primary_interval['contributing_frames']} "
+            f"({primary_interval['maximum_consistent_pct']:.1f}%)",
+            "- Boundary classifications use software presentation returns and their prediction "
+            "error; they do not model physical monitor scanout or camera rolling shutter.",
+        ])
+        classifications = interval_analysis.get("classification_counts", {})
+        if classifications:
+            lines.extend(["", "| Presentation classification | Frames |", "|---|---:|"])
+            lines.extend(
+                f"| {name.replace('_', ' ')} | {count} |"
+                for name, count in sorted(classifications.items())
+            )
+    lines.extend([
         "",
         "## Clean offset distribution",
         "",
@@ -528,7 +562,7 @@ def _markdown(report: dict) -> str:
         "",
         "| Strategy | Holdout MAE | Median absolute | P95 absolute | RMSE | Bias | Within 10 ms |",
         "|---|---:|---:|---:|---:|---:|---:|",
-    ]
+    ])
     for key in report["strategy_order"]:
         strategy = report["strategies"][key]
         metrics = strategy["holdout_metrics"]
@@ -671,6 +705,9 @@ def analyze_output_directory(
         ),
         "source_recording_directory": source.get("recording_directory"),
         "source_provenance_sha256": provenance,
+        "presentation_interval_analysis": source.get(
+            "presentation_interval_analysis"
+        ),
         "data_quality": quality,
         "clean_offset_distribution": distribution,
         "chronological_split": {

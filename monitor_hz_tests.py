@@ -7,6 +7,7 @@ HDMI transport, monitor processing, panel scanout, or photon output latency.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 from pathlib import Path
@@ -138,6 +139,7 @@ def print_summary(
         for sample in samples
         if sample.get("prediction_error_ns") is not None
     ]
+    automatic_gc = any(sample["automatic_gc"] for sample in samples)
 
     elapsed_ns = samples[-1]["flip_ns"] - samples[0]["flip_ns"]
     effective_hz = (len(samples) - 1) * 1_000_000_000 / elapsed_ns
@@ -176,6 +178,8 @@ def print_summary(
         f"{_format_ms(_percentile_ns(swap, 0.50))} / "
         f"{_format_ms(_percentile_ns(swap, 0.95))}"
     )
+    print(f"Automatic cyclic GC: {'enabled' if automatic_gc else 'disabled'}")
+    print("Manual garbage collection: never called")
     if prediction_errors:
         median_error = _percentile_ns(prediction_errors, 0.50)
         absolute_p95 = _percentile_ns(
@@ -188,6 +192,28 @@ def print_summary(
         )
     print(f"Irregular intervals: {irregular} / {len(intervals)}")
     print(f"Missed-period candidates: {missed}")
+
+    slow = sorted(
+        (sample for sample in samples if sample.get("interval_ns") is not None),
+        key=lambda sample: sample["interval_ns"],
+        reverse=True,
+    )[:5]
+    print("Slowest presentation intervals:")
+    for sample in slow:
+        prediction_error = sample.get("prediction_error_ns")
+        prediction_detail = (
+            "prediction error n/a"
+            if prediction_error is None
+            else f"prediction error {prediction_error / 1e6:.3f} ms"
+        )
+        print(
+            "  display "
+            f"{sample['display_index']}: "
+            f"interval {sample['interval_ns'] / 1e6:.3f} ms, "
+            f"paint {sample['paint_ns'] / 1e6:.3f} ms, "
+            f"flip-return {sample['swap_ns'] / 1e6:.3f} ms, "
+            f"{prediction_detail}"
+        )
 
 
 def print_interpretation_guide() -> None:
@@ -212,6 +238,7 @@ def run_qt_test(args: argparse.Namespace, screen: dict, expected_hz: float) -> i
         configure_surface_format,
     )
 
+    gc_disabled_for_test = args.disable_gc
     configure_surface_format()
     app = QGuiApplication(["monitor-hz-tests"])
     qt_screens = app.screens()
@@ -328,6 +355,12 @@ def run_qt_test(args: argparse.Namespace, screen: dict, expected_hz: float) -> i
                             else None
                         ),
                         "flip_ns": flip_ns,
+                        "display_index": self.frame_index,
+                        "predicted_flip_ns": pending["marker_ns"],
+                        "flip_return_ns": flip_ns,
+                        "presentation_event_kind": "qt_frame_swapped_return",
+                        "physical_presentation_measured": False,
+                        "automatic_gc": not gc_disabled_for_test,
                     }
                 )
 
@@ -350,7 +383,14 @@ def run_qt_test(args: argparse.Namespace, screen: dict, expected_hz: float) -> i
         window.showFullScreen()
 
     QTimer.singleShot(round((args.warmup + args.duration) * 1000), window.close)
-    app.exec()
+    automatic_gc_was_enabled = gc.isenabled()
+    if gc_disabled_for_test:
+        gc.disable()
+    try:
+        app.exec()
+    finally:
+        if gc_disabled_for_test and automatic_gc_was_enabled:
+            gc.enable()
 
     context = window.context()
     actual_format = context.format() if context is not None else window.format()
@@ -369,6 +409,10 @@ def run_qt_test(args: argparse.Namespace, screen: dict, expected_hz: float) -> i
             "Swap behavior": str(actual_format.swapBehavior()),
             "Timestamp mode": args.timestamp_mode,
             "QR drawing": args.qt_draw_mode,
+            "Retained QR matrices / pixmaps": (
+                f"{len(window.renderer.matrices)} / {len(window.renderer.images)}"
+                if window.renderer is not None else "0 / 0"
+            ),
         },
     )
     return 0 if len(window.samples) >= 2 else 1
@@ -389,6 +433,10 @@ def run_pygame_test(
 
     from calibration.display import FramePacer, QRClockRenderer
 
+    automatic_gc_was_enabled = gc.isenabled()
+    gc_disabled_for_test = args.disable_gc
+    if gc_disabled_for_test:
+        gc.disable()
     pygame.display.init()
     pygame.font.init()
     samples: list[dict] = []
@@ -493,12 +541,20 @@ def run_pygame_test(
                             else None
                         ),
                         "flip_ns": flip_ns,
+                        "display_index": frame_index,
+                        "predicted_flip_ns": marker_ns,
+                        "flip_return_ns": flip_ns,
+                        "presentation_event_kind": "pygame_display_flip_return",
+                        "physical_presentation_measured": False,
+                        "automatic_gc": not gc_disabled_for_test,
                     }
                 )
             last_flip_ns = flip_ns
             frame_index += 1
     finally:
         pygame.quit()
+        if gc_disabled_for_test and automatic_gc_was_enabled:
+            gc.enable()
 
     sdl_size = sizes[args.screen]
     print_summary(
@@ -514,6 +570,9 @@ def run_pygame_test(
             "VSync requested": "yes",
             "Timestamp mode": args.timestamp_mode,
             "QR drawing": args.pygame_draw_mode,
+            "Reusable QR surface pairs": (
+                len(renderer._qr_surfaces) if renderer is not None else 0
+            ),
         },
     )
     return 0 if len(samples) >= 2 else 1
@@ -612,6 +671,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--disable-gc",
+        action="store_true",
+        help=(
+            "disable automatic cyclic GC during presentation without running "
+            "manual collections"
+        ),
+    )
+    parser.add_argument(
         "--windowed",
         action="store_true",
         help="use a centered window instead of fullscreen",
@@ -660,6 +727,8 @@ def _forwarded_arguments(
         result.extend(("--refresh-hz", str(args.refresh_hz)))
     if args.windowed:
         result.append("--windowed")
+    if args.disable_gc:
+        result.append("--disable-gc")
     return result
 
 
