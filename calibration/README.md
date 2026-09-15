@@ -135,11 +135,13 @@ only to the in-memory image used for inspection and decoding.
 
 ## Quantitative strategies
 
-Only rows marked `accepted_clean` with `Clean` replacement timing and a finite
-offset are used. The first 70% of clean frames is the training portion; the
-later 30% is a chronological holdout that is not used to fit parameters.
+Every accepted frame with finite ordered presentation bounds is retained;
+timing flags and partial QR readability remain explicit diagnostics. Legacy
+reports without interval bounds fall back only to clean finite offsets. The
+first 70% of usable frames is the training portion and the later 30% is a
+chronological holdout that is not used to fit parameters.
 
-The report compares five strategies:
+The report compares these strategies:
 
 - **Current fixed 87.348 ms** uses the provisional default without fitting.
 - **Calibrated fixed median** uses the training median. A median minimizes total
@@ -148,9 +150,20 @@ The report compares five strategies:
   error but is more sensitive to outliers.
 - **PTS-step median** groups the current camera PTS interval into 5 ms buckets
   and uses the training median for the matching bucket.
-- **Six-step PTS history** is a least-squares linear regression using the current
-  PTS interval and the five previous intervals. It does not use QR values,
-  future frames, display index, or elapsed recording time as predictors.
+- **PTS cadence state** selects a compact one-, two-, or three-step categorical
+  5 ms cadence state inside the training portion.
+- **Selected-length PTS history** compares regularized linear histories from one
+  through six PTS steps on an inner chronological validation split, then refits
+  the selected length on the complete training portion.
+- **Regularized six-step PTS history** preserves the explicit six-step candidate
+  for comparison. No PTS strategy uses QR values, future frames, display index,
+  generation labels, or elapsed recording time as predictors.
+
+Readability is scored separately for full and partial grids. Each prediction
+row also contains the selected interval shifted by one and two measured display
+periods. These newer-generation alternatives expose the consequence of a
+missing latest QR, but the analyzer never chooses an alternative by minimizing
+its residual and never supplies these alternatives to a live predictor.
 
 For each frame, the signed residual is:
 
@@ -204,6 +217,15 @@ The root analyzer then automatically runs the quantitative analyzer, which creat
 - `calibration_offset_histogram.png` — the clean observed-offset distribution;
 - `calibration_fixed_residual_histogram.png` — one panel per fixed strategy;
 - `calibration_pts_residual_histogram.png` — one panel per PTS-based strategy.
+- `calibration_readability_diagnostics.png` — timing bands colored by missing QR
+  count plus full-grid readability for each cell selected as newest.
+
+When at least two sibling analysis folders are available, the root analyzer
+also writes `calibration_cross_recording_analysis/`. It fits each strategy on
+one complete recording and evaluates it unchanged on every other recording.
+The cross-recording JSON, Markdown, CSV, and graph report fixed-candidate
+repeatability, worst-pair P95, per-recording regression, and whether distinct
+camera stream restarts were identified.
 
 With `--svg`, the quantitative analyzer also creates an `.svg` copy beside each
 PNG. Existing SVG files from an earlier run are not deleted when the analyzer is
@@ -215,15 +237,20 @@ bins. Residual ranges are symmetric around zero.
 
 ## Interpreting the verdict safely
 
-- Exclude timing-suspect rows and rows whose QR removal timing is unknown. A QR
-  is removed after the configured number of newer visible codes; missing that
-  replacement evidence is not a clean transition.
+- Review timing-suspect and partial-readability subsets separately. They remain
+  usable when their recorded presentation interval is complete, but they must
+  not be mistaken for fully readable evidence.
 - A recommended correction replaces the configured subtraction; it is
   never added to it.
 - The chronological holdout tests a later portion of the same recording. It is
   useful for comparison, but it is not independent session validation.
 - Do not enable a learned dynamic correction from one recording. Preselect the
   strategy and confirm it on a later, independently recorded calibration first.
+- Cross-recording acceptance requires fixed candidates within 2 ms, at least a
+  0.5 ms dynamic MAE gain, no P95 regression larger than 0.5 ms, no per-session
+  MAE regression larger than 0.5 ms, and at least two identified camera stream
+  sessions. Restart both the camera stream and calibration display when
+  collecting independent evidence.
 - Keep the software-marker result separate from claims about physical exposure
   timing, RTSP transport delay, or radar alignment.
 - Treat each decoded newest QR as an interval constraint: its state is active
@@ -244,7 +271,8 @@ Run the focused non-visual checks with:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-  python3 -m pytest -q tests/test_qr_calibration.py tests/test_calibration_workflow.py
+  python3 -m pytest -q tests/test_qr_calibration.py \
+  tests/test_cross_recording_analysis.py tests/test_calibration_workflow.py
 ```
 
 These checks validate data handling and orchestration. Confirm the real display,

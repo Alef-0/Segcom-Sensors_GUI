@@ -26,6 +26,12 @@ MAX_CONTINUOUS_PTS_STEP_MS = 100.0
 TRAIN_FRACTION = 0.70
 MINIMUM_CLEAN_FRAMES = 30
 STEP_BUCKET_MS = 5.0
+HISTORY_RIDGE = 1e-3
+MINIMUM_CADENCE_STATE_FRAMES = 10
+GENERATION_ALTERNATIVES = 2
+FIXED_REPEATABILITY_LIMIT_MS = 2.0
+DYNAMIC_MINIMUM_GAIN_MS = 0.5
+DYNAMIC_P95_TOLERANCE_MS = 0.5
 
 ANALYSIS_JSON = "calibration_analysis.json"
 FRAMES_CSV = "calibration_frames.csv"
@@ -37,6 +43,7 @@ RESIDUAL_GRAPH = "calibration_residual_cdf.png"
 OFFSET_HISTOGRAM = "calibration_offset_histogram.png"
 FIXED_RESIDUAL_HISTOGRAM = "calibration_fixed_residual_histogram.png"
 PTS_RESIDUAL_HISTOGRAM = "calibration_pts_residual_histogram.png"
+READABILITY_GRAPH = "calibration_readability_diagnostics.png"
 _PLOTTING = None
 
 
@@ -87,6 +94,11 @@ class FrameEvidence:
     pts_history_ms: tuple[float, ...]
     interval_lower_ms: float | None
     interval_upper_ms: float | None
+    matched_readable_qrs: int | None
+    grid_qrs: int | None
+    latest_cell: int | None
+    latest_cell_name: str | None
+    readable_cells: tuple[bool, ...]
 
     @property
     def clean(self) -> bool:
@@ -117,6 +129,21 @@ class FrameEvidence:
         if self.offset_ms is None:
             raise ValueError("Evidence has neither an interval nor an exact offset")
         return self.offset_ms
+
+    @property
+    def fully_readable(self) -> bool:
+        return (
+            self.matched_readable_qrs is not None
+            and self.grid_qrs is not None
+            and self.grid_qrs > 0
+            and self.matched_readable_qrs >= self.grid_qrs
+        )
+
+    @property
+    def missing_qrs(self) -> int | None:
+        if self.matched_readable_qrs is None or self.grid_qrs is None:
+            return None
+        return max(0, self.grid_qrs - self.matched_readable_qrs)
 
 
 def _sha256(path: Path) -> str:
@@ -165,7 +192,9 @@ def _load_saved_analysis(output: Path) -> tuple[dict, list[dict], dict]:
     return report, frames, provenance
 
 
-def _prepare_evidence(frames: list[dict]) -> list[FrameEvidence]:
+def _prepare_evidence(
+    frames: list[dict], *, default_grid_qrs: int | None = None
+) -> list[FrameEvidence]:
     evidence = []
     previous_pts: float | None = None
     history: list[float] = []
@@ -203,6 +232,31 @@ def _prepare_evidence(frames: list[dict]) -> list[FrameEvidence]:
             pts_history_ms=tuple(recent[:6]),
             interval_lower_ms=interval_lower,
             interval_upper_ms=interval_upper,
+            matched_readable_qrs=(
+                int(row["matched_readable_qrs"])
+                if _finite_number(row.get("matched_readable_qrs")) is not None
+                else None
+            ),
+            grid_qrs=(
+                int(row["grid_qrs"])
+                if _finite_number(row.get("grid_qrs")) is not None
+                else default_grid_qrs
+            ),
+            latest_cell=(
+                int(row["latest_cell"])
+                if _finite_number(row.get("latest_cell")) is not None
+                else None
+            ),
+            latest_cell_name=(
+                str(row["latest_cell_name"])
+                if row.get("latest_cell_name") is not None
+                else None
+            ),
+            readable_cells=(
+                tuple(value is not None and str(value).strip() != "" for value in row["qr_values_ms"])
+                if isinstance(row.get("qr_values_ms"), list)
+                else ()
+            ),
         ))
         history.append(step)
         previous_pts = pts
@@ -368,6 +422,108 @@ def _generation_step_analysis(
     }
 
 
+def _readability_analysis(
+    rows: list[FrameEvidence], display_period_ms: float | None
+) -> dict:
+    known = [row for row in rows if row.matched_readable_qrs is not None]
+    fully_readable = [row for row in known if row.fully_readable]
+    partial = [row for row in known if not row.fully_readable]
+
+    def subset_metrics(members: list[FrameEvidence]) -> dict | None:
+        if not members:
+            return None
+        target, lower, upper = _interval_arrays(members)
+        return {
+            "frames": len(members),
+            "midpoint_distribution": _describe(target),
+            "current_fixed_metrics": _metrics(
+                target,
+                np.full(len(target), CURRENT_CORRECTION_MS),
+                lower,
+                upper,
+            ),
+        }
+
+    by_cell = []
+    cells = sorted({row.latest_cell for row in known if row.latest_cell is not None})
+    for cell in cells:
+        members = [row for row in known if row.latest_cell == cell]
+        missing = [row.missing_qrs or 0 for row in members]
+        by_cell.append({
+            "cell": cell,
+            "cell_name": next(
+                (row.latest_cell_name for row in members if row.latest_cell_name),
+                f"Cell {cell}",
+            ),
+            "selected_as_newest_frames": len(members),
+            "fully_readable_frames": sum(row.fully_readable for row in members),
+            "fully_readable_pct": 100 * sum(row.fully_readable for row in members) / len(members),
+            "mean_matched_readable_qrs": float(np.mean([
+                row.matched_readable_qrs for row in members
+            ])),
+            "mean_missing_qrs": float(np.mean(missing)),
+            "interval_midpoint_median_ms": float(np.median([
+                row.representative_offset_ms for row in members
+            ])),
+        })
+
+    cell_map_rows = [row for row in known if row.readable_cells]
+    cell_count = max((len(row.readable_cells) for row in cell_map_rows), default=0)
+    per_cell = []
+    selected_counts = {
+        row["cell"]: row["selected_as_newest_frames"] for row in by_cell
+    }
+    for cell in range(cell_count):
+        observed = [row for row in cell_map_rows if cell < len(row.readable_cells)]
+        readable_frames = sum(row.readable_cells[cell] for row in observed)
+        per_cell.append({
+            "cell": cell,
+            "observed_frames": len(observed),
+            "readable_frames": readable_frames,
+            "readable_pct": 100 * readable_frames / len(observed),
+            "selected_as_newest_frames": selected_counts.get(cell, 0),
+        })
+
+    ambiguity = None
+    if display_period_ms is not None and math.isfinite(display_period_ms) and display_period_ms > 0:
+        deltas = [
+            round((row.representative_offset_ms - CURRENT_CORRECTION_MS) / display_period_ms)
+            for row in known
+        ]
+        ambiguity = {
+            "reference_correction_ms": CURRENT_CORRECTION_MS,
+            "classification": (
+                "Diagnostic only. Positive steps mean the selected marker interval is one or more "
+                "display periods older than the provisional fixed correction. No alternative is "
+                "chosen for fitting or live prediction."
+            ),
+            "steps_from_current_counts": {
+                str(step): deltas.count(step) for step in sorted(set(deltas))
+            },
+            "one_or_more_older_generation_frames": sum(step >= 1 for step in deltas),
+            "two_or_more_older_generation_frames": sum(step >= 2 for step in deltas),
+        }
+
+    return {
+        "known_readability_frames": len(known),
+        "fully_readable_frames": len(fully_readable),
+        "partial_readability_frames": len(partial),
+        "fully_readable_pct": 100 * len(fully_readable) / len(known) if known else None,
+        "fully_readable_metrics": subset_metrics(fully_readable),
+        "partial_readability_metrics": subset_metrics(partial),
+        "selected_newest_by_cell": by_cell,
+        "per_cell_readability": per_cell,
+        "generation_ambiguity": ambiguity,
+        "alternative_interval_policy": {
+            "alternatives_per_frame": GENERATION_ALTERNATIVES,
+            "method": (
+                "Report the selected interval shifted earlier by one and two measured display "
+                "periods. Alternatives remain diagnostic and are never selected by residual size."
+            ),
+        },
+    }
+
+
 def _step_bucket(step_ms: float) -> float:
     return round(step_ms / STEP_BUCKET_MS) * STEP_BUCKET_MS
 
@@ -412,13 +568,19 @@ def _fit_step_medians(train: list[FrameEvidence], fallback: float) -> dict[float
     } or {_step_bucket(NOMINAL_PTS_STEP_MS): fallback}
 
 
-def _fit_history_model(train: list[FrameEvidence]) -> dict:
-    features = np.asarray([row.pts_history_ms for row in train], dtype=float)
+def _fit_history_model(
+    train: list[FrameEvidence], *, history_length: int = 6
+) -> dict:
+    if not 1 <= history_length <= 6:
+        raise ValueError("PTS history length must be between 1 and 6")
+    features = np.asarray([
+        row.pts_history_ms[:history_length] for row in train
+    ], dtype=float)
     target, lower, upper = _interval_arrays(train)
     center = np.median(features, axis=0)
     design = np.column_stack((np.ones(len(features)), features - center))
     coefficients, _, rank, _ = np.linalg.lstsq(design, target, rcond=None)
-    ridge = 1e-8
+    ridge = HISTORY_RIDGE
     ridge_matrix = np.diag([0.0, *([ridge] * (design.shape[1] - 1))])
     converged = False
     gradient_norm = math.inf
@@ -468,20 +630,109 @@ def _fit_history_model(train: list[FrameEvidence]) -> dict:
         "centered_intercept_ms": float(coefficients[0]),
         "intercept_ms": float(coefficients[0] - center @ slopes),
         "slopes": slopes.tolist(),
+        "history_length": history_length,
+        "ridge": ridge,
         "rank": int(rank),
         "fit_objective": "squared distance outside presentation interval",
         "optimizer_iterations": iterations,
         "optimizer_converged": converged,
         "optimizer_final_gradient_max_abs": gradient_norm,
-        "features": ["pts_step_ms", *[f"pts_step_lag{i}_ms" for i in range(1, 6)]],
+        "features": [
+            "pts_step_ms",
+            *[f"pts_step_lag{i}_ms" for i in range(1, history_length)],
+        ],
     }
 
 
 def _predict_history(model: dict, rows: Iterable[FrameEvidence]) -> np.ndarray:
-    features = np.asarray([row.pts_history_ms for row in rows], dtype=float)
+    history_length = int(model.get("history_length", len(model["slopes"])))
+    features = np.asarray([
+        row.pts_history_ms[:history_length] for row in rows
+    ], dtype=float)
     center = np.asarray(model["center_ms"], dtype=float)
     slopes = np.asarray(model["slopes"], dtype=float)
     return model["centered_intercept_ms"] + (features - center) @ slopes
+
+
+def _cadence_key(row: FrameEvidence, depth: int) -> tuple[float, ...]:
+    return tuple(_step_bucket(value) for value in row.pts_history_ms[:depth])
+
+
+def _fit_cadence_model(
+    train: list[FrameEvidence], *, depth: int, fallback: float
+) -> dict:
+    step_fallbacks = _fit_step_medians(train, fallback)
+    groups: dict[tuple[float, ...], list[FrameEvidence]] = {}
+    for row in train:
+        groups.setdefault(_cadence_key(row, depth), []).append(row)
+    states = {
+        key: _fit_interval_constant(members, squared=False)
+        for key, members in groups.items()
+        if len(members) >= MINIMUM_CADENCE_STATE_FRAMES
+    }
+    return {
+        "depth": depth,
+        "fallback_ms": fallback,
+        "step_fallbacks": step_fallbacks,
+        "states": states,
+    }
+
+
+def _predict_cadence(model: dict, rows: Iterable[FrameEvidence]) -> np.ndarray:
+    depth = int(model["depth"])
+    return np.asarray([
+        model["states"].get(
+            _cadence_key(row, depth),
+            model["step_fallbacks"].get(
+                _step_bucket(row.pts_step_ms), model["fallback_ms"]
+            ),
+        )
+        for row in rows
+    ])
+
+
+def _select_cadence_depth(train: list[FrameEvidence]) -> tuple[dict, list[dict]]:
+    inner_count = max(1, min(len(train) - 1, int(len(train) * TRAIN_FRACTION)))
+    inner_train = train[:inner_count]
+    inner_holdout = train[inner_count:]
+    target, lower, upper = _interval_arrays(inner_holdout)
+    trials = []
+    for depth in range(1, 4):
+        fallback = _fit_interval_constant(inner_train, squared=False)
+        model = _fit_cadence_model(inner_train, depth=depth, fallback=fallback)
+        metrics = _metrics(target, _predict_cadence(model, inner_holdout), lower, upper)
+        trials.append({"depth": depth, "metrics": metrics})
+    selected = min(
+        trials,
+        key=lambda trial: (
+            trial["metrics"]["mae_ms"],
+            trial["metrics"]["p95_absolute_ms"],
+            trial["depth"],
+        ),
+    )["depth"]
+    fallback = _fit_interval_constant(train, squared=False)
+    return _fit_cadence_model(train, depth=selected, fallback=fallback), trials
+
+
+def _select_history_length(train: list[FrameEvidence]) -> tuple[dict, list[dict]]:
+    inner_count = max(1, min(len(train) - 1, int(len(train) * TRAIN_FRACTION)))
+    inner_train = train[:inner_count]
+    inner_holdout = train[inner_count:]
+    target, lower, upper = _interval_arrays(inner_holdout)
+    trials = []
+    for history_length in range(1, 7):
+        model = _fit_history_model(inner_train, history_length=history_length)
+        metrics = _metrics(target, _predict_history(model, inner_holdout), lower, upper)
+        trials.append({"history_length": history_length, "metrics": metrics})
+    selected = min(
+        trials,
+        key=lambda trial: (
+            trial["metrics"]["mae_ms"],
+            trial["metrics"]["p95_absolute_ms"],
+            trial["history_length"],
+        ),
+    )["history_length"]
+    return _fit_history_model(train, history_length=selected), trials
 
 
 def _strategy_predictions(
@@ -491,7 +742,9 @@ def _strategy_predictions(
     median = _fit_interval_constant(train, squared=False)
     mean = _fit_interval_constant(train, squared=True)
     step_medians = _fit_step_medians(train, median)
-    history_model = _fit_history_model(train)
+    cadence_model, cadence_trials = _select_cadence_depth(train)
+    selected_history_model, history_trials = _select_history_length(train)
+    history_model = _fit_history_model(train, history_length=6)
 
     count = len(usable)
     predictions = {
@@ -501,6 +754,8 @@ def _strategy_predictions(
         "pts_step_median": np.asarray([
             step_medians.get(_step_bucket(row.pts_step_ms), median) for row in usable
         ]),
+        "pts_cadence_state": _predict_cadence(cadence_model, usable),
+        "pts_history_selected_linear": _predict_history(selected_history_model, usable),
         "pts_history6_linear": _predict_history(history_model, usable),
     }
     definitions = {
@@ -527,9 +782,44 @@ def _strategy_predictions(
                 "bucket_corrections_ms": {f"{key:g}": value for key, value in sorted(step_medians.items())},
             },
         },
+        "pts_cadence_state": {
+            "label": "PTS cadence-state interval median",
+            "fit": (
+                "Chronologically selected categorical state using the current and up to two "
+                "previous 5 ms PTS-step buckets"
+            ),
+            "parameters": {
+                "selected_depth": cadence_model["depth"],
+                "minimum_state_frames": MINIMUM_CADENCE_STATE_FRAMES,
+                "fallback_ms": cadence_model["fallback_ms"],
+                "step_fallbacks_ms": {
+                    f"{key:g}": value
+                    for key, value in sorted(cadence_model["step_fallbacks"].items())
+                },
+                "state_corrections_ms": {
+                    "/".join(f"{value:g}" for value in key): correction
+                    for key, correction in sorted(cadence_model["states"].items())
+                },
+                "inner_validation_trials": cadence_trials,
+            },
+        },
+        "pts_history_selected_linear": {
+            "label": "Selected-length regularized PTS history",
+            "fit": (
+                "Chronologically selects 1-6 current/lagged PTS intervals inside the training "
+                "portion, then refits that length with ridge regularization"
+            ),
+            "parameters": {
+                **selected_history_model,
+                "inner_validation_trials": history_trials,
+            },
+        },
         "pts_history6_linear": {
-            "label": "Six-step PTS interval model",
-            "fit": "Squared interval-distance fit using current and five previous PTS intervals",
+            "label": "Regularized six-step PTS interval model",
+            "fit": (
+                "Squared interval-distance fit using current and five previous PTS intervals "
+                "with ridge regularization"
+            ),
             "parameters": history_model,
         },
     }
@@ -594,6 +884,99 @@ def _write_timeline_graph(
     )
     axis.grid(alpha=0.22)
     axis.legend(ncols=2, fontsize=9)
+    _save_figure(figure, path, save_svg=save_svg)
+
+
+def _write_readability_graph(
+    path: Path,
+    usable: list[FrameEvidence],
+    readability: dict,
+    *,
+    save_svg: bool = False,
+) -> None:
+    """Show missing-QR timing bands and selected-newest reliability per cell."""
+    plt, PercentFormatter = _plotting()
+    figure, (timeline, cells) = plt.subplots(
+        1, 2, figsize=(14, 5.2), layout="constrained"
+    )
+    known = [row for row in usable if row.missing_qrs is not None]
+    unknown = [row for row in usable if row.missing_qrs is None]
+    if known:
+        points = timeline.scatter(
+            [row.frame_number for row in known],
+            [row.representative_offset_ms for row in known],
+            c=[row.missing_qrs for row in known],
+            cmap="viridis",
+            vmin=0,
+            vmax=max(1, max(row.missing_qrs or 0 for row in known)),
+            s=12,
+            alpha=0.7,
+        )
+        colorbar = figure.colorbar(points, ax=timeline, pad=0.02)
+        colorbar.set_label("Unreadable or unmatched QR cells")
+    if unknown:
+        timeline.scatter(
+            [row.frame_number for row in unknown],
+            [row.representative_offset_ms for row in unknown],
+            color="#7a858f",
+            s=10,
+            alpha=0.45,
+            label="Readability unavailable",
+        )
+    timeline.axhline(
+        CURRENT_CORRECTION_MS,
+        color="#b4465a",
+        linestyle="--",
+        linewidth=1.4,
+        label=f"Current {CURRENT_CORRECTION_MS:.3f} ms",
+    )
+    timeline.set(
+        title="Timing bands versus QR readability",
+        xlabel="Camera frame number",
+        ylabel="Presentation-interval midpoint (ms)",
+    )
+    timeline.grid(alpha=0.22)
+    timeline.legend(fontsize=8)
+
+    cell_rows = readability.get("per_cell_readability", [])
+    if cell_rows:
+        positions = np.arange(len(cell_rows))
+        bars = cells.bar(
+            positions,
+            [row["readable_pct"] for row in cell_rows],
+            color="#3f8f68",
+        )
+        cells.set_xticks(
+            positions,
+            [str(row["cell"]) for row in cell_rows],
+        )
+        for bar, row in zip(bars, cell_rows):
+            cells.text(
+                bar.get_x() + bar.get_width() / 2,
+                min(98, bar.get_height() + 2),
+                f"newest={row['selected_as_newest_frames']}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                rotation=90,
+            )
+        cells.set_ylim(0, 112)
+        cells.yaxis.set_major_formatter(PercentFormatter(xmax=100))
+    else:
+        cells.text(
+            0.5,
+            0.5,
+            "Selected-cell metadata unavailable",
+            transform=cells.transAxes,
+            ha="center",
+            va="center",
+        )
+    cells.set(
+        title="Per-cell QR readability and newest-selection count",
+        xlabel="Detected grid cell (zero-based)",
+        ylabel="Frames where cell decoded (%)",
+    )
+    cells.grid(axis="y", alpha=0.22)
     _save_figure(figure, path, save_svg=save_svg)
 
 
@@ -722,12 +1105,24 @@ def _write_predictions(
     usable: list[FrameEvidence],
     train_count: int,
     predictions: dict[str, np.ndarray],
+    *,
+    display_period_ms: float | None,
 ) -> None:
     fields = [
         "frame_number", "filename", "split", "source_validation",
         "source_timing_status", "evidence_policy", "observed_offset_ms",
         "interval_lower_ms", "interval_upper_ms", "representative_offset_ms",
-        "pts_step_ms",
+        "pts_step_ms", "matched_readable_qrs", "grid_qrs", "missing_qrs",
+        "readability_class", "latest_cell", "latest_cell_name",
+        "diagnostic_generation_steps_from_current",
+        *[
+            field
+            for generation in range(1, GENERATION_ALTERNATIVES + 1)
+            for field in (
+                f"newer_generation_{generation}_interval_lower_ms",
+                f"newer_generation_{generation}_interval_upper_ms",
+            )
+        ],
         *[f"correction_{key}" for key in predictions],
         *[f"interval_residual_{key}" for key in predictions],
     ]
@@ -758,7 +1153,30 @@ def _write_predictions(
                 "interval_upper_ms": upper,
                 "representative_offset_ms": row.representative_offset_ms,
                 "pts_step_ms": row.pts_step_ms,
+                "matched_readable_qrs": row.matched_readable_qrs,
+                "grid_qrs": row.grid_qrs,
+                "missing_qrs": row.missing_qrs,
+                "readability_class": (
+                    "full" if row.fully_readable
+                    else "partial" if row.matched_readable_qrs is not None
+                    else "unknown"
+                ),
+                "latest_cell": row.latest_cell,
+                "latest_cell_name": row.latest_cell_name,
+                "diagnostic_generation_steps_from_current": (
+                    round(
+                        (row.representative_offset_ms - CURRENT_CORRECTION_MS)
+                        / display_period_ms
+                    )
+                    if display_period_ms is not None and display_period_ms > 0
+                    else None
+                ),
             }
+            if display_period_ms is not None and display_period_ms > 0:
+                for generation in range(1, GENERATION_ALTERNATIVES + 1):
+                    shift = generation * display_period_ms
+                    record[f"newer_generation_{generation}_interval_lower_ms"] = lower - shift
+                    record[f"newer_generation_{generation}_interval_upper_ms"] = upper - shift
             record.update({
                 f"correction_{key}": float(values[index])
                 for key, values in predictions.items()
@@ -854,6 +1272,51 @@ def _markdown(report: dict) -> str:
                 f"| {band['generation_steps_from_anchor']:+d} | {band['frames']} | "
                 f"{band['interval_midpoint_median_ms']:.3f} ms | {exact_text} |"
             )
+    readability = report.get("readability_analysis")
+    if isinstance(readability, dict) and readability["known_readability_frames"]:
+        lines.extend([
+            "",
+            "## QR readability and generation ambiguity",
+            "",
+            f"- Fully readable grids: {readability['fully_readable_frames']} / "
+            f"{readability['known_readability_frames']} "
+            f"({readability['fully_readable_pct']:.1f}%)",
+            f"- Partial grids retained: {readability['partial_readability_frames']}",
+            "- Each frame now reports one- and two-generation newer interval alternatives. "
+            "They are diagnostics only and are not chosen by residual size or used by a live model.",
+        ])
+        ambiguity = readability.get("generation_ambiguity")
+        if isinstance(ambiguity, dict):
+            lines.extend([
+                f"- Default-relative diagnostic: "
+                f"{ambiguity['one_or_more_older_generation_frames']} frames are at least one "
+                f"display period older than {ambiguity['reference_correction_ms']:.3f} ms; "
+                f"{ambiguity['two_or_more_older_generation_frames']} are at least two periods older.",
+            ])
+            if readability["per_cell_readability"]:
+                lines.extend([
+                    "",
+                    "| Detected grid cell | Readable frames | Readability | Selected newest |",
+                    "|---:|---:|---:|---:|",
+                ])
+                for cell in readability["per_cell_readability"]:
+                    lines.append(
+                        f"| {cell['cell']} | {cell['readable_frames']} / "
+                        f"{cell['observed_frames']} | {cell['readable_pct']:.1f}% | "
+                        f"{cell['selected_as_newest_frames']} |"
+                    )
+            lines.extend([
+                "",
+                "| Selected newest cell | Frames | Fully readable | Mean matched QRs | Midpoint median |",
+                "|---:|---:|---:|---:|---:|",
+            ])
+            for cell in readability["selected_newest_by_cell"]:
+                lines.append(
+                    f"| {cell['cell']} ({cell['cell_name']}) | "
+                    f"{cell['selected_as_newest_frames']} | {cell['fully_readable_pct']:.1f}% | "
+                    f"{cell['mean_matched_readable_qrs']:.2f} | "
+                    f"{cell['interval_midpoint_median_ms']:.3f} ms |"
+                )
     lines.extend([
         "",
         "## Presentation-interval midpoint distribution",
@@ -900,6 +1363,18 @@ def _markdown(report: dict) -> str:
         "display indices, generation-band labels, future frames, or elapsed recording time as predictors. "
         "The dynamic ranking remains exploratory "
         "because it comes from one recording; confirm it on another independently recorded calibration before enabling it live.",
+        "The cadence-state depth and regularized history length are selected only inside the training "
+        "portion before the final chronological holdout is scored.",
+        "",
+        "## Acceptance criteria",
+        "",
+        f"- Fixed candidates must stay within {report['acceptance_criteria']['fixed_repeatability_limit_ms']:.1f} ms "
+        "across independently restarted sessions.",
+        f"- A dynamic strategy must improve MAE by at least "
+        f"{report['acceptance_criteria']['dynamic_minimum_mae_gain_ms']:.1f} ms.",
+        f"- Its P95 may not exceed the fixed model by more than "
+        f"{report['acceptance_criteria']['dynamic_p95_tolerance_ms']:.1f} ms.",
+        "- Cross-session no-regression is evaluated separately; this single recording cannot pass it.",
         "",
         "## Files",
         "",
@@ -908,6 +1383,7 @@ def _markdown(report: dict) -> str:
         f"- `{Path(OFFSET_HISTOGRAM).stem}` ({graph_suffixes}): distribution of retained interval midpoints",
         f"- `{Path(FIXED_RESIDUAL_HISTOGRAM).stem}` ({graph_suffixes}): one panel per fixed strategy",
         f"- `{Path(PTS_RESIDUAL_HISTOGRAM).stem}` ({graph_suffixes}): one panel per PTS strategy",
+        f"- `{Path(READABILITY_GRAPH).stem}` ({graph_suffixes}): missing-QR timing bands and per-cell readability",
         f"- `{PREDICTIONS_CSV}`: per-usable-frame interval bounds, predictions, residuals, and split labels",
         f"- `{VERDICT_JSON}`: complete metrics, model coefficients, provenance, and machine-readable verdict",
         "",
@@ -923,7 +1399,13 @@ def analyze_output_directory(
     if not output.is_dir():
         raise ValueError(f"Analysis output directory does not exist: {output}")
     source, frames, provenance = _load_saved_analysis(output)
-    evidence = _prepare_evidence(frames)
+    grid = source.get("grid") if isinstance(source.get("grid"), dict) else {}
+    default_grid_qrs = (
+        int(grid["qr_count"])
+        if _finite_number(grid.get("qr_count")) is not None
+        else None
+    )
+    evidence = _prepare_evidence(frames, default_grid_qrs=default_grid_qrs)
     usable = [row for row in evidence if row.usable]
     if len(usable) < MINIMUM_CLEAN_FRAMES:
         raise ValueError(
@@ -948,16 +1430,23 @@ def analyze_output_directory(
             ),
         }
 
-    candidate_keys = ("fixed_train_median", "pts_step_median", "pts_history6_linear")
+    candidate_keys = (
+        "fixed_train_median",
+        "pts_step_median",
+        "pts_cadence_state",
+        "pts_history_selected_linear",
+        "pts_history6_linear",
+    )
     best_key = min(candidate_keys, key=lambda key: strategies[key]["holdout_metrics"]["mae_ms"])
     calibrated_fixed_mae = strategies["fixed_train_median"]["holdout_metrics"]["mae_ms"]
     best_mae = strategies[best_key]["holdout_metrics"]["mae_ms"]
     gain_ms = calibrated_fixed_mae - best_mae
     meaningful_dynamic_gain = (
-        best_key in ("pts_step_median", "pts_history6_linear")
-        and gain_ms >= max(0.5, 0.05 * calibrated_fixed_mae)
+        best_key != "fixed_train_median"
+        and gain_ms >= max(DYNAMIC_MINIMUM_GAIN_MS, 0.05 * calibrated_fixed_mae)
         and strategies[best_key]["holdout_metrics"]["p95_absolute_ms"]
-        <= strategies["fixed_train_median"]["holdout_metrics"]["p95_absolute_ms"] + 0.5
+        <= strategies["fixed_train_median"]["holdout_metrics"]["p95_absolute_ms"]
+        + DYNAMIC_P95_TOLERANCE_MS
     )
 
     distribution = _describe(target)
@@ -977,6 +1466,12 @@ def analyze_output_directory(
     )
     consensus = _maximum_interval_consensus(usable)
     generation_steps = _generation_step_analysis(usable, consensus)
+    display_period_ms = (
+        generation_steps["estimated_display_period_ms"]
+        if isinstance(generation_steps, dict)
+        else None
+    )
+    readability = _readability_analysis(usable, display_period_ms)
     if meaningful_dynamic_gain:
         dynamic_assessment = (
             f"The lowest observed chronological-holdout interval error came from "
@@ -1049,6 +1544,7 @@ def analyze_output_directory(
         OFFSET_HISTOGRAM,
         FIXED_RESIDUAL_HISTOGRAM,
         PTS_RESIDUAL_HISTOGRAM,
+        READABILITY_GRAPH,
     ]
     if save_svg:
         graph_files.extend(str(Path(path).with_suffix(".svg")) for path in graph_files.copy())
@@ -1073,6 +1569,7 @@ def analyze_output_directory(
             "source_recording_analysis": source.get("presentation_interval_analysis"),
         },
         "generation_step_analysis": generation_steps,
+        "readability_analysis": readability,
         "data_quality": quality,
         "interval_midpoint_distribution": distribution,
         "clean_offset_distribution": source_clean_distribution,
@@ -1136,9 +1633,25 @@ def analyze_output_directory(
             "residual_range": "Each panel's full residual range, symmetric around zero plus 6% padding",
             "height": "Percentage of evaluated frames in each bin",
         },
+        "acceptance_criteria": {
+            "fixed_repeatability_limit_ms": FIXED_REPEATABILITY_LIMIT_MS,
+            "dynamic_minimum_mae_gain_ms": DYNAMIC_MINIMUM_GAIN_MS,
+            "dynamic_p95_tolerance_ms": DYNAMIC_P95_TOLERANCE_MS,
+            "single_recording_status": (
+                "Cross-recording repeatability and no-regression criteria require separately "
+                "recorded sessions and are evaluated by calibration.cross_recording_analysis."
+            ),
+            "dynamic_gain_passed_this_holdout": meaningful_dynamic_gain,
+        },
     }
 
-    _write_predictions(output / PREDICTIONS_CSV, usable, train_count, predictions)
+    _write_predictions(
+        output / PREDICTIONS_CSV,
+        usable,
+        train_count,
+        predictions,
+        display_period_ms=display_period_ms,
+    )
     _write_timeline_graph(
         output / TIMELINE_GRAPH, evidence, session_correction, save_svg=save_svg
     )
@@ -1190,13 +1703,21 @@ def analyze_output_directory(
         symmetric_about_zero=True,
         save_svg=save_svg,
     )
+    _write_readability_graph(
+        output / READABILITY_GRAPH,
+        usable,
+        readability,
+        save_svg=save_svg,
+    )
     _write_histogram(
         output / PTS_RESIDUAL_HISTOGRAM,
         "Holdout interval-distance distribution — PTS strategies",
         "Signed distance outside presentation interval (ms)",
         [
             ("PTS-step interval median", _interval_residual(holdout_lower, holdout_upper, predictions["pts_step_median"][holdout_slice]), "#3f8f68"),
-            ("Six-step PTS interval model", _interval_residual(holdout_lower, holdout_upper, predictions["pts_history6_linear"][holdout_slice]), "#147a88"),
+            ("PTS cadence state", _interval_residual(holdout_lower, holdout_upper, predictions["pts_cadence_state"][holdout_slice]), "#577a3f"),
+            ("Selected-length PTS history", _interval_residual(holdout_lower, holdout_upper, predictions["pts_history_selected_linear"][holdout_slice]), "#5f6fb2"),
+            ("Regularized six-step PTS", _interval_residual(holdout_lower, holdout_upper, predictions["pts_history6_linear"][holdout_slice]), "#147a88"),
         ],
         symmetric_about_zero=True,
         save_svg=save_svg,

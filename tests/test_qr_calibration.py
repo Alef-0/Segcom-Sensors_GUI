@@ -798,6 +798,81 @@ class RecordingTests(unittest.TestCase):
 
 
 class QuantitativeVerdictTests(unittest.TestCase):
+    def test_report_separates_readability_and_preserves_generation_alternatives(self):
+        with TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            frames = []
+            pts_ns = 0
+            for index in range(60):
+                step_ms = 20.0 if index % 3 == 1 else 40.0
+                pts_ns += int(step_ms * 1e6)
+                midpoint = 77.0 if step_ms == 20.0 else 87.0
+                partial = index % 4 == 0
+                frames.append({
+                    "frame_number": index + 1,
+                    "filename": f"camera_{index + 1:06d}.jpg",
+                    "validation": "accepted_clean",
+                    "timing_status": "Clean",
+                    "pts_ns": pts_ns,
+                    "pts_minus_latest_qr_ms": midpoint,
+                    "offset_interval_lower_ms": midpoint - 5.0,
+                    "offset_interval_upper_ms": midpoint + 5.0,
+                    "matched_readable_qrs": 8 if partial else 10,
+                    "grid_qrs": 10,
+                    "qr_values_ms": [
+                        None if partial and cell in (1, 4) else f"qr-{cell}"
+                        for cell in range(10)
+                    ],
+                    "latest_cell": index % 10,
+                    "latest_cell_name": f"Cell {index % 10}",
+                })
+            source = {
+                "recording_directory": "/recordings/sample",
+                "grid": {"qr_count": 10},
+                "frames": frames,
+            }
+            (output / "calibration_analysis.json").write_text(
+                json.dumps(source), encoding="utf-8"
+            )
+            with (output / "calibration_frames.csv").open(
+                "w", encoding="utf-8", newline=""
+            ) as destination:
+                writer = csv.DictWriter(destination, fieldnames=frames[0].keys())
+                writer.writeheader()
+                writer.writerows(frames)
+
+            def graph_file(path, *_args, **_kwargs):
+                path.write_bytes(b"PNG")
+
+            with (
+                patch("calibration.quantitative_analysis._write_timeline_graph", side_effect=graph_file),
+                patch("calibration.quantitative_analysis._write_residual_graph", side_effect=graph_file),
+                patch("calibration.quantitative_analysis._write_histogram", side_effect=graph_file),
+                patch("calibration.quantitative_analysis._write_readability_graph", side_effect=graph_file),
+            ):
+                report = analyze_output_directory(output)
+
+            readability = report["readability_analysis"]
+            self.assertEqual(readability["fully_readable_frames"], 45)
+            self.assertEqual(readability["partial_readability_frames"], 15)
+            self.assertEqual(len(readability["selected_newest_by_cell"]), 10)
+            self.assertEqual(len(readability["per_cell_readability"]), 10)
+            self.assertEqual(readability["per_cell_readability"][1]["readable_pct"], 75.0)
+            self.assertIn("pts_cadence_state", report["strategies"])
+            self.assertIn("pts_history_selected_linear", report["strategies"])
+            self.assertEqual(
+                report["strategies"]["pts_history6_linear"]["parameters"]["ridge"],
+                1e-3,
+            )
+            with (output / "calibration_strategy_predictions.csv").open(
+                encoding="utf-8", newline=""
+            ) as source_file:
+                prediction = next(csv.DictReader(source_file))
+            self.assertEqual(prediction["readability_class"], "partial")
+            self.assertNotEqual(
+                prediction["newer_generation_1_interval_lower_ms"], ""
+            )
+
     def test_saved_analysis_defaults_to_png_and_optionally_saves_svg_graphs(self):
         with TemporaryDirectory() as temporary:
             output = Path(temporary)
@@ -841,6 +916,7 @@ class QuantitativeVerdictTests(unittest.TestCase):
                 patch("calibration.quantitative_analysis._write_timeline_graph", side_effect=graph_file),
                 patch("calibration.quantitative_analysis._write_residual_graph", side_effect=graph_file),
                 patch("calibration.quantitative_analysis._write_histogram", side_effect=graph_file),
+                patch("calibration.quantitative_analysis._write_readability_graph", side_effect=graph_file),
             ):
                 report = analyze_output_directory(output)
 
@@ -859,6 +935,7 @@ class QuantitativeVerdictTests(unittest.TestCase):
                 "calibration_offset_histogram",
                 "calibration_fixed_residual_histogram",
                 "calibration_pts_residual_histogram",
+                "calibration_readability_diagnostics",
             )
             for stem in graph_stems:
                 self.assertTrue((output / f"{stem}.png").is_file())
@@ -869,6 +946,7 @@ class QuantitativeVerdictTests(unittest.TestCase):
                 patch("calibration.quantitative_analysis._write_timeline_graph", side_effect=graph_file),
                 patch("calibration.quantitative_analysis._write_residual_graph", side_effect=graph_file),
                 patch("calibration.quantitative_analysis._write_histogram", side_effect=graph_file),
+                patch("calibration.quantitative_analysis._write_readability_graph", side_effect=graph_file),
             ):
                 svg_report = analyze_output_directory(output, save_svg=True)
 
@@ -897,6 +975,38 @@ class QuantitativeVerdictTests(unittest.TestCase):
             self.assertIn(str(recording), command)
             self.assertIn(str(output), command)
 
+    def test_root_launcher_builds_cross_recording_report_for_sibling_analyses(self):
+        with TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            first = parent / "01_calibration_analysis"
+            second = parent / "02_calibration_analysis"
+            destination = parent / "calibration_cross_recording_analysis"
+            destination.mkdir()
+            (destination / "calibration_cross_recording.json").write_text(
+                json.dumps({"output_directory": str(destination)}),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(
+                    recording_launcher,
+                    "discover_analysis_directories",
+                    return_value=[first, second],
+                ),
+                patch.object(recording_launcher, "matplotlib_environment", return_value={}),
+                patch.object(recording_launcher.subprocess, "run") as run,
+            ):
+                report = recording_launcher._run_cross_recording_analysis(first)
+
+            self.assertEqual(report["output_directory"], str(destination))
+            command = run.call_args.args[0]
+            self.assertEqual(
+                command[:3],
+                [recording_launcher.sys.executable, "-m", "calibration.cross_recording_analysis"],
+            )
+            self.assertIn(str(first), command)
+            self.assertIn(str(second), command)
+            self.assertIn(str(destination), command)
+
     def test_root_launcher_runs_distance_analysis_after_the_window(self):
         recording = Path("/recordings/sample")
         output = Path("/recordings/sample_analysis")
@@ -908,12 +1018,14 @@ class QuantitativeVerdictTests(unittest.TestCase):
             patch.object(recording_launcher, "_run_quantitative_analysis", return_value={
                 "output_directory": str(output)
             }) as quantitative,
+            patch.object(recording_launcher, "_run_cross_recording_analysis", return_value=None) as cross,
             patch("sys.argv", ["analyze_calibration_recording.py", str(recording)]),
         ):
             recording_launcher.main()
         display.assert_called_once()
         analyze.assert_called_once_with(recording, output)
         quantitative.assert_called_once_with(output)
+        cross.assert_called_once_with(output)
 
 
 if __name__ == "__main__":

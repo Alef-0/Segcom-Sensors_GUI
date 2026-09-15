@@ -130,10 +130,11 @@ PTS frames are rejected and counted.
 
 The separate camera latency adjustment provisionally defaults to 87.348 ms. It is subtracted
 when associating a camera observation with radar time and is recorded in
-metadata. It does not replace or configure the RTSP jitter buffer. This value
-comes from `recordings/01_calibration`; confirm it on an independent recording
-and recheck it after changes to the DVR, stream session, decoder, network path,
-or capture setup.
+metadata. It does not replace or configure the RTSP jitter buffer. The current
+repeated recordings keep their interval-aware fixed candidates within 2 ms, but
+they share one camera stream epoch. Keep the value provisional until it passes
+a separately restarted camera/display session, and recheck it after changes to
+the DVR, decoder, network path, or capture setup.
 
 See `sensors/camera/README.md` for the pipeline and timestamp policy in more detail.
 
@@ -224,19 +225,28 @@ python3 analyze_calibration_recording.py /path/to/calibration-recording \
 python3 -m calibration.distance_analysis \
   /path/to/calibration-recording
 
-# Recreate only the quantitative strategy report and its five graphs
+# Recreate only the quantitative strategy report and its graphs
 python3 -m calibration.quantitative_analysis \
   /path/to/calibration-recording_analysis
+
+# Compare already analyzed recordings with frozen source-to-target models
+python3 -m calibration.cross_recording_analysis \
+  /path/to/01_calibration_analysis /path/to/02_calibration_analysis \
+  --output-directory /path/to/calibration_cross_recording_analysis
 ```
 
 For each decoded QR, the analyzer verifies the recorded quadrant and checks both
 its own flip timing and the following replacement. Suspect or missing replacement
 evidence stays visible but is excluded from the clean offset summary. The verdict
 compares the current 87.348 ms default, calibrated fixed corrections, PTS-step
-groups, and a six-step causal PTS-history model on a chronological 70/30 split.
-A learned model remains
-experimental until the preselected strategy is confirmed on a later independent
-recording. Readable codes alone do not establish physical exposure time.
+groups, a compact cadence-state model, automatically selected regularized
+history lengths, and the explicit six-step model on a chronological 70/30 split.
+It also reports per-cell/full-grid readability and one-/two-refresh alternative
+intervals without using those alternatives to select a better-looking result.
+When sibling analyses exist, the launcher automatically fits on one complete
+recording and evaluates unchanged on the others. A learned model remains
+experimental until that frozen comparison includes separately restarted stream
+sessions. Readable codes alone do not establish physical exposure time.
 
 ## CSV conversion
 

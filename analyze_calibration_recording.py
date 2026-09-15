@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 from calibration.quantitative_analysis import matplotlib_environment
+from calibration.cross_recording_analysis import discover_analysis_directories
 from calibration.recording_display import DEFAULT_INTRINSICS, run_recording_display
 
 
@@ -45,6 +46,29 @@ def _run_quantitative_analysis(output: Path) -> dict:
     return json.loads((output / "calibration_verdict.json").read_text(encoding="utf-8"))
 
 
+def _run_cross_recording_analysis(output: Path) -> dict | None:
+    analyses = discover_analysis_directories(output.parent)
+    if len(analyses) < 2:
+        return None
+    destination = output.parent / "calibration_cross_recording_analysis"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "calibration.cross_recording_analysis",
+            *[str(path) for path in analyses],
+            "--output-directory",
+            str(destination),
+        ],
+        cwd=PROJECT_ROOT,
+        env=matplotlib_environment(),
+        check=True,
+    )
+    return json.loads(
+        (destination / "calibration_cross_recording.json").read_text(encoding="utf-8")
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", type=Path, help="Calibration recording folder")
@@ -67,6 +91,7 @@ def main() -> None:
 
     report = _run_distance_analysis(arguments.folder, output)
     verdict = _run_quantitative_analysis(output)
+    cross_recording = _run_cross_recording_analysis(output)
     print(
         f"Distance analysis saved in {report['output_directory']}",
         flush=True,
@@ -75,6 +100,11 @@ def main() -> None:
         f"Quantitative verdict saved in {verdict['output_directory']}",
         flush=True,
     )
+    if cross_recording is not None:
+        print(
+            f"Cross-recording validation saved in {cross_recording['output_directory']}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
