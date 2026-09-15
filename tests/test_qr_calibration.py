@@ -93,6 +93,29 @@ class QRHelpersTests(unittest.TestCase):
         self.assertFalse(matrix[:QUIET_ZONE_MODULES].any())
         self.assertFalse(matrix[:, :QUIET_ZONE_MODULES].any())
 
+    def test_fixed_qr_masks_are_supported_and_validated(self):
+        automatic = qr_matrix("000012345678")
+        fixed = qr_matrix("000012345678", mask_pattern=0)
+
+        self.assertEqual(fixed.shape, automatic.shape)
+        self.assertFalse(fixed[:QUIET_ZONE_MODULES].any())
+        with self.assertRaisesRegex(ValueError, "mask pattern"):
+            qr_matrix("000012345678", mask_pattern=8)
+
+    def test_every_fixed_qr_mask_decodes_at_module_aligned_scale(self):
+        detector = cv2.QRCodeDetector()
+        for mask_pattern in range(8):
+            with self.subTest(mask_pattern=mask_pattern):
+                matrix = qr_matrix("000012345678", mask_pattern=mask_pattern)
+                image = np.repeat(
+                    np.repeat(255 - matrix * 255, 12, axis=0),
+                    12,
+                    axis=1,
+                )
+                decoded, points, _ = detector.detectAndDecode(image)
+                self.assertEqual(decoded, "000012345678")
+                self.assertIsNotNone(points)
+
     def test_bounding_boxes_are_ordered_clockwise_by_sector(self):
         detections = [
             {"raw": "3", "bbox": np.array([10, 60, 30, 80]), "center": (20, 70), "confidence": 1},
@@ -206,6 +229,20 @@ class QRHelpersTests(unittest.TestCase):
         self.assertEqual(renderer.metadata()["grid_qrs"], 12)
         self.assertEqual(renderer.metadata()["grid_columns"], 6)
 
+    def test_qt_renderer_keeps_unscaled_pixmaps_and_records_fixed_mask(self):
+        self.qt_app = QGuiApplication.instance() or QGuiApplication(["qr-test"])
+        renderer = QRClockRenderer(1920, 1080, qr_mask_pattern=3)
+        timestamp_ns = 10_000_000_000
+
+        renderer.render_next(timestamp_ns, 0)
+
+        self.assertEqual(
+            renderer.images[timestamp_ns].width(),
+            renderer.matrices[timestamp_ns].shape[0],
+        )
+        self.assertEqual(renderer.metadata()["qr_mask_pattern"], 3)
+        self.assertEqual(renderer.metadata()["qr_mask_selection"], "fixed")
+
     def test_qt_renderer_retains_unchanged_cells_and_clears_expired_cell(self):
         self.qt_app = QGuiApplication.instance() or QGuiApplication(["qr-test"])
         renderer = QRClockRenderer(960, 540)
@@ -240,6 +277,24 @@ class QRHelpersTests(unittest.TestCase):
             canvas.pixelColor(renderer.qr_rects[0].center()),
             QT_BACKGROUND,
         )
+
+    def test_qt_unscaled_pixmap_matches_module_drawing(self):
+        self.qt_app = QGuiApplication.instance() or QGuiApplication(["qr-test"])
+        pixmap_canvas = QImage(960, 540, QImage.Format.Format_RGB32)
+        module_canvas = QImage(960, 540, QImage.Format.Format_RGB32)
+        pixmap_renderer = QRClockRenderer(960, 540)
+        module_renderer = QRClockRenderer(960, 540)
+
+        pixmap_renderer.render_next(10_000_000_000, 0)
+        module_renderer.render_next(10_000_000_000, 0, cache_pixmap=False)
+        pixmap_painter = QPainter(pixmap_canvas)
+        pixmap_renderer.paint(pixmap_painter)
+        pixmap_painter.end()
+        module_painter = QPainter(module_canvas)
+        module_renderer.paint(module_painter, cached_pixmaps=False)
+        module_painter.end()
+
+        self.assertEqual(pixmap_canvas, module_canvas)
 
     def test_next_swap_prediction_uses_last_swap_and_skips_elapsed_periods(self):
         monitor = SwapTimingMonitor(60.0)
@@ -320,6 +375,25 @@ class QRHelpersTests(unittest.TestCase):
         )
         self.assertEqual(id(surface_renderer.qr_rects), qr_rects_id)
 
+    def test_pygame_prepared_qr_is_reused_by_deadline_render(self):
+        pygame.font.init()
+        renderer = PygameQRClockRenderer(
+            pygame.Surface((960, 540), depth=32),
+            qr_mask_pattern=2,
+        )
+        timestamp_ns = 10_000_000_000
+
+        with patch("calibration.display.qr_matrix", wraps=qr_matrix) as build_matrix:
+            renderer.prepare_qr(timestamp_ns)
+            renderer.render_next(timestamp_ns, 0)
+            self.assertEqual(build_matrix.call_count, 1)
+            self.assertEqual(build_matrix.call_args.kwargs["mask_pattern"], 2)
+
+            renderer.render_next(timestamp_ns + 20_000_000, 1)
+            self.assertEqual(build_matrix.call_count, 2)
+
+        self.assertEqual(renderer.metadata()["qr_mask_pattern"], 2)
+
     def test_display_journals_stream_rows_without_retaining_frame_history(self):
         for name, journal_class in (
             ("pygame", PygameDisplayJournal),
@@ -375,6 +449,12 @@ class QRHelpersTests(unittest.TestCase):
             pacer.predict_next_flip(flip_return + 2_000_000),
             flip_return + pacer.period_ns,
         )
+
+    def test_pygame_pacer_exposes_configurable_spin_wait(self):
+        pacer = FramePacer(10_000_000_000, 100.0, spin_wait_us=250)
+        self.assertEqual(pacer.spin_wait_ns, 250_000)
+        with self.assertRaisesRegex(ValueError, "Spin wait"):
+            FramePacer(10_000_000_000, 100.0, spin_wait_us=-1)
 
 
 class RecordingTests(unittest.TestCase):
@@ -956,76 +1036,39 @@ class QuantitativeVerdictTests(unittest.TestCase):
                 self.assertIn("<svg", (output / filename).read_text())
                 self.assertIn(filename, svg_report["output_files"])
 
-    def test_root_launcher_passes_recording_and_saved_qr_analysis_to_distance_model(self):
-        recording = Path("/recordings/sample")
+    def test_root_launcher_runs_only_final_analysis_with_explicit_output(self):
         with TemporaryDirectory() as temporary:
             output = Path(temporary)
-            (output / "distance_analysis.json").write_text("{}", encoding="utf-8")
-            with (
-                patch.object(recording_launcher, "matplotlib_environment", return_value={}),
-                patch.object(recording_launcher.subprocess, "run") as run,
-            ):
-                recording_launcher._run_distance_analysis(recording, output)
-
-            command = run.call_args.args[0]
-            self.assertEqual(
-                command[:3],
-                [recording_launcher.sys.executable, "-m", "calibration.distance_analysis"],
-            )
-            self.assertIn(str(recording), command)
-            self.assertIn(str(output), command)
-
-    def test_root_launcher_builds_cross_recording_report_for_sibling_analyses(self):
-        with TemporaryDirectory() as temporary:
-            parent = Path(temporary)
-            first = parent / "01_calibration_analysis"
-            second = parent / "02_calibration_analysis"
-            destination = parent / "calibration_cross_recording_analysis"
+            destination = output / "final_analysis"
             destination.mkdir()
-            (destination / "calibration_cross_recording.json").write_text(
+            (destination / "final_analysis.json").write_text(
                 json.dumps({"output_directory": str(destination)}),
                 encoding="utf-8",
             )
-            with (
-                patch.object(
-                    recording_launcher,
-                    "discover_analysis_directories",
-                    return_value=[first, second],
-                ),
-                patch.object(recording_launcher, "matplotlib_environment", return_value={}),
-                patch.object(recording_launcher.subprocess, "run") as run,
-            ):
-                report = recording_launcher._run_cross_recording_analysis(first)
+            with patch.object(recording_launcher.subprocess, "run") as run:
+                report = recording_launcher._run_final_analysis(output)
 
-            self.assertEqual(report["output_directory"], str(destination))
             command = run.call_args.args[0]
             self.assertEqual(
                 command[:3],
-                [recording_launcher.sys.executable, "-m", "calibration.cross_recording_analysis"],
+                [recording_launcher.sys.executable, "-m", "calibration.final_analysis"],
             )
-            self.assertIn(str(first), command)
-            self.assertIn(str(second), command)
-            self.assertIn(str(destination), command)
+            self.assertIn(str(output), command)
+            self.assertEqual(report["output_directory"], str(destination))
 
-    def test_root_launcher_runs_distance_analysis_after_the_window(self):
+    def test_root_launcher_runs_final_analysis_after_the_window(self):
         recording = Path("/recordings/sample")
         output = Path("/recordings/sample_analysis")
         with (
             patch.object(recording_launcher, "run_recording_display", return_value=output) as display,
-            patch.object(recording_launcher, "_run_distance_analysis", return_value={
-                "output_directory": str(output)
+            patch.object(recording_launcher, "_run_final_analysis", return_value={
+                "output_directory": str(output / "final_analysis")
             }) as analyze,
-            patch.object(recording_launcher, "_run_quantitative_analysis", return_value={
-                "output_directory": str(output)
-            }) as quantitative,
-            patch.object(recording_launcher, "_run_cross_recording_analysis", return_value=None) as cross,
             patch("sys.argv", ["analyze_calibration_recording.py", str(recording)]),
         ):
             recording_launcher.main()
         display.assert_called_once()
-        analyze.assert_called_once_with(recording, output)
-        quantitative.assert_called_once_with(output)
-        cross.assert_called_once_with(output)
+        analyze.assert_called_once_with(output)
 
 
 if __name__ == "__main__":

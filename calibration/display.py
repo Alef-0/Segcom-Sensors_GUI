@@ -19,6 +19,7 @@ import pygame
 from calibration.qr import (
     GRID_LAYOUTS,
     QUIET_ZONE_MODULES,
+    QR_MASK_PATTERNS,
     grid_bounds,
     grid_cell_names,
     grid_positions,
@@ -42,11 +43,22 @@ TIMESTAMP_MODES = ("paint-start", "predicted-flip")
 DEFAULT_TIMESTAMP_MODE = "predicted-flip"
 QR_DRAW_MODES = ("surface", "modules")
 DEFAULT_QR_DRAW_MODE = "surface"
+DEFAULT_SPIN_WAIT_US = 1_000
 
 
 def format_timestamp(timestamp_ns: int) -> str:
     seconds, nanoseconds = divmod(timestamp_ns, 1_000_000_000)
     return f"{seconds:,}".replace(",", " ") + f".{nanoseconds // 1_000_000:03d}"
+
+
+def parse_spin_wait_us(value: str) -> int:
+    try:
+        spin_wait_us = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("spin wait must be a whole number") from error
+    if not 0 <= spin_wait_us <= 5_000:
+        raise argparse.ArgumentTypeError("spin wait must be from 0 to 5000 microseconds")
+    return spin_wait_us
 
 
 def grid_areas(width: int, height: int, grid_qrs: int) -> tuple[pygame.Rect, ...]:
@@ -69,6 +81,7 @@ class QRClockRenderer:
         target: pygame.Surface,
         visible_qrs: int = VISIBLE_QRS,
         grid_qrs: int = DEFAULT_GRID_QRS,
+        qr_mask_pattern: int | None = None,
     ):
         width, height = target.get_size()
         if width < 320 or height < 240:
@@ -76,12 +89,15 @@ class QRClockRenderer:
         grid_shape(grid_qrs)
         if not 1 <= visible_qrs <= grid_qrs:
             raise ValueError(f"Visible QR codes must be from 1 to {grid_qrs}")
+        if qr_mask_pattern is not None and qr_mask_pattern not in QR_MASK_PATTERNS:
+            raise ValueError("QR mask pattern must be from 0 to 7")
         if not pygame.font.get_init():
             pygame.font.init()
         self.target = target
         self.size = target.get_size()
         self.grid_qrs = grid_qrs
         self.visible_qrs = visible_qrs
+        self.qr_mask_pattern = qr_mask_pattern
         self.cell_names = grid_cell_names(grid_qrs)
         self.areas = grid_areas(width, height, grid_qrs)
         rows, columns = grid_shape(grid_qrs)
@@ -95,6 +111,8 @@ class QRClockRenderer:
             tuple[int, int],
             tuple[pygame.Surface, pygame.Surface],
         ] = {}
+        self._prepared_payload: str | None = None
+        self._prepared_matrix = None
         self.next_cell = 0
         self.newest_cell: int | None = None
         target.fill(BACKGROUND)
@@ -152,6 +170,27 @@ class QRClockRenderer:
         self.target.blit(image, bounds)
         return bounds
 
+    def prepare_qr(self, timestamp_ns: int) -> None:
+        """Prepare one predicted QR before the deadline-critical paint section."""
+        payload = timestamp_payload(timestamp_ns)
+        if payload == self._prepared_payload:
+            return
+        self._prepared_payload = payload
+        self._prepared_matrix = qr_matrix(
+            payload,
+            mask_pattern=self.qr_mask_pattern,
+        )
+
+    def _matrix_for(self, timestamp_ns: int):
+        payload = timestamp_payload(timestamp_ns)
+        if payload != self._prepared_payload or self._prepared_matrix is None:
+            self._prepared_payload = payload
+            self._prepared_matrix = qr_matrix(
+                payload,
+                mask_pattern=self.qr_mask_pattern,
+            )
+        return self._prepared_matrix
+
     def render_next(
         self,
         timestamp_ns: int,
@@ -170,7 +209,7 @@ class QRClockRenderer:
             self.timestamps[expired] = None
             self.display_indices[expired] = None
         self.target.fill(BACKGROUND, self.areas[cell])
-        matrix = qr_matrix(timestamp_payload(timestamp_ns))
+        matrix = self._matrix_for(timestamp_ns)
         if qr_draw_mode == "surface":
             bounds = self._draw_qr_surface(self.qr_rects[cell], matrix)
         else:
@@ -210,6 +249,10 @@ class QRClockRenderer:
             "cell_order": list(self.cell_names),
             "cell_positions": [list(position) for position in grid_positions(self.grid_qrs)],
             "visible_qrs": self.visible_qrs,
+            "qr_mask_pattern": self.qr_mask_pattern,
+            "qr_mask_selection": (
+                "automatic" if self.qr_mask_pattern is None else "fixed"
+            ),
             "indicator_style": "underline",
             "indicator_width": UNDERLINE_HEIGHT,
             "corner_order": (
@@ -234,13 +277,21 @@ class QRClockRenderer:
 class FramePacer:
     """Maintain an absolute refresh grid and report missed/late presentations."""
 
-    def __init__(self, anchor_ns: int, refresh_hz: float):
+    def __init__(
+        self,
+        anchor_ns: int,
+        refresh_hz: float,
+        spin_wait_us: int = DEFAULT_SPIN_WAIT_US,
+    ):
         if not math.isfinite(refresh_hz) or not 1 <= refresh_hz <= 1000:
             raise ValueError("Refresh rate must be between 1 and 1000 Hz")
+        if not 0 <= spin_wait_us <= 5_000:
+            raise ValueError("Spin wait must be from 0 to 5000 microseconds")
         self.nominal_period_ns = round(1_000_000_000 / refresh_hz)
         self.period_ns = self.nominal_period_ns
         self.deadline_ns = anchor_ns + self.period_ns
         self.render_budget_ns = min(1_500_000, self.period_ns // 3)
+        self.spin_wait_ns = spin_wait_us * 1_000
         self.last_flip_ns: int | None = None
         self.render_times = deque(maxlen=120)
 
@@ -274,8 +325,13 @@ class FramePacer:
                 if not extra:
                     return True, skipped
                 continue
-            if remaining > 1_000_000:
-                pygame.time.wait(min(10, max(1, (remaining - 1_000_000) // 1_000_000)))
+            if remaining > self.spin_wait_ns:
+                pygame.time.wait(
+                    min(
+                        10,
+                        max(1, (remaining - self.spin_wait_ns) // 1_000_000),
+                    )
+                )
             else:
                 target = self.deadline_ns - self.render_budget_ns
                 while time.monotonic_ns() < target:
@@ -422,6 +478,8 @@ def run_calibration_display(
     grid_qrs: int = DEFAULT_GRID_QRS,
     timestamp_mode: str = DEFAULT_TIMESTAMP_MODE,
     qr_draw_mode: str = DEFAULT_QR_DRAW_MODE,
+    qr_mask_pattern: int | None = None,
+    spin_wait_us: int = DEFAULT_SPIN_WAIT_US,
 ) -> None:
     """Sample, draw, and flip on one thread without queued display frames."""
     if width < 320 or height < 240:
@@ -433,6 +491,10 @@ def run_calibration_display(
         raise ValueError(f"Timestamp mode must be one of: {', '.join(TIMESTAMP_MODES)}")
     if qr_draw_mode not in QR_DRAW_MODES:
         raise ValueError(f"QR draw mode must be one of: {', '.join(QR_DRAW_MODES)}")
+    if qr_mask_pattern is not None and qr_mask_pattern not in QR_MASK_PATTERNS:
+        raise ValueError("QR mask pattern must be from 0 to 7")
+    if not 0 <= spin_wait_us <= 5_000:
+        raise ValueError("Spin wait must be from 0 to 5000 microseconds")
 
     pygame.display.init()
     pygame.font.init()
@@ -463,9 +525,14 @@ def run_calibration_display(
             screen,
             visible_qrs=visible_qrs,
             grid_qrs=grid_qrs,
+            qr_mask_pattern=qr_mask_pattern,
         )
         pygame.display.flip()
-        pacer = FramePacer(time.monotonic_ns(), refresh_hz)
+        pacer = FramePacer(
+            time.monotonic_ns(),
+            refresh_hz,
+            spin_wait_us=spin_wait_us,
+        )
         journal = DisplayJournal(journal_path, {
             **renderer.metadata(),
             "screen_index": screen_index,
@@ -488,6 +555,7 @@ def run_calibration_display(
             "python_gc_policy": "automatic-disabled-no-manual-collection",
             "prediction_period_ns": pacer.period_ns,
             "qr_draw_mode": qr_draw_mode,
+            "spin_wait_us": spin_wait_us,
         })
         paused = False
         exit_requested = False
@@ -510,7 +578,15 @@ def run_calibration_display(
                     toggled = True
                     journal.pause(paused, time.monotonic_ns())
                     if not paused:
-                        pacer = FramePacer(time.monotonic_ns(), refresh_hz)
+                        pacer = FramePacer(
+                            time.monotonic_ns(),
+                            refresh_hz,
+                            spin_wait_us=spin_wait_us,
+                        )
+                        if timestamp_mode == "predicted-flip":
+                            renderer.prepare_qr(
+                                pacer.predict_next_flip(time.monotonic_ns())
+                            )
                         resumed_after_pause = True
                     pygame.display.set_caption(WINDOW_NAME + (" — paused" if paused else ""))
             return exit_requested or paused or toggled
@@ -518,6 +594,8 @@ def run_calibration_display(
         clock = pygame.time.Clock()
         automatic_gc_was_enabled = gc.isenabled()
         gc.disable()
+        if timestamp_mode == "predicted-flip":
+            renderer.prepare_qr(pacer.predict_next_flip(time.monotonic_ns()))
         while True:
             if paused:
                 poll_controls()
@@ -565,6 +643,8 @@ def run_calibration_display(
             timing["resumed_after_pause"] = resumed_after_pause
             resumed_after_pause = False
             journal.append(cell, timing)
+            if timestamp_mode == "predicted-flip":
+                renderer.prepare_qr(pacer.predict_next_flip(time.monotonic_ns()))
     finally:
         if journal is not None:
             journal.close()
@@ -615,6 +695,24 @@ def main() -> None:
         default=DEFAULT_QR_DRAW_MODE,
         help="Draw each QR as one scaled surface or as individual modules",
     )
+    parser.add_argument(
+        "--qr-mask-pattern",
+        type=int,
+        choices=QR_MASK_PATTERNS,
+        help=(
+            "Use a fixed QR mask (0-7) for faster generation; default: choose "
+            "the lowest-penalty mask automatically"
+        ),
+    )
+    parser.add_argument(
+        "--spin-wait-us",
+        type=parse_spin_wait_us,
+        default=DEFAULT_SPIN_WAIT_US,
+        help=(
+            "Final busy-wait duration in microseconds; lower values save CPU but "
+            "can add scheduling jitter (default: 1000)"
+        ),
+    )
     arguments = parser.parse_args()
     run_calibration_display(
         width=arguments.width,
@@ -627,6 +725,8 @@ def main() -> None:
         grid_qrs=arguments.grid_qrs,
         timestamp_mode=arguments.timestamp_mode,
         qr_draw_mode=arguments.qr_draw_mode,
+        qr_mask_pattern=arguments.qr_mask_pattern,
+        spin_wait_us=arguments.spin_wait_us,
     )
 
 

@@ -13,6 +13,7 @@ from qrcode.constants import ERROR_CORRECT_L
 PAYLOAD_DIGITS = 12
 PAYLOAD_MODULUS_MS = 10**PAYLOAD_DIGITS
 QUIET_ZONE_MODULES = 2
+QR_MASK_PATTERNS = tuple(range(8))
 DETECTION_BATCH_SIZE = 4
 GRID_LAYOUTS = {
     4: (2, 2),
@@ -29,13 +30,20 @@ def timestamp_payload(timestamp_ns: int) -> str:
     return f"{timestamp_ns // 1_000_000 % PAYLOAD_MODULUS_MS:0{PAYLOAD_DIGITS}d}"
 
 
-def qr_matrix(payload: str, border: int = QUIET_ZONE_MODULES) -> np.ndarray:
+def qr_matrix(
+    payload: str,
+    border: int = QUIET_ZONE_MODULES,
+    mask_pattern: int | None = None,
+) -> np.ndarray:
     """Return a black/white QR matrix, including the requested quiet zone."""
+    if mask_pattern is not None and mask_pattern not in QR_MASK_PATTERNS:
+        raise ValueError("QR mask pattern must be from 0 to 7")
     code = qrcode.QRCode(
         version=1,
         error_correction=ERROR_CORRECT_L,
         box_size=1,
         border=border,
+        mask_pattern=mask_pattern,
     )
     code.add_data(payload, optimize=0)
     code.make(fit=True)

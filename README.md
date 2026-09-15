@@ -123,10 +123,12 @@ GStreamer jitter-buffer latency. That 145 ms value controls buffering; it is
 not itself a measured end-to-end correction.
 
 Saved-frame time starts from buffer PTS mapped through the GStreamer segment
-and pipeline clock to a stable host-time anchor. Valid per-frame camera NTP
-metadata disciplines that PTS timeline gradually. Missing NTP falls back to
-PTS, large NTP steps require repeated confirmation, and invalid or non-forward
-PTS frames are rejected and counted.
+and pipeline clock to a stable host-time anchor. The capture callback records
+application arrival before pulling or converting the sample; later processing
+timestamps and capture-queue occupancy remain separate diagnostics. Camera NTP
+metadata is observational and never moves the segment-mapped media time.
+Invalid or non-forward timing is rejected from image recording but retained as
+a timing event with the information available at rejection.
 
 The separate camera latency adjustment provisionally defaults to 87.348 ms. It is subtracted
 when associating a camera observation with radar time and is recorded in
@@ -212,41 +214,31 @@ NTP, and configured grid values are editable without automatically starting a
 scan. Finishing the full scan writes `calibration_analysis.json` and
 `calibration_frames.csv` to a sibling
 `<recording-folder-name>_analysis` directory. After the inspection window is
-closed, the root launcher maps every decoded QR to its recorded display flip,
-fits the interval-aware frame-arrival model, and writes estimated observation
-times for every camera frame, including frames with QR gaps.
+closed, the root launcher runs only `calibration.final_analysis`. It reconstructs
+the media reference from segment-mapped running time, keeps callback arrival
+separate from capture correction, fits interval-constrained causal models, and
+writes a strict maximum/median evaluation plus one interval-error histogram for
+each model family.
 
 ```bash
 python3 analyze_calibration_recording.py /path/to/calibration-recording
 python3 analyze_calibration_recording.py /path/to/calibration-recording \
   --intrinsics /path/to/intrinsics.json
 
-# Recreate only the distance analysis from existing QR analysis files (no window)
-python3 -m calibration.distance_analysis \
-  /path/to/calibration-recording
-
-# Recreate only the quantitative strategy report and its graphs
-python3 -m calibration.quantitative_analysis \
-  /path/to/calibration-recording_analysis
-
-# Compare already analyzed recordings with frozen source-to-target models
-python3 -m calibration.cross_recording_analysis \
+# Analyze explicit existing recording analyses without opening the window
+python3 -m calibration.final_analysis \
   /path/to/01_calibration_analysis /path/to/02_calibration_analysis \
-  --output-directory /path/to/calibration_cross_recording_analysis
+  --output-directory /path/to/final_analysis
 ```
 
-For each decoded QR, the analyzer verifies the recorded quadrant and checks both
-its own flip timing and the following replacement. Suspect or missing replacement
-evidence stays visible but is excluded from the clean offset summary. The verdict
-compares the current 87.348 ms default, calibrated fixed corrections, PTS-step
-groups, a compact cadence-state model, automatically selected regularized
-history lengths, and the explicit six-step model on a chronological 70/30 split.
-It also reports per-cell/full-grid readability and one-/two-refresh alternative
-intervals without using those alternatives to select a better-looking result.
-When sibling analyses exist, the launcher automatically fits on one complete
-recording and evaluates unchanged on the others. A learned model remains
-experimental until that frozen comparison includes separately restarted stream
-sessions. Readable codes alone do not establish physical exposure time.
+For each decoded QR, the final analyzer uses the next actual presentation event
+as the end of the permissible correction interval. It starts with a constant,
+then a compact mapped-cadence state, then regularized mapped-time history only if
+simpler inner checks fail. Delivery timing changes `A-M` and estimated arrival
+delay, not capture correction. Any scored error at or above 10 ms fails the
+maximum goal; unscorable frames remain in the report. Results stay conditional
+on the decoded QR being the newest displayed generation and do not establish
+physical exposure time.
 
 ## CSV conversion
 
@@ -289,8 +281,8 @@ See `tests/README.md` for the test-area map.
 | `interface_core.py` | Shared GUI layout and state transitions |
 | `sensors/` | Radar, RTSP camera, timestamp, and GPS integrations |
 | `processing/` | Plotting, filtering, recording, PCD reading, snapshots, and playback |
-| `calibration/` | QR display/decoding, recording viewer, distance analysis, quantitative tools, and camera intrinsics |
-| `analyze_calibration_recording.py` | Runs the recording viewer, then the arrival-to-observation distance analysis |
+| `calibration/` | QR display/decoding, recording viewer, final interval analysis, legacy comparison tools, and camera intrinsics |
+| `analyze_calibration_recording.py` | Runs the recording viewer, then only the final interval analysis |
 | `convert_to_csv.py` | Recursive PCD-to-CSV export |
 | `content/` | ARS40X technical-documentation extracts |
 | `recordings/` | Generated recording data, kept outside source packages |

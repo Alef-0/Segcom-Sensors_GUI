@@ -52,21 +52,29 @@ class FakeBuffer:
 
 
 class FakeSegment:
-    @staticmethod
-    def to_running_time(_format, pts):
-        return pts
+    def __init__(self, *, start=0, base=0):
+        self.start = start
+        self.stop = Gst.CLOCK_TIME_NONE
+        self.time = 0
+        self.base = base
+        self.offset = 0
+        self.rate = 1.0
+        self.applied_rate = 1.0
+
+    def to_running_time(self, _format, pts):
+        return pts - self.start + self.base
 
 
 class FakeSample:
-    def __init__(self, buffer):
+    def __init__(self, buffer, segment=None):
         self._buffer = buffer
+        self._segment = segment or FakeSegment()
 
     def get_buffer(self):
         return self._buffer
 
-    @staticmethod
-    def get_segment():
-        return FakeSegment()
+    def get_segment(self):
+        return self._segment
 
 
 class FakeClock:
@@ -264,7 +272,7 @@ class CameraPipelinePolicyTests(unittest.TestCase):
             FakeSample(FakeBuffer(Gst.SECOND, reference_timestamp=0))
         )
         self.assertTrue(result.valid)
-        self.assertEqual(result.source, "host-anchored-pts")
+        self.assertEqual(result.source, "host-anchored-segment-running-time")
         self.assertIsNone(result.camera_ntp_ns)
 
     def test_valid_pts_uses_pipeline_clock_when_ntp_meta_is_absent(self):
@@ -275,8 +283,69 @@ class CameraPipelinePolicyTests(unittest.TestCase):
             FakeSample(FakeBuffer(running_time - 100 * Gst.MSECOND))
         )
         self.assertTrue(result.valid)
-        self.assertEqual(result.source, "host-anchored-pts")
+        self.assertEqual(result.source, "host-anchored-segment-running-time")
         self.assertLess(abs(result.captured_at.timestamp() - (time.time() - 0.1)), 0.1)
+
+    def test_nonzero_segment_mapping_is_used_instead_of_raw_pts(self):
+        policy = FrameTimestampPolicy()
+        policy.reset(FakePipeline(2 * Gst.SECOND))
+        sample = FakeSample(
+            FakeBuffer(5 * Gst.SECOND),
+            FakeSegment(start=4 * Gst.SECOND, base=Gst.SECOND),
+        )
+        with (
+            patch(
+                "sensors.camera.camera_timebase.time.time_ns",
+                return_value=100 * Gst.SECOND,
+            ),
+            patch(
+                "sensors.camera.camera_timebase.time.monotonic_ns",
+                return_value=10 * Gst.SECOND,
+            ),
+        ):
+            result = policy.timestamp_for_sample(sample)
+
+        self.assertEqual(result.timing["pts_ns"], 5 * Gst.SECOND)
+        self.assertEqual(result.timing["running_time_ns"], 2 * Gst.SECOND)
+        self.assertEqual(result.media_time_ns, 100 * Gst.SECOND)
+
+    def test_added_delivery_delay_changes_arrival_delay_not_capture_estimate(self):
+        pipeline = FakePipeline(Gst.SECOND)
+        policy = FrameTimestampPolicy(capture_correction_ms=80.0)
+        policy.reset(pipeline)
+        with (
+            patch(
+                "sensors.camera.camera_timebase.time.time_ns",
+                side_effect=(100 * Gst.SECOND, 101 * Gst.SECOND),
+            ),
+            patch(
+                "sensors.camera.camera_timebase.time.monotonic_ns",
+                side_effect=(10 * Gst.SECOND, 10 * Gst.SECOND,
+                             11 * Gst.SECOND, 11 * Gst.SECOND),
+            ),
+        ):
+            first = policy.timestamp_for_sample(
+                FakeSample(FakeBuffer(Gst.SECOND)),
+                application_arrival_monotonic_ns=10 * Gst.SECOND + 100 * Gst.MSECOND,
+                application_arrival_unix_ns=100 * Gst.SECOND + 100 * Gst.MSECOND,
+            )
+            pipeline.clock.value = 2 * Gst.SECOND
+            second = policy.timestamp_for_sample(
+                FakeSample(FakeBuffer(2 * Gst.SECOND)),
+                application_arrival_monotonic_ns=11 * Gst.SECOND + 120 * Gst.MSECOND,
+                application_arrival_unix_ns=101 * Gst.SECOND + 120 * Gst.MSECOND,
+            )
+
+        self.assertEqual(
+            second.timing["estimated_capture_monotonic_ns"]
+            - first.timing["estimated_capture_monotonic_ns"],
+            Gst.SECOND,
+        )
+        self.assertEqual(
+            second.timing["estimated_arrival_delay_ns"]
+            - first.timing["estimated_arrival_delay_ns"],
+            20 * Gst.MSECOND,
+        )
 
     def test_reference_timestamp_is_observational_only(self):
         running_time = Gst.SECOND
@@ -284,9 +353,15 @@ class CameraPipelinePolicyTests(unittest.TestCase):
         reference_time_ns = 125 * Gst.SECOND
         policy = FrameTimestampPolicy()
         policy.reset(FakePipeline(running_time))
-        with patch(
-            "sensors.camera.camera_timebase.time.time_ns",
-            return_value=host_time_ns,
+        with (
+            patch(
+                "sensors.camera.camera_timebase.time.time_ns",
+                return_value=host_time_ns,
+            ),
+            patch(
+                "sensors.camera.camera_timebase.time.monotonic_ns",
+                return_value=10 * Gst.SECOND,
+            ),
         ):
             result = policy.timestamp_for_sample(
                 FakeSample(FakeBuffer(
@@ -295,7 +370,7 @@ class CameraPipelinePolicyTests(unittest.TestCase):
                 ))
             )
         self.assertTrue(result.valid)
-        self.assertEqual(result.source, "host-anchored-pts")
+        self.assertEqual(result.source, "host-anchored-segment-running-time")
         self.assertEqual(result.media_time_ns, host_time_ns)
         self.assertEqual(result.reference_clock_offset_seconds, 25.0)
         self.assertEqual(result.camera_ntp_ns, reference_time_ns)
@@ -306,15 +381,21 @@ class CameraPipelinePolicyTests(unittest.TestCase):
         policy.reset(FakePipeline(Gst.SECOND))
         host_time_ns = 100 * Gst.SECOND
         reference_time_ns = host_time_ns + 25 * Gst.SECOND
-        with patch(
-            "sensors.camera.camera_timebase.time.time_ns",
-            return_value=host_time_ns,
+        with (
+            patch(
+                "sensors.camera.camera_timebase.time.time_ns",
+                return_value=host_time_ns,
+            ),
+            patch(
+                "sensors.camera.camera_timebase.time.monotonic_ns",
+                return_value=10 * Gst.SECOND,
+            ),
         ):
             result = policy.timestamp_for_sample(
                 FakeSample(FakeBuffer(Gst.SECOND, reference_timestamp=reference_time_ns))
             )
         self.assertTrue(result.valid)
-        self.assertEqual(result.source, "host-anchored-pts")
+        self.assertEqual(result.source, "host-anchored-segment-running-time")
         self.assertAlmostEqual(result.reference_clock_offset_seconds, 25.0)
         self.assertIn("DVR reference clock offset", result.reference_warning)
 
@@ -349,7 +430,12 @@ class CameraPipelinePolicyTests(unittest.TestCase):
             ),
             patch(
                 "sensors.camera.camera_timebase.time.monotonic_ns",
-                side_effect=(10 * Gst.SECOND, 11 * Gst.SECOND),
+                side_effect=(
+                    10 * Gst.SECOND,
+                    10 * Gst.SECOND,
+                    11 * Gst.SECOND,
+                    11 * Gst.SECOND,
+                ),
             ),
         ):
             policy.timestamp_for_sample(FakeSample(FakeBuffer(
@@ -364,7 +450,7 @@ class CameraPipelinePolicyTests(unittest.TestCase):
 
         self.assertEqual(result.media_time_ns, 101 * Gst.SECOND)
         self.assertEqual(result.camera_ntp_ns, 126 * Gst.SECOND + 100 * Gst.MSECOND)
-        self.assertEqual(result.source, "host-anchored-pts")
+        self.assertEqual(result.source, "host-anchored-segment-running-time")
 
     def test_unknown_reference_clock_is_preserved_without_conversion(self):
         policy = FrameTimestampPolicy()
@@ -414,6 +500,60 @@ class CameraPipelinePolicyTests(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertIn("duplicated", result.reason)
 
+    def test_segment_change_resets_history_and_allows_rebased_pts(self):
+        pipeline = FakePipeline(2 * Gst.SECOND)
+        policy = FrameTimestampPolicy()
+        policy.reset(pipeline)
+        with (
+            patch(
+                "sensors.camera.camera_timebase.time.time_ns",
+                side_effect=(100 * Gst.SECOND, 100 * Gst.SECOND + 100 * Gst.MSECOND),
+            ),
+            patch(
+                "sensors.camera.camera_timebase.time.monotonic_ns",
+                side_effect=(10 * Gst.SECOND, 10 * Gst.SECOND,
+                             10 * Gst.SECOND + 100 * Gst.MSECOND,
+                             10 * Gst.SECOND + 100 * Gst.MSECOND),
+            ),
+        ):
+            first = policy.timestamp_for_sample(
+                FakeSample(FakeBuffer(2 * Gst.SECOND))
+            )
+            pipeline.clock.value += 100 * Gst.MSECOND
+            second = policy.timestamp_for_sample(FakeSample(
+                FakeBuffer(Gst.SECOND),
+                FakeSegment(base=Gst.SECOND + 100 * Gst.MSECOND),
+            ))
+
+        self.assertTrue(first.valid)
+        self.assertTrue(second.valid)
+        self.assertIn("segment_changed", second.timing["flags"])
+        self.assertIsNone(second.timing["running_time_delta_ns"])
+
+    def test_capture_queue_backlog_marks_estimate_degraded(self):
+        policy = FrameTimestampPolicy()
+        policy.reset(FakePipeline(Gst.SECOND))
+        with (
+            patch(
+                "sensors.camera.camera_timebase.time.time_ns",
+                return_value=100 * Gst.SECOND,
+            ),
+            patch(
+                "sensors.camera.camera_timebase.time.monotonic_ns",
+                return_value=10 * Gst.SECOND,
+            ),
+        ):
+            result = policy.timestamp_for_sample(
+                FakeSample(FakeBuffer(Gst.SECOND)),
+                capture_queue_levels={"capture_queue_level_buffers": 4},
+            )
+
+        self.assertIn("capture_queue_backlog", result.timing["flags"])
+        self.assertEqual(
+            result.timing["capture_estimator_status"],
+            "degraded_timing_observation",
+        )
+
     def test_capture_callback_skips_recording_when_timestamp_is_invalid(self):
         pipeline = object.__new__(GStreamerPipeline)
         pipeline.first_frame_received = True
@@ -422,7 +562,7 @@ class CameraPipelinePolicyTests(unittest.TestCase):
             "Policy",
             (),
             {
-                "timestamp_for_sample": lambda _self, _sample: FrameTimestampResult(
+                "timestamp_for_sample": lambda _self, _sample, **_kwargs: FrameTimestampResult(
                     None, reason="frame has invalid PTS"
                 )
             },
@@ -434,7 +574,9 @@ class CameraPipelinePolicyTests(unittest.TestCase):
             {"submit": lambda _self, *args, **kwargs: submitted.append((args, kwargs))},
         )()
         rejected = []
-        pipeline._reject_synchronized_frame = rejected.append
+        pipeline._reject_synchronized_frame = (
+            lambda reason, timing=None: rejected.append((reason, timing))
+        )
         pipeline._emit_manual_snapshot = lambda *_args: self.fail(
             "manual snapshot must not receive an invalid timestamp"
         )
@@ -443,7 +585,7 @@ class CameraPipelinePolicyTests(unittest.TestCase):
 
         self.assertEqual(result, Gst.FlowReturn.OK)
         self.assertEqual(submitted, [])
-        self.assertEqual(rejected, ["frame has invalid PTS"])
+        self.assertEqual(rejected, [("frame has invalid PTS", None)])
 
     def test_capture_callback_sends_only_valid_timestamp_to_both_savers(self):
         captured_at = datetime.now(timezone.utc)
@@ -455,7 +597,7 @@ class CameraPipelinePolicyTests(unittest.TestCase):
             "Policy",
             (),
             {
-                "timestamp_for_sample": lambda _self, _sample: FrameTimestampResult(
+                "timestamp_for_sample": lambda _self, _sample, **_kwargs: FrameTimestampResult(
                     captured_at,
                     source="pipeline-clock",
                     receipt_offset_seconds=0.25,
@@ -487,6 +629,45 @@ class CameraPipelinePolicyTests(unittest.TestCase):
         })])
         self.assertEqual(observed_ntp, [(None, None)])
         self.assertEqual(manual, [(frame, captured_at)])
+
+    def test_capture_callback_stamps_arrival_before_pull_and_conversion(self):
+        captured_at = datetime.now(timezone.utc)
+        observed = {}
+
+        class Policy:
+            def timestamp_for_sample(self, _sample, **timing):
+                observed.update(timing)
+                return FrameTimestampResult(captured_at, source="test")
+
+        pipeline = object.__new__(GStreamerPipeline)
+        pipeline.first_frame_received = True
+        pipeline._sample_to_frame = lambda _sample: object()
+        pipeline.timestamp_policy = Policy()
+        pipeline.snapshot_recorder = type(
+            "Recorder", (), {"submit": lambda _self, *_args, **_kwargs: True}
+        )()
+        pipeline._observe_camera_ntp = lambda *_args: None
+        pipeline._report_unusual_pts_gap = lambda _timing: None
+        pipeline._emit_manual_snapshot = lambda *_args: None
+
+        with (
+            patch(
+                "sensors.camera.camera_gstreamer.time.monotonic_ns",
+                side_effect=(100, 200, 300),
+            ),
+            patch(
+                "sensors.camera.camera_gstreamer.time.time_ns",
+                side_effect=(1_000, 2_000, 3_000),
+            ),
+        ):
+            result = pipeline.on_new_capture_sample(
+                FakeSink(FakeSample(FakeBuffer(Gst.SECOND)))
+            )
+
+        self.assertEqual(result, Gst.FlowReturn.OK)
+        self.assertEqual(observed["application_arrival_monotonic_ns"], 100)
+        self.assertEqual(observed["sample_pulled_monotonic_ns"], 200)
+        self.assertEqual(observed["frame_converted_monotonic_ns"], 300)
 
     def test_ntp_observation_only_publishes_reference_clock(self):
         pipeline = object.__new__(GStreamerPipeline)

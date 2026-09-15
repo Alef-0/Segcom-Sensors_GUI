@@ -13,6 +13,7 @@ from processing.recording.camera_telemetry import (
     CAMERA_TIMESTAMPS_JOURNAL_NAME,
     CAMERA_TIMING_EVENTS_NAME,
     CAMERA_TIMING_SESSION_NAME,
+    SCHEMA_VERSION,
     CameraTelemetryWriter,
 )
 from processing.recording.paths import (
@@ -149,6 +150,14 @@ class CameraSnapshotRecorder:
             ))
         except queue.Full:
             self.frames_dropped += 1
+            if self._calibration:
+                self._telemetry.append_event({
+                    "event": "frame_dropped_writer_queue",
+                    "observed_frame": self.frames_observed,
+                    "selected_frame": self.frames_selected,
+                    "reason": "image writer queue is full",
+                    "timing": timing,
+                })
             if self.dropped_callback is not None:
                 self.dropped_callback({
                     "reason": "image writer queue is full",
@@ -163,9 +172,21 @@ class CameraSnapshotRecorder:
     def poll_error(self) -> Exception | None:
         return self.error
 
-    def note_invalid_timing_frame(self) -> None:
+    def note_invalid_timing_frame(
+        self,
+        *,
+        reason: str = "invalid timing",
+        timing: Mapping | None = None,
+    ) -> None:
         if self.active:
             self.frames_rejected_invalid_timing += 1
+            if self._calibration:
+                self._telemetry.append_event({
+                    "event": "frame_rejected_invalid_timing",
+                    "rejected_frame": self.frames_rejected_invalid_timing,
+                    "reason": str(reason),
+                    "timing": dict(timing or {}),
+                })
 
     def record_timing_events(self, events) -> None:
         if not self.active or not self._calibration:
@@ -284,9 +305,12 @@ class CameraSnapshotRecorder:
             key: timing.get(key)
             for key in (
                 "stream_epoch",
+                "mapping_revision",
+                "segment_epoch",
                 "pipeline_zero_unix_ns",
                 "pipeline_zero_monotonic_ns",
                 "pipeline_clock_type",
+                "pipeline_base_time_ns",
             )
             if timing.get(key) is not None
         })
@@ -298,17 +322,85 @@ class CameraSnapshotRecorder:
         adjustment_ns = round(self._latency_adjustment_ms * 1_000_000)
         estimated_exposure_ns = int(media_time_ns) - adjustment_ns
         record = {
+            "timestamp_schema_version": timing.get(
+                "timestamp_schema_version", SCHEMA_VERSION
+            ),
             "frame": filename,
             "stream_epoch": timing.get("stream_epoch"),
+            "mapping_revision": timing.get("mapping_revision"),
+            "segment_epoch": timing.get("segment_epoch"),
+            "segment": timing.get("segment"),
             "pts_ns": timing.get("pts_ns"),
             "running_time_ns": timing.get("running_time_ns"),
+            "running_time_delta_ns": timing.get("running_time_delta_ns"),
+            "media_monotonic_ns": timing.get("media_monotonic_ns"),
+            "application_arrival_monotonic_ns": timing.get(
+                "application_arrival_monotonic_ns"
+            ),
+            "application_arrival_unix_ns": timing.get(
+                "application_arrival_unix_ns"
+            ),
+            "application_arrival_delta_ns": timing.get(
+                "application_arrival_delta_ns"
+            ),
+            "arrival_boundary": timing.get("arrival_boundary"),
+            "sample_pulled_monotonic_ns": timing.get(
+                "sample_pulled_monotonic_ns"
+            ),
+            "sample_pulled_unix_ns": timing.get("sample_pulled_unix_ns"),
+            "frame_converted_monotonic_ns": timing.get(
+                "frame_converted_monotonic_ns"
+            ),
+            "frame_converted_unix_ns": timing.get("frame_converted_unix_ns"),
+            "timestamped_monotonic_ns": timing.get("timestamped_monotonic_ns"),
+            "timestamped_unix_ns": timing.get("timestamped_unix_ns"),
+            # Legacy fields retain their pre-v3 meaning: the time sampled by the
+            # timestamp policy after image conversion, not callback arrival.
             "received_monotonic_ns": timing.get("host_monotonic_received_ns"),
             "received_unix_ns": timing.get("host_realtime_received_ns"),
+            "pipeline_running_time_observed_ns": timing.get(
+                "pipeline_running_time_observed_ns"
+            ),
+            "pipeline_clock_mapping_monotonic_ns": timing.get(
+                "pipeline_clock_mapping_monotonic_ns"
+            ),
+            "pipeline_clock_mapping_uncertainty_ns": timing.get(
+                "pipeline_clock_mapping_uncertainty_ns"
+            ),
+            "capture_queue_level_buffers": timing.get(
+                "capture_queue_level_buffers"
+            ),
+            "capture_queue_level_bytes": timing.get("capture_queue_level_bytes"),
+            "capture_queue_level_time_ns": timing.get(
+                "capture_queue_level_time_ns"
+            ),
             "reference_timestamp_raw_ns": timing.get("reference_timestamp_raw_ns"),
             "reference_clock": timing.get("reference_clock"),
             "reference_ntp_ns": timing.get("camera_ntp_ns"),
             "media_unix_ns": int(media_time_ns),
             "estimated_exposure_unix_ns": estimated_exposure_ns,
+            "observable_arrival_minus_media_ns": timing.get(
+                "observable_arrival_minus_media_ns"
+            ),
+            "estimated_capture_unix_ns": timing.get("estimated_capture_unix_ns"),
+            "estimated_capture_monotonic_ns": timing.get(
+                "estimated_capture_monotonic_ns"
+            ),
+            "estimated_arrival_delay_ns": timing.get("estimated_arrival_delay_ns"),
+            "capture_estimator_model": timing.get("capture_estimator_model"),
+            "capture_estimator_version": timing.get("capture_estimator_version"),
+            "capture_calibration_version": timing.get("capture_calibration_version"),
+            "capture_estimator_correction_ns": timing.get(
+                "capture_estimator_correction_ns"
+            ),
+            "capture_estimator_status": timing.get("capture_estimator_status"),
+            "capture_estimator_uncertainty_ns": timing.get(
+                "capture_estimator_uncertainty_ns"
+            ),
+            "capture_estimator_uncertainty_meaning": timing.get(
+                "capture_estimator_uncertainty_meaning"
+            ),
+            "capture_time_reference": timing.get("capture_time_reference"),
             "saved_unix_ns": int(saved_at_ns),
             "flags": list(timing.get("flags") or ()),
         }
@@ -318,7 +410,7 @@ class CameraSnapshotRecorder:
         if not self._telemetry.active:
             return
         summary = {
-            "schema_version": 2,
+            "schema_version": SCHEMA_VERSION,
             "started_at": self._recording_started_at,
             "started_unix_ns": self._recording_started_unix_ns,
             "started_monotonic_ns": self._recording_started_monotonic_ns,

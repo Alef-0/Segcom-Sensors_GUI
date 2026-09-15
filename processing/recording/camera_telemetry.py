@@ -12,7 +12,7 @@ CAMERA_TIMESTAMPS_JOURNAL_NAME = "camera_timestamps.jsonl"
 CAMERA_TIMING_EVENTS_NAME = "camera_timing_events.jsonl"
 CAMERA_TIMING_SESSION_NAME = "camera_timing_session.json"
 CAMERA_RECORDING_SUMMARY_NAME = "camera_recording_summary.json"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class CameraTelemetryWriter:
@@ -48,11 +48,18 @@ class CameraTelemetryWriter:
         if not self.active or not epoch:
             return
         value = dict(epoch)
-        epoch_number = value.get("stream_epoch")
+        identity = tuple(
+            value.get(key)
+            for key in ("stream_epoch", "mapping_revision", "segment_epoch")
+        )
         with self._lock:
             epochs = self._session.setdefault("epochs", [])
             for existing in epochs:
-                if existing.get("stream_epoch") == epoch_number:
+                existing_identity = tuple(
+                    existing.get(key)
+                    for key in ("stream_epoch", "mapping_revision", "segment_epoch")
+                )
+                if existing_identity == identity:
                     if all(existing.get(key) == item for key, item in value.items()):
                         return
                     existing.update(value)

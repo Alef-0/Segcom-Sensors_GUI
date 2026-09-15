@@ -21,7 +21,10 @@ from sensors.camera.camera_pipeline import (
 )
 from sensors.camera.camera_reference_clock import ReferenceClockObserver
 from sensors.camera.camera_timebase import FrameTimestampPolicy
-from sensors.camera.timing_defaults import DEFAULT_CAMERA_TIMESTAMP_CORRECTION_MS
+from sensors.camera.timing_defaults import (
+    DEFAULT_CAMERA_CALIBRATION_VERSION,
+    DEFAULT_CAMERA_TIMESTAMP_CORRECTION_MS,
+)
 
 gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst
@@ -70,7 +73,10 @@ class GStreamerPipeline:
             self._report_snapshot,
             self._report_recording_drop,
         )
-        self.timestamp_policy = FrameTimestampPolicy()
+        self.timestamp_policy = FrameTimestampPolicy(
+            capture_correction_ms=self.latency_adjustment_ms,
+            capture_calibration_version=DEFAULT_CAMERA_CALIBRATION_VERSION,
+        )
         self.reference_clock = ReferenceClockObserver()
         self.stream_epoch = 0
         self.decoder_preference = "auto"
@@ -186,6 +192,25 @@ class GStreamerPipeline:
                     "pipeline_latency_ms": self.pipeline_latency_ms,
                     "stream_epoch_at_start": self.stream_epoch,
                     "display_journal": value.get("display_journal"),
+                    "timing_contract": {
+                        "media_reference": (
+                            "pipeline clock anchor plus segment-mapped buffer running time"
+                        ),
+                        "application_arrival_boundary": (
+                            "capture appsink new-sample callback entry"
+                        ),
+                        "correction_sign": (
+                            "positive correction is subtracted from media reference"
+                        ),
+                        "capture_reference": (
+                            "provisional corrected camera timestamp; physical exposure "
+                            "start/midpoint is not established"
+                        ),
+                        "arrival_delay": (
+                            "application arrival monotonic time minus estimated capture time"
+                        ),
+                        "units": "integer nanoseconds unless a field name says otherwise",
+                    },
                 },
             )
             self.calibration_recording = calibration
@@ -302,6 +327,7 @@ class GStreamerPipeline:
         restart = pipeline_latency_ms != self.pipeline_latency_ms and self.connected
         self.pipeline_latency_ms = pipeline_latency_ms
         self.latency_adjustment_ms = adjustment_ms
+        self.timestamp_policy.set_capture_correction_ms(adjustment_ms)
         self.snapshot_recorder.set_latency_adjustment_ms(adjustment_ms)
         self._put_status(
             "camera_latency_state",
@@ -567,12 +593,66 @@ class GStreamerPipeline:
             self.frames.put_nowait(frame)
         return Gst.FlowReturn.OK
 
+    def _capture_queue_levels(self):
+        pipeline = getattr(self, "pipeline", None)
+        queue_element = (
+            pipeline.get_by_name("capture_queue")
+            if pipeline is not None and hasattr(pipeline, "get_by_name")
+            else None
+        )
+        if queue_element is None:
+            return {}
+        output = {}
+        for property_name, field_name in (
+            ("current-level-buffers", "capture_queue_level_buffers"),
+            ("current-level-bytes", "capture_queue_level_bytes"),
+            ("current-level-time", "capture_queue_level_time_ns"),
+        ):
+            try:
+                output[field_name] = int(queue_element.get_property(property_name))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        return output
+
+    def _retain_capture_failure(self, reason, timing):
+        note_invalid_frame = getattr(
+            self.snapshot_recorder, "note_invalid_timing_frame", None
+        )
+        if note_invalid_frame is not None:
+            note_invalid_frame(reason=reason, timing=timing)
+
     def on_new_capture_sample(self, sink):
+        application_arrival_monotonic_ns = time.monotonic_ns()
+        application_arrival_unix_ns = time.time_ns()
         sample = sink.emit("pull-sample")
+        sample_pulled_monotonic_ns = time.monotonic_ns()
+        sample_pulled_unix_ns = time.time_ns()
         if sample is None:
+            self._retain_capture_failure(
+                "capture appsink returned no sample",
+                {
+                    "application_arrival_monotonic_ns": application_arrival_monotonic_ns,
+                    "application_arrival_unix_ns": application_arrival_unix_ns,
+                    "sample_pulled_monotonic_ns": sample_pulled_monotonic_ns,
+                    "sample_pulled_unix_ns": sample_pulled_unix_ns,
+                },
+            )
             return Gst.FlowReturn.ERROR
         frame = self._sample_to_frame(sample)
+        frame_converted_monotonic_ns = time.monotonic_ns()
+        frame_converted_unix_ns = time.time_ns()
         if frame is None:
+            self._retain_capture_failure(
+                "capture sample could not be converted to an image",
+                {
+                    "application_arrival_monotonic_ns": application_arrival_monotonic_ns,
+                    "application_arrival_unix_ns": application_arrival_unix_ns,
+                    "sample_pulled_monotonic_ns": sample_pulled_monotonic_ns,
+                    "sample_pulled_unix_ns": sample_pulled_unix_ns,
+                    "frame_converted_monotonic_ns": frame_converted_monotonic_ns,
+                    "frame_converted_unix_ns": frame_converted_unix_ns,
+                },
+            )
             return Gst.FlowReturn.ERROR
         shape = getattr(frame, "shape", ())
         if len(shape) >= 2:
@@ -585,9 +665,21 @@ class GStreamerPipeline:
                 f"{self.current_decoder_backend.name} decoder"
             )
 
-        timestamp = self.timestamp_policy.timestamp_for_sample(sample)
+        timestamp = self.timestamp_policy.timestamp_for_sample(
+            sample,
+            application_arrival_monotonic_ns=application_arrival_monotonic_ns,
+            application_arrival_unix_ns=application_arrival_unix_ns,
+            sample_pulled_monotonic_ns=sample_pulled_monotonic_ns,
+            sample_pulled_unix_ns=sample_pulled_unix_ns,
+            frame_converted_monotonic_ns=frame_converted_monotonic_ns,
+            frame_converted_unix_ns=frame_converted_unix_ns,
+            capture_queue_levels=self._capture_queue_levels(),
+        )
         if not timestamp.valid:
-            self._reject_synchronized_frame(timestamp.reason or "unknown timestamp error")
+            self._reject_synchronized_frame(
+                timestamp.reason or "unknown timestamp error",
+                timing=timestamp.timing,
+            )
             return Gst.FlowReturn.OK
 
         self._observe_camera_ntp(
@@ -610,14 +702,14 @@ class GStreamerPipeline:
         self._emit_manual_snapshot(frame, timestamp.captured_at)
         return Gst.FlowReturn.OK
 
-    def _reject_synchronized_frame(self, reason):
+    def _reject_synchronized_frame(self, reason, *, timing=None):
         note_invalid_frame = getattr(
             self.snapshot_recorder,
             "note_invalid_timing_frame",
             None,
         )
         if note_invalid_frame is not None:
-            note_invalid_frame()
+            note_invalid_frame(reason=reason, timing=timing)
         now = time.monotonic()
         if now - self._last_timestamp_warning >= TIMESTAMP_WARNING_INTERVAL_SECONDS:
             print(f"[DEBUG][CAMERA] Skipping unsynchronized camera frame: {reason}")

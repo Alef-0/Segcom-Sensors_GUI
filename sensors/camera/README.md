@@ -81,23 +81,40 @@ packet capture, or operating-system network telemetry.
 
 Every capture sample must have a valid, strictly increasing PTS that can be
 mapped through its segment to pipeline running time. The first usable frame
-anchors pipeline running time to host realtime while a monotonic clock tracks
-host-clock movement.
+anchors pipeline running time to host realtime and monotonic time. The pipeline
+clock read is bracketed by two host-monotonic samples; the half-window is stored
+as mapping-sample uncertainty. A clock, base-time, or segment change starts a
+new mapping/segment revision instead of silently reusing the prior history.
 
-The resulting `captured_at` always comes from the fixed host anchor plus frame
-running time. A frame reference timestamp is converted only when its caps
+The capture appsink callback records `application_arrival_*` before pulling the
+sample or converting it to an image. Separate pull-complete, conversion-complete,
+and timestamp-policy fields expose work added after that boundary. The legacy
+`received_*` fields retain their old post-conversion meaning in schema version 3.
+Capture-queue occupancy is a diagnostic; application arrival is not described
+as network arrival.
+
+The resulting legacy `captured_at` still comes from the fixed host anchor plus
+segment-mapped frame running time, so downstream code continues to subtract the
+configured correction exactly once. The timing journal additionally carries an
+observation-only estimated capture time and `estimated_arrival_delay = A - (M-c)`.
+Its uncertainty covers only the host/pipeline clock sampling window; camera
+processing, display scanout, and the physical exposure reference remain
+unverified. A frame reference timestamp is converted only when its caps
 explicitly identify an NTP or Unix clock. It is retained as diagnostic evidence
-and never moves the PTS-derived image time. Unknown reference clocks remain raw
+and never moves the segment-derived image time. Unknown reference clocks remain raw
 and are flagged instead of being guessed.
 
-Each calibration row keeps the independent observations needed to recompute
-the relationship: PTS, segment running time, host Unix and monotonic receipt,
-declared reference-clock data, PTS-derived media time, and flags. Epoch anchors
-are stored once per pipeline restart in the session file rather than repeated
-in every row.
+Each calibration row keeps the independent observations needed to recompute the
+relationship: raw PTS, segment running time, the early application-arrival
+boundary, later processing timestamps, queue occupancy, declared reference-clock
+data, mapped media time, provisional estimate, and flags. Mapping anchors are
+stored by pipeline restart, mapping revision, and segment revision in the session
+file rather than repeated in every row.
 
-Invalid PTS frames are not recorded. A PTS interval above 1.75 nominal frame
-periods is reported as an unusual-gap candidate, not as confirmed frame loss.
+Invalid-timing frames and writer-queue drops are not saved as images, but their
+reason and available timing fields are retained in `camera_timing_events.jsonl`.
+A mapped running-time interval above 1.75 nominal frame periods is reported as
+an unusual-gap candidate, not as confirmed frame loss.
 This avoids misclassifying the observed alternating 20/40 ms cadence and its
 occasional approximately 50 ms interval. Confirmed transport evidence comes
 from jitter-buffer counters and messages.

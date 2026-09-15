@@ -39,14 +39,25 @@ import tempfile
 import numpy as np
 
 
-VERSION = 1
+VERSION = 2
 HISTORY = 12
 MIN_TRAIN = 40
 MIN_TEST = 20
 TARGETS = ("newest_generation", "newest_visibility", "common_visibility")
-FEATURE_NAMES = ([f"pts_gap_lag_{index}_ms" for index in range(HISTORY)]
-                 + [f"receipt_gap_lag_{index}_ms" for index in range(4)]
-                 + [f"receipt_minus_pts_age_change_lag_{index}_ms" for index in range(4)])
+FEATURE_NAMES = (
+    [f"running_time_gap_lag_{index}_ms" for index in range(HISTORY)]
+    + [f"application_arrival_gap_lag_{index}_ms" for index in range(4)]
+    + ["arrival_minus_media_ms"]
+    + [f"arrival_minus_media_change_lag_{index}_ms" for index in range(4)]
+    + [
+        "running_gap_mean_4_ms",
+        "running_gap_std_4_ms",
+        "running_gap_mean_12_ms",
+        "running_gap_std_12_ms",
+        "arrival_gap_mean_4_ms",
+        "arrival_gap_std_4_ms",
+    ]
+)
 
 
 @dataclass(frozen=True)
@@ -116,10 +127,36 @@ def _bounds(reference: int, start: int, end: int) -> list[float] | None:
     return [(reference - end) / 1e6, (reference - start) / 1e6]
 
 
-def _features(steps: list[float], arrivals: list[float], ages: list[float]) -> list:
+def _features(
+    steps: list[float], arrivals: list[float], arrival_minus_media: list[float]
+) -> list:
     def history(values, count):
         return list(reversed(values[-count:])) + [None] * max(0, count - len(values))
-    return history(steps, HISTORY) + history(arrivals, 4) + history(ages, 4)
+
+    def summary(values, count, operation):
+        selected = values[-count:]
+        return float(operation(selected)) if selected else None
+
+    age_changes = [
+        current - previous
+        for previous, current in zip(
+            arrival_minus_media[:-1], arrival_minus_media[1:]
+        )
+    ]
+    return (
+        history(steps, HISTORY)
+        + history(arrivals, 4)
+        + [arrival_minus_media[-1] if arrival_minus_media else None]
+        + history(age_changes, 4)
+        + [
+            summary(steps, 4, np.mean),
+            summary(steps, 4, np.std),
+            summary(steps, 12, np.mean),
+            summary(steps, 12, np.std),
+            summary(arrivals, 4, np.mean),
+            summary(arrivals, 4, np.std),
+        ]
+    )
 
 
 def load_session(directory: str | Path) -> Session:
@@ -143,15 +180,39 @@ def load_session(directory: str | Path) -> Session:
     if camera_path is None:
         raise ValueError(f"No camera journal in {recording}")
     epoch_path = recording / "camera_timing_session.json"
+    summary_path = recording / "camera_recording_summary.json"
+    events_path = recording / "camera_timing_events.jsonl"
+    recording_summary = _json(summary_path) if summary_path.is_file() else {}
+    timing_events = (
+        [
+            json.loads(line)
+            for line in events_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if events_path.is_file() else []
+    )
+    event_counts = Counter(
+        str(row.get("event", "unknown"))
+        for row in timing_events
+        if isinstance(row, dict)
+    )
     epochs = _json(epoch_path) if epoch_path.is_file() else {}
     epoch_map = {}
+    legacy_epoch_map = {}
+    stream_identity_anchor = {}
     for epoch in epochs.get("epochs", []):
-        key = _integer(epoch.get("stream_epoch"))
+        stream_epoch = _integer(epoch.get("stream_epoch"))
+        mapping_revision = _integer(epoch.get("mapping_revision"))
+        segment_epoch = _integer(epoch.get("segment_epoch"))
         zero = _integer(epoch.get("pipeline_zero_monotonic_ns"))
-        if key is not None and zero is not None:
+        if stream_epoch is not None and zero is not None:
+            key = (stream_epoch, mapping_revision, segment_epoch)
             if key in epoch_map and epoch_map[key] != zero:
                 raise ValueError(f"Conflicting epoch anchors: {epoch_path}")
             epoch_map[key] = zero
+            stream_identity_anchor.setdefault(stream_epoch, zero)
+            if mapping_revision is None and segment_epoch is None:
+                legacy_epoch_map[stream_epoch] = zero
     journal = _journal(display_path)
     metadata = [row for row in journal if row.get("kind") == "session"]
     if len(metadata) != 1:
@@ -201,7 +262,7 @@ def load_session(directory: str | Path) -> Session:
         decoded[filename] = row
     cameras = _journal(camera_path)
     seen, output, counts = set(), [], Counter()
-    steps, arrivals, ages = [], [], []
+    steps, arrivals, arrival_minus_media = [], [], []
     previous = None
     segment = 0
     stream_keys = set()
@@ -213,31 +274,62 @@ def load_session(directory: str | Path) -> Session:
         seen.add(filename)
         decoded_row = decoded.get(filename, {})
         epoch = _integer(camera.get("stream_epoch"))
-        zero = epoch_map.get(epoch)
-        pts = _integer(camera.get("pts_ns"))
-        received = _integer(camera.get("received_monotonic_ns",
-                                       camera.get("host_monotonic_received_ns")))
-        reference = zero + pts if zero is not None and pts is not None else None
+        mapping_revision = _integer(camera.get("mapping_revision"))
+        segment_epoch = _integer(camera.get("segment_epoch"))
+        zero = epoch_map.get((epoch, mapping_revision, segment_epoch))
         if zero is None:
+            zero = legacy_epoch_map.get(epoch)
+        pts = _integer(camera.get("pts_ns"))
+        running_time = _integer(camera.get("running_time_ns"))
+        received = _integer(camera.get("application_arrival_monotonic_ns"))
+        if received is None:
+            received = _integer(
+                camera.get(
+                    "received_monotonic_ns",
+                    camera.get("host_monotonic_received_ns"),
+                )
+            )
+        saved_media_monotonic = _integer(camera.get("media_monotonic_ns"))
+        if saved_media_monotonic is not None:
+            reference = saved_media_monotonic
+            reference_method = "saved_segment_running_time_mapping"
+        elif zero is not None and running_time is not None:
+            reference = zero + running_time
+            reference_method = "replayed_segment_running_time_mapping"
+        elif zero is not None and pts is not None:
+            reference = zero + pts
+            reference_method = "legacy_raw_pts_fallback"
+        else:
+            reference = None
+            reference_method = "unavailable"
+        counts[f"reference_{reference_method}"] += 1
+        identity_zero = stream_identity_anchor.get(epoch)
+        if identity_zero is None:
             identity_complete = False
         else:
-            stream_keys.add(f"{zero}:{epoch}")
-        continuous = (previous is not None and epoch == previous[0]
-                      and pts is not None and previous[1] is not None
-                      and 0 < pts - previous[1] <= 100_000_000
-                      and received is not None and previous[2] is not None
-                      and 0 < received - previous[2] <= 1_000_000_000
-                      and not any(previous[2] < pause <= received for pause in pauses))
+            stream_keys.add(f"{identity_zero}:{epoch}")
+        continuity_key = (epoch, mapping_revision, segment_epoch)
+        continuous = (
+            previous is not None
+            and continuity_key == previous[0]
+            and running_time is not None
+            and previous[1] is not None
+            and 0 < running_time - previous[1] <= 100_000_000
+            and received is not None
+            and previous[2] is not None
+            and 0 < received - previous[2] <= 1_000_000_000
+            and not any(previous[2] < pause <= received for pause in pauses)
+        )
         if continuous:
-            steps.append((pts - previous[1]) / 1e6)
+            steps.append((running_time - previous[1]) / 1e6)
             arrivals.append((received - previous[2]) / 1e6)
-            if reference is not None and previous[3] is not None:
-                ages.append(((received - reference) - (previous[2] - previous[3])) / 1e6)
         else:
-            steps, arrivals, ages = [], [], []
+            steps, arrivals, arrival_minus_media = [], [], []
             segment += 1
-        features = _features(steps, arrivals, ages)
-        previous = (epoch, pts, received, reference)
+        if received is not None and reference is not None:
+            arrival_minus_media.append((received - reference) / 1e6)
+        features = _features(steps, arrivals, arrival_minus_media)
+        previous = (continuity_key, running_time, received, reference)
         raw_values = decoded_row.get("qr_values_ms", [])
         if not isinstance(raw_values, list):
             raw_values = []
@@ -262,7 +354,7 @@ def load_session(directory: str | Path) -> Session:
         if not decoded_row:
             reasons.append("no_decoded_frame")
         if reference is None:
-            reasons.append("missing_raw_pts_epoch_anchor")
+            reasons.append("missing_segment_running_time_mapping")
         if not indices:
             reasons.append("no_unique_qr_identity")
         if bad or wrong_cell or len(indices) != len(matched):
@@ -313,9 +405,24 @@ def load_session(directory: str | Path) -> Session:
         counts.update(reasons)
         output.append({
             "recording": directory.name, "frame_number": number, "filename": filename,
-            "segment": segment, "pts_ns": pts, "received_monotonic_ns": received,
-            "stream_key": f"{zero}:{epoch}" if zero is not None else None,
-            "pts_reference_monotonic_ns": reference, "features": features,
+            "segment": segment, "pts_ns": pts,
+            "running_time_ns": running_time,
+            "application_arrival_monotonic_ns": received,
+            "legacy_received_monotonic_ns": _integer(camera.get("received_monotonic_ns")),
+            "sample_pulled_monotonic_ns": _integer(camera.get("sample_pulled_monotonic_ns")),
+            "frame_converted_monotonic_ns": _integer(camera.get("frame_converted_monotonic_ns")),
+            "capture_queue_level_buffers": _integer(camera.get("capture_queue_level_buffers")),
+            "stream_key": (
+                f"{identity_zero}:{epoch}"
+                if identity_zero is not None else None
+            ),
+            "media_reference_monotonic_ns": reference,
+            "reference_reconstruction": reference_method,
+            "observable_arrival_minus_media_ms": (
+                (received - reference) / 1e6
+                if received is not None and reference is not None else None
+            ),
+            "features": features,
             "targets": targets, "flags": flags, "exclusion_reasons": reasons,
             "decoded_unique_qrs": len(indices), "grid_qrs": grid, "visible_qrs": visible,
             "latest_display_index": latest,
@@ -329,13 +436,44 @@ def load_session(directory: str | Path) -> Session:
                                          for row in output)
     counts["common_visibility_frames"] = sum(row["targets"]["common_visibility"] is not None
                                             for row in output)
-    paths = [analysis_path, camera_path, display_path] + ([epoch_path] if epoch_path.is_file() else [])
+    counts["recording_summary_frames_rejected_invalid_timing"] = int(
+        recording_summary.get("frames_rejected_invalid_timing", 0) or 0
+    )
+    counts["recording_summary_frames_dropped_writer_queue"] = int(
+        recording_summary.get("frames_dropped_writer_queue", 0) or 0
+    )
+    counts["timing_event_rejected_invalid_timing"] = event_counts.get(
+        "frame_rejected_invalid_timing", 0
+    )
+    counts["timing_event_dropped_writer_queue"] = event_counts.get(
+        "frame_dropped_writer_queue", 0
+    )
+    paths = [analysis_path, camera_path, display_path]
+    paths.extend(
+        path
+        for path in (epoch_path, summary_path, events_path)
+        if path.is_file()
+    )
     provenance = {str(path): _hash(path) for path in paths}
     return Session(directory.name, directory, recording, output, provenance,
                    {"counts": dict(counts), "display_period_ms": period,
                     "grid_qrs": grid, "visible_qrs": visible,
                     "presentation_semantics": metadata.get("presentation_semantics"),
                     "camera_journal_sha256": _hash(camera_path),
+                    "unsaved_frame_accounting": {
+                        "summary": {
+                            key: recording_summary.get(key)
+                            for key in (
+                                "frames_observed",
+                                "frames_selected",
+                                "frames_saved",
+                                "frames_rejected_invalid_timing",
+                                "frames_dropped_writer_queue",
+                                "confirmed_frames_not_saved",
+                            )
+                        },
+                        "timing_event_counts": dict(event_counts),
+                    },
                     "decoded_inputs_already_remapped_by_upstream_reader": True},
                    stream_keys, identity_complete)
 
@@ -349,30 +487,48 @@ def _score(bounds: np.ndarray, prediction: np.ndarray, goals: Goals) -> dict:
     absolute = np.abs(_residual(bounds, prediction))
     midpoint = np.mean(bounds, axis=1)
     worst = np.maximum(np.abs(bounds[:, 0] - prediction), np.abs(bounds[:, 1] - prediction))
+    widths = bounds[:, 1] - bounds[:, 0]
     coverage = float(100 * np.mean(absolute < goals.threshold_ms))
     median = float(np.median(absolute))
+    maximum = float(max(absolute))
+    at_or_above = int(np.sum(absolute >= goals.threshold_ms))
     return {
         "n": len(absolute), "mae_ms": float(np.mean(absolute)),
         "median_absolute_ms": median, "p95_absolute_ms": float(np.percentile(absolute, 95)),
-        "p99_absolute_ms": float(np.percentile(absolute, 99)), "maximum_absolute_ms": float(max(absolute)),
+        "p99_absolute_ms": float(np.percentile(absolute, 99)), "maximum_absolute_ms": maximum,
+        "errors_at_or_above_threshold": at_or_above,
+        "errors_at_or_above_threshold_pct": float(100 * at_or_above / len(absolute)),
         "bias_ms": float(np.mean(_residual(bounds, prediction))),
         "inside_interval_pct": float(100 * np.mean(absolute == 0)),
         "below_threshold_pct": coverage,
         "below_median_goal_pct": float(100 * np.mean(absolute < goals.median_ms)),
-        "median_interval_width_ms": float(np.median(bounds[:, 1] - bounds[:, 0])),
+        "interval_width_ms": {
+            "minimum": float(np.min(widths)),
+            "median": float(np.median(widths)),
+            "p95": float(np.percentile(widths, 95)),
+            "maximum": float(np.max(widths)),
+        },
+        "median_interval_width_ms": float(np.median(widths)),
         "midpoint_mae_ms": float(np.mean(np.abs(midpoint - prediction))),
+        "worst_endpoint_median_ms": float(np.median(worst)),
         "worst_endpoint_p95_ms": float(np.percentile(worst, 95)),
+        "worst_endpoint_maximum_ms": float(np.max(worst)),
         "worst_endpoint_below_threshold_pct": float(100 * np.mean(worst < goals.threshold_ms)),
-        "conditional_goal_passed": bool(median < goals.median_ms and coverage >= goals.coverage_pct),
+        "strict_maximum_goal_passed": bool(maximum < goals.threshold_ms),
+        "strict_median_goal_passed": bool(median < goals.median_ms),
+        "conditional_goal_passed": bool(
+            maximum < goals.threshold_ms and median < goals.median_ms
+        ),
     }
 
 
 def _rank(metrics: dict, goals: Goals) -> tuple:
-    # First minimize violations of the two requested goals, then the error tail.
-    deficit = max(0, goals.coverage_pct - metrics["below_threshold_pct"]) / 100
+    # A single scored frame at or above the threshold is a strict failure.
+    deficit = max(0, metrics["maximum_absolute_ms"] / goals.threshold_ms - 1)
     deficit += max(0, metrics["median_absolute_ms"] / goals.median_ms - 1)
     return (not metrics["conditional_goal_passed"], deficit,
-            metrics["p95_absolute_ms"], metrics["median_absolute_ms"], metrics["mae_ms"])
+            metrics["maximum_absolute_ms"], metrics["median_absolute_ms"],
+            metrics["p95_absolute_ms"], metrics["mae_ms"])
 
 
 def _eligible(rows: list[dict]) -> list[dict]:
@@ -396,12 +552,35 @@ def _coverage_shift(bounds: np.ndarray, prediction: np.ndarray, goals: Goals) ->
     return float(best)
 
 
-def _design(x: np.ndarray, depth: int, receipt: bool) -> np.ndarray:
+def _design(x: np.ndarray, depth: int, receipt: bool = False) -> np.ndarray:
     values = x[:, :depth]
     # Missing history is explicit and later imputed from training data only.
     if receipt:
         values = np.column_stack((values, x[:, HISTORY:HISTORY + 8]))
     return values
+
+
+def _interval_constant(
+    bounds: np.ndarray, goals: Goals, *, baseline: float | None = None
+) -> float:
+    midpoint = np.mean(bounds, axis=1)
+    if baseline is None:
+        baseline = float(np.median(midpoint))
+    candidates = np.unique(np.concatenate((bounds.ravel(), midpoint, [baseline])))
+    return float(min(
+        candidates,
+        key=lambda value: (
+            _rank(_score(bounds, np.full(len(bounds), value), goals), goals),
+            abs(value - baseline),
+        ),
+    ))
+
+
+def _cadence_key(row: dict, depth: int, bucket_ms: float) -> str | None:
+    values = row["features"][:depth]
+    if any(value is None or not math.isfinite(float(value)) for value in values):
+        return None
+    return ":".join(str(int(round(float(value) / bucket_ms))) for value in values)
 
 
 def _preprocess(x: np.ndarray, parameters: dict | None = None) -> tuple[np.ndarray, dict]:
@@ -423,14 +602,20 @@ def _preprocess(x: np.ndarray, parameters: dict | None = None) -> tuple[np.ndarr
 
 def _recipes() -> dict[str, list[dict]]:
     return {
-        "fixed_midpoint": [{"kind": "fixed_midpoint"}],
-        "fixed_coverage": [{"kind": "fixed_coverage"}],
-        "robust_pts_history": [dict(kind="huber", depth=depth, ridge=ridge, receipt=False)
-                               for depth in (1, 3, 6, 12) for ridge in (0.1, 1.0)],
-        "local_cadence_neighbors": [dict(kind="neighbors", depth=depth, neighbors=count, receipt=False)
-                                    for depth in (3, 6, 12) for count in (15, 40)],
-        "receipt_innovation_history": [dict(kind="huber", depth=depth, ridge=1.0, receipt=True)
-                                       for depth in (3, 6, 12)],
+        "model_a_constant": [{"kind": "fixed_interval"}],
+        "model_b_cadence_state": [
+            dict(kind="cadence_state", depth=depth, bucket_ms=bucket)
+            for depth in (1, 2, 3) for bucket in (5.0, 10.0)
+        ],
+        "model_c_interval_history": [
+            dict(kind="interval_ridge", depth=depth, ridge=ridge)
+            for depth in (3, 6, 12) for ridge in (0.1, 1.0)
+        ],
+        "comparison_fixed_midpoint": [{"kind": "fixed_midpoint"}],
+        "comparison_local_neighbors": [
+            dict(kind="neighbors", depth=depth, neighbors=count)
+            for depth in (3, 6, 12) for count in (15, 40)
+        ],
     }
 
 
@@ -439,12 +624,33 @@ def _fit(rows: list[dict], recipe: dict, goals: Goals) -> dict:
     y = np.mean(bounds, axis=1)
     kind = recipe["kind"]
     model = {"recipe": recipe, "training_frames": len(rows)}
-    if kind.startswith("fixed"):
+    if kind == "fixed_midpoint":
         correction = float(np.median(y))
-        if kind == "fixed_coverage":
-            correction += _coverage_shift(bounds, np.full(len(y), correction), goals)
         return dict(model, correction_ms=correction)
-    design, preprocessing = _preprocess(_design(x, recipe["depth"], recipe["receipt"]))
+    if kind == "fixed_interval":
+        return dict(model, correction_ms=_interval_constant(bounds, goals))
+    if kind == "cadence_state":
+        fallback = _interval_constant(bounds, goals)
+        grouped = defaultdict(list)
+        for row in rows:
+            key = _cadence_key(row, recipe["depth"], recipe["bucket_ms"])
+            if key is not None:
+                grouped[key].append(row)
+        states = {}
+        for key, members in grouped.items():
+            if len(members) < 10:
+                continue
+            member_bounds = _arrays(members)[1]
+            states[key] = {
+                "correction_ms": _interval_constant(
+                    member_bounds, goals, baseline=fallback
+                ),
+                "training_frames": len(members),
+            }
+        return dict(model, correction_ms=fallback, states=states)
+    design, preprocessing = _preprocess(
+        _design(x, recipe["depth"], recipe.get("receipt", False))
+    )
     model["preprocessing"] = preprocessing
     if kind == "neighbors":
         # This nonparametric model retains only training camera features/targets.
@@ -458,29 +664,61 @@ def _fit(rows: list[dict], recipe: dict, goals: Goals) -> dict:
     penalty = np.eye(design.shape[1]) * recipe["ridge"]
     penalty[0, 0] = 0
     coefficients = np.zeros(design.shape[1])
+    if kind == "interval_ridge":
+        coefficients[0] = _interval_constant(bounds, goals, baseline=intercept)
     for _ in range(40):
-        updated = np.linalg.solve(design.T @ (weights[:, None] * design) + penalty,
-                                  design.T @ (weights * centered))
-        residual = centered - design @ updated
+        if kind == "interval_ridge":
+            prediction = design @ coefficients
+            target = np.clip(prediction, bounds[:, 0], bounds[:, 1])
+            # A tiny midpoint term is only a deterministic tie breaker when a
+            # broad set of predictions satisfies the training intervals.
+            target = 0.999 * target + 0.001 * y
+            updated = np.linalg.solve(
+                design.T @ (weights[:, None] * design) + penalty,
+                design.T @ (weights * target),
+            )
+            residual = _residual(bounds, design @ updated)
+        else:
+            updated = np.linalg.solve(
+                design.T @ (weights[:, None] * design) + penalty,
+                design.T @ (weights * centered),
+            )
+            residual = centered - design @ updated
         robust_scale = max(1.0, 1.4826 * float(np.median(np.abs(residual - np.median(residual)))))
         weights = np.minimum(1, 1.345 * robust_scale / np.maximum(np.abs(residual), 1e-12))
         converged = np.max(np.abs(updated - coefficients)) < 1e-7
         coefficients = updated
         if converged:
             break
-    coefficients[0] += intercept
+    if kind != "interval_ridge":
+        coefficients[0] += intercept
     prediction = design @ coefficients
     model.update(coefficients=coefficients.tolist(),
-                 shift_ms=_coverage_shift(bounds, prediction, goals))
+                 shift_ms=(
+                     0.0
+                     if kind == "interval_ridge"
+                     else _coverage_shift(bounds, prediction, goals)
+                 ))
     return model
 
 
 def _predict(model: dict, rows: list[dict]) -> np.ndarray:
     recipe = model["recipe"]
+    if recipe["kind"] == "cadence_state":
+        return np.asarray([
+            model["states"].get(
+                _cadence_key(row, recipe["depth"], recipe["bucket_ms"]),
+                model,
+            )["correction_ms"]
+            for row in rows
+        ])
     if "correction_ms" in model:
         return np.full(len(rows), model["correction_ms"])
     x = np.asarray([row["features"] for row in rows], dtype=float)
-    design, _ = _preprocess(_design(x, recipe["depth"], recipe["receipt"]), model["preprocessing"])
+    design, _ = _preprocess(
+        _design(x, recipe["depth"], recipe.get("receipt", False)),
+        model["preprocessing"],
+    )
     if recipe["kind"] == "neighbors":
         train = np.asarray(model["training_features"])
         labels = np.asarray(model["training_midpoints"])
@@ -529,8 +767,31 @@ def _select_models(groups: list[list[dict]], goals: Goals) -> tuple[dict, dict]:
                                    "worst_fold_rank": list(max(_rank(m, goals) for m in results))})
         choice = min(trials[family], key=lambda trial: tuple(trial["worst_fold_rank"]))
         models[family] = _fit(training, choice["recipe"], goals)
-    # This choice is frozen before looking at the outer holdout/other recording.
-    family = min(trials, key=lambda key: min(tuple(t["worst_fold_rank"]) for t in trials[key]))
+    # Escalate model complexity only when the simpler causal family fails the
+    # strict inner-fold goals. Comparison baselines are never silently promoted.
+    deployable_families = (
+        "model_a_constant",
+        "model_b_cadence_state",
+        "model_c_interval_history",
+    )
+    family = None
+    for candidate in deployable_families:
+        choice = min(
+            trials[candidate], key=lambda trial: tuple(trial["worst_fold_rank"])
+        )
+        if all(
+            metric["conditional_goal_passed"]
+            for metric in choice["fold_metrics"]
+        ):
+            family = candidate
+            break
+    if family is None:
+        family = min(
+            deployable_families,
+            key=lambda key: min(
+                tuple(trial["worst_fold_rank"]) for trial in trials[key]
+            ),
+        )
     models["preselected"] = models[family]
     return models, {"selected_family": family, "inner_folds": len(folds), "trials": trials}
 
@@ -563,19 +824,104 @@ def _block_uncertainty(rows: list[dict], absolute: np.ndarray, goals: Goals) -> 
 
 
 def _evaluate(model: dict, rows: list[dict], goals: Goals) -> tuple[dict, list[dict]]:
-    eligible = _eligible(rows)
+    if not rows:
+        return {
+            "status": "no_camera_frames",
+            "camera_frames": 0,
+            "valid_estimates": 0,
+            "frames_without_valid_estimate": 0,
+            "frames_without_defensible_qr_interval": 0,
+        }, []
+    prediction_all = _predict(model, rows)
+    valid_estimate = np.isfinite(prediction_all)
+    qr_eligible_indices = [
+        index
+        for index, row in enumerate(rows)
+        if row["targets"]["newest_generation"] is not None
+    ]
+    eligible_indices = [
+        index
+        for index in qr_eligible_indices
+        if valid_estimate[index]
+    ]
+    eligible = [rows[index] for index in eligible_indices]
+    records = []
+    for index, (row, predicted) in enumerate(zip(rows, prediction_all)):
+        valid = bool(valid_estimate[index])
+        interval = row["targets"]["newest_generation"]
+        error = None
+        if valid and interval is not None:
+            error = float(_residual(
+                np.asarray([interval], dtype=float),
+                np.asarray([predicted], dtype=float),
+            )[0])
+        media_reference = row.get("media_reference_monotonic_ns")
+        arrival = row.get("application_arrival_monotonic_ns")
+        capture = (
+            int(round(media_reference - predicted * 1e6))
+            if valid and media_reference is not None else None
+        )
+        arrival_delay = (
+            (arrival - capture) / 1e6
+            if capture is not None and arrival is not None else None
+        )
+        records.append({
+            "recording": row["recording"],
+            "frame_number": row["frame_number"],
+            "filename": row["filename"],
+            "estimate_valid": valid,
+            "estimate_status": "valid" if valid else "model_returned_nonfinite",
+            "correction_ms": float(predicted) if valid else None,
+            "estimated_capture_monotonic_ns": capture,
+            "observable_arrival_minus_media_ms": row.get(
+                "observable_arrival_minus_media_ms"
+            ),
+            "estimated_arrival_delay_ms": arrival_delay,
+            "interval_lower_ms": float(interval[0]) if interval is not None else None,
+            "interval_upper_ms": float(interval[1]) if interval is not None else None,
+            "interval_residual_ms": error,
+            "midpoint_residual_ms": (
+                float(np.mean(interval) - predicted)
+                if valid and interval is not None else None
+            ),
+            "below_threshold": (
+                bool(abs(error) < goals.threshold_ms) if error is not None else None
+            ),
+            "residual_display_periods": (
+                int(round(error / row["display_period_ms"]))
+                if error is not None else None
+            ),
+        })
     if not eligible:
-        return {"status": "no_evaluable_frames", "camera_frames": len(rows)}, []
-    prediction = _predict(model, eligible)
+        return {
+            "status": "no_evaluable_frames",
+            "camera_frames": len(rows),
+            "valid_estimates": int(np.sum(valid_estimate)),
+            "frames_without_valid_estimate": int(np.sum(~valid_estimate)),
+            "frames_without_defensible_qr_interval": (
+                len(rows) - len(qr_eligible_indices)
+            ),
+        }, records
+    prediction = prediction_all[eligible_indices]
     bounds = _arrays(eligible)[1]
     result = _score(bounds, prediction, goals)
     residual = _residual(bounds, prediction)
     result.update(status="evaluated", camera_frames=len(rows),
+                  valid_estimates=int(np.sum(valid_estimate)),
+                  frames_without_valid_estimate=int(np.sum(~valid_estimate)),
+                  frames_without_defensible_qr_interval=(
+                      len(rows) - len(qr_eligible_indices)
+                  ),
                   scored_camera_pct=100 * len(eligible) / len(rows),
                   below_threshold_all_camera_lower_bound_pct=100 * int(np.sum(
                       np.abs(residual) < goals.threshold_ms)) / len(rows),
                   enough_evaluation_frames=len(eligible) >= MIN_TEST,
                   uncertainty=_block_uncertainty(eligible, np.abs(residual), goals))
+    result["every_camera_frame_verified"] = bool(
+        len(eligible) == len(rows)
+        and not np.any(~valid_estimate)
+        and result["conditional_goal_passed"]
+    )
     result["cohorts"] = {}
     for flag in ("all_grid_cells_decoded", "more_codes_than_configured_visible",
                  "visibility_contradiction", "upstream_position_warnings",
@@ -590,15 +936,6 @@ def _evaluate(model: dict, rows: list[dict], goals: Goals) -> tuple[dict, list[d
         if subset:
             result["sensitivity"][target] = _score(np.asarray([row["targets"][target] for row in subset]),
                                                   _predict(model, subset), goals)
-    records = []
-    for row, predicted, error, interval in zip(eligible, prediction, residual, bounds):
-        records.append({"recording": row["recording"], "frame_number": row["frame_number"],
-                        "filename": row["filename"], "correction_ms": float(predicted),
-                        "interval_lower_ms": float(interval[0]), "interval_upper_ms": float(interval[1]),
-                        "interval_residual_ms": float(error),
-                        "midpoint_residual_ms": float(np.mean(interval) - predicted),
-                        "below_threshold": bool(abs(error) < goals.threshold_ms),
-                        "residual_display_periods": int(round(error / row["display_period_ms"]))})
     return result, records
 
 
@@ -699,26 +1036,32 @@ def analyze_directories(directories: list[str | Path], *, goals: Goals | None = 
     independent_pass = bool(primary) and all(
         row.get("metrics", {}).get("conditional_goal_passed", False)
         and row["metrics"].get("enough_evaluation_frames", False)
-        and row["metrics"].get("below_threshold_all_camera_lower_bound_pct", 0) >= goals.coverage_pct
         for row in primary)
     expected_targets = sum(len(group) for group in components) if len(components) >= 2 else 0
     independent_pass = independent_pass and len(primary) == expected_targets and expected_targets == len(sessions)
+    independent_every_frame_verified = independent_pass and all(
+        row.get("metrics", {}).get("every_camera_frame_verified", False)
+        for row in primary
+    )
     return {
         "schema_version": VERSION, "generated_at": datetime.now().astimezone().isoformat(),
         "goals": {"median_absolute_below_ms": goals.median_ms, "absolute_below_ms": goals.threshold_ms,
-                  "minimum_coverage_pct": goals.coverage_pct, "strict_threshold_comparison": True},
+                  "supplementary_coverage_pct": goals.coverage_pct,
+                  "maximum_must_be_below_threshold": True,
+                  "strict_threshold_comparison": True},
         "feature_order": FEATURE_NAMES,
         "evidence_policy": {
             "primary": "Newest decoded generation to next presentation; conditional on no missed newer QR",
             "sensitivity": "Newest-marker lifetime and common lifetime of all markers; never used for selection",
             "contradiction": "Empty common visibility is unexplained; do not attribute it automatically to rolling shutter",
             "saved_input_limit": "QR values were decoded/remapped upstream; original pixels and omitted detections are not reassessed",
-            "features": "Current/past raw PTS gaps; receipt model also uses past/current receipt gaps and changes of receipt-minus-PTS age",
+            "features": "Causal segment-running-time gaps plus recorded application-arrival gaps, arrival-minus-media state, and rolling diagnostics; deployed correction families use running-time history only",
             "forbidden_predictors": "QR values, cell IDs, display indices, absolute recording time, old fitted corrections",
-            "reference": "Raw epoch pipeline-zero monotonic time plus raw camera PTS; no saved corrected timestamps",
-            "selection": "Two forward inner folds; rank worst recording/fold by goal violations then P95, median and MAE; frozen before outer scoring",
+            "reference": "Saved media monotonic time or pipeline-zero monotonic plus segment-mapped running time; raw PTS is legacy-only fallback",
+            "arrival_separation": "Correction estimates capture time from media timing; application arrival affects only q=A-M and estimated arrival delay q+c",
+            "selection": "Two forward inner folds; advance from constant to cadence state to interval-regularized history only when simpler strict goals fail; freeze before outer scoring",
             "purge_frames": HISTORY, "primary_holdout_fraction": 0.3,
-            "fit_target": "Interval midpoint for robust regression/neighbors; training-only coverage shift for regression",
+            "fit_target": "Primary models minimize distance outside permissible correction intervals; midpoint and neighbor fits remain labeled comparison baselines",
             "missing_features": "Training-only median imputation plus explicit missing indicators; reset history at gaps/epochs/pauses",
             "uncertainty": "Report midpoint error, worst-endpoint error, interval width and block resampling alongside interval distance",
         },
@@ -731,10 +1074,12 @@ def analyze_directories(directories: list[str | Path], *, goals: Goals | None = 
         "frames": [row for s in sessions for row in s.frames],
         "verdict": {
             "conditional_independent_goals_passed": bool(independent_pass),
+            "independent_every_frame_verified": bool(independent_every_frame_verified),
             "physical_accuracy_established": False,
-            "status": ("conditional_goals_met_exposure_unverified" if independent_pass else
+            "status": ("conditional_goals_met_all_frames_exposure_unverified" if independent_every_frame_verified else
+                       "conditional_goals_met_incomplete_qr_coverage" if independent_pass else
                        "needs_independent_stream_evidence" if len(components) < 2 else "conditional_goals_not_met"),
-            "explanation": "A low interval error cannot establish actual exposure timing when QR generation, visibility, or physical presentation is unresolved",
+            "explanation": "Strict maximum and median results apply only to defensibly scored software-marker intervals; unscorable frames and physical exposure timing remain explicit limitations",
         },
     }
 
@@ -744,29 +1089,33 @@ def _markdown(report: dict) -> str:
     lines = ["# Final calibration analysis", "", f"Generated: {report['generated_at']}", "",
              f"Status: **{report['verdict']['status']}**", "",
              f"Goals: median < {goals['median_absolute_below_ms']:g} ms; "
-             f"at least {goals['minimum_coverage_pct']:g}% of errors < {goals['absolute_below_ms']:g} ms.", "",
+             f"maximum < {goals['absolute_below_ms']:g} ms. Any scored frame at or above "
+             "the maximum threshold fails the evaluation.", "",
              "All scores are conditional software-marker scores. Physical exposure accuracy is unverified.", "",
              "## Evidence and assumptions", ""]
     lines.extend(f"- **{key}:** {value}" for key, value in report["evidence_policy"].items())
     lines.extend(["", "## Input audit", "",
-                  "| Recording | Camera frames | Scored | More QRs than configured visible | Visibility contradictions |",
-                  "|---|---:|---:|---:|---:|"])
+                  "| Recording | Saved camera frames | Scored | Rejected timing | Writer drops | More QRs than configured visible | Visibility contradictions |",
+                  "|---|---:|---:|---:|---:|---:|---:|"])
     for session in report["sessions"]:
         counts = session["audit"]["counts"]
         lines.append(f"| {session['name']} | {counts['camera_frames']} | {counts['primary_scored_frames']} | "
+                     f"{counts.get('recording_summary_frames_rejected_invalid_timing', 0)} | "
+                     f"{counts.get('recording_summary_frames_dropped_writer_queue', 0)} | "
                      f"{counts.get('more_codes_than_configured_visible', 0)} | {counts.get('visibility_contradiction', 0)} |")
     lines.extend(["", "## Models selected before evaluation", "",
                   "These rows use the model family and settings selected inside the training data. "
                   "All competing families are exported separately; the best outer result is not rebranded as a validated winner.", "",
-                  "| Check | Source → target | Selected family | MAE | Median | P95 | Below threshold | Goal pass |",
+                  "| Check | Source → target | Selected family | Median | Maximum | At/above threshold | No QR interval | Goal pass |",
                   "|---|---|---|---:|---:|---:|---:|---|"])
     for row in report["experiments"]:
         if row.get("strategy") != "preselected" or row["status"] != "evaluated":
             continue
         m = row["metrics"]
         lines.append(f"| {row['kind']} | {' + '.join(row['sources'])} → {row['target']} | "
-                     f"{row['selected_family']} | {m['mae_ms']:.3f} | {m['median_absolute_ms']:.3f} | "
-                     f"{m['p95_absolute_ms']:.3f} | {m['below_threshold_pct']:.1f}% | {m['conditional_goal_passed']} |")
+                     f"{row['selected_family']} | {m['median_absolute_ms']:.3f} | "
+                     f"{m['maximum_absolute_ms']:.3f} | {m['errors_at_or_above_threshold']} | "
+                     f"{m['frames_without_defensible_qr_interval']} | {m['conditional_goal_passed']} |")
     skipped = [row for row in report["experiments"] if row["status"] != "evaluated"]
     lines.extend(["", "## Stream groups", "", *[f"- {', '.join(group)}" for group in report["stream_groups"]], "",
                   "Unknown stream identities cannot pass independent validation. All recordings sharing any stream epoch "
@@ -775,7 +1124,8 @@ def _markdown(report: dict) -> str:
                                               for row in skipped], "",
                   "## Graph guide", "",
                   "- Residual CDF: each full curve uses held-out predictions; dashed lines show the requested thresholds.",
-                  "- Overview: coverage and P95 per evaluated target; each point retains its source/target label.",
+                  "- Overview: maximum and median interval error per evaluated target; each point retains its source/target label.",
+                  "- Interval histograms: one panel per model shows the signed distance outside held-out QR intervals; zero is inside.",
                   "- Evidence: decoded QR count versus configured visibility; contradictions are not automatically explained away.",
                   "", "## Reproducibility", "",
                   "The JSON includes source hashes, selected settings, training models, feature preprocessing, "
@@ -818,14 +1168,14 @@ def _plot(report: dict, output: Path, svg: bool) -> list[str]:
         for family in (*_recipes(), "preselected"):
             values = [abs(row["interval_residual_ms"]) for row in report["predictions"]
                       if row["experiment"].startswith("chronological_holdout:")
-                      and row["recording"] == session["name"] and row["strategy"] == family]
+                      and row["recording"] == session["name"] and row["strategy"] == family
+                      and row["interval_residual_ms"] is not None]
             if values:
                 x = np.sort(values)
                 axis.step(np.r_[0, x], np.r_[0, 100 * np.arange(1, len(x) + 1) / len(x)],
                           where="post", label=family, linewidth=2.3 if family == "preselected" else 1)
         axis.axvline(goals["absolute_below_ms"], color="black", linestyle="--")
         axis.axvline(goals["median_absolute_below_ms"], color="gray", linestyle=":")
-        axis.axhline(goals["minimum_coverage_pct"], color="black", linestyle="--")
         axis.axhline(50, color="gray", linestyle=":")
         axis.set(title=f"{session['name']}: chronological holdout (conditional QR interval)",
                  xlabel="Absolute distance outside interval (ms)", ylabel="Frames at or below error (%)",
@@ -837,9 +1187,9 @@ def _plot(report: dict, output: Path, svg: bool) -> list[str]:
                and row["status"] == "evaluated"]
     figure, axes = plt.subplots(1, 2, figsize=(15, max(5, len(results) * 0.35)), layout="constrained")
     labels = [f"{row['kind']}: {'+'.join(row['sources'])} → {row['target']}" for row in results]
-    for axis, key, goal, title in zip(axes, ("below_threshold_pct", "p95_absolute_ms"),
-                                   (goals["minimum_coverage_pct"], goals["absolute_below_ms"]),
-                                   ("Coverage below threshold (%)", "P95 interval error (ms)")):
+    for axis, key, goal, title in zip(axes, ("maximum_absolute_ms", "median_absolute_ms"),
+                                   (goals["absolute_below_ms"], goals["median_absolute_below_ms"]),
+                                   ("Maximum interval error (ms)", "Median interval error (ms)")):
         axis.barh(np.arange(len(results)), [row["metrics"][key] for row in results])
         axis.set_yticks(np.arange(len(results)), labels, fontsize=7)
         axis.axvline(goal, linestyle="--", color="black")
@@ -847,6 +1197,39 @@ def _plot(report: dict, output: Path, svg: bool) -> list[str]:
         axis.invert_yaxis()
         axis.grid(axis="x", alpha=0.2)
     save(figure, "final_analysis_overview")
+    families = list(_recipes())
+    columns = 2
+    rows_count = math.ceil(len(families) / columns)
+    figure, axes = plt.subplots(
+        rows_count,
+        columns,
+        figsize=(14, 3.5 * rows_count),
+        squeeze=False,
+        layout="constrained",
+    )
+    for family, axis in zip(families, axes.ravel()):
+        values = [
+            row["interval_residual_ms"]
+            for row in report["predictions"]
+            if row["experiment"].startswith("chronological_holdout:")
+            and row["strategy"] == family
+            and row["interval_residual_ms"] is not None
+        ]
+        if values:
+            limit = max(goals["absolute_below_ms"], max(abs(value) for value in values))
+            axis.hist(values, bins=np.linspace(-limit, limit, 32), color="#287e9b", alpha=0.85)
+        axis.axvline(0, color="black", linewidth=1)
+        axis.axvline(-goals["absolute_below_ms"], color="#bd3b39", linestyle="--")
+        axis.axvline(goals["absolute_below_ms"], color="#bd3b39", linestyle="--")
+        axis.set(
+            title=family,
+            xlabel="Signed distance outside permissible interval (ms)",
+            ylabel="Held-out frames",
+        )
+        axis.grid(axis="y", alpha=0.2)
+    for axis in axes.ravel()[len(families):]:
+        axis.set_visible(False)
+    save(figure, "final_analysis_interval_error_histograms")
     figure, axes = plt.subplots(len(sessions), 1, figsize=(11, 3 * len(sessions)), squeeze=False,
                                 layout="constrained")
     for session, axis in zip(sessions, axes[:, 0]):
@@ -899,8 +1282,10 @@ def _self_test() -> None:
     for model in models.values():
         prediction = _predict(model, rows)
         assert np.all(np.isfinite(prediction))
-    np.testing.assert_allclose(_predict(models["robust_pts_history"], rows),
-                               [np.mean(row["targets"]["newest_generation"]) for row in rows], atol=0.2)
+    assert np.max(np.abs(_residual(
+        np.asarray([row["targets"]["newest_generation"] for row in rows]),
+        _predict(models["model_c_interval_history"], rows),
+    ))) < goals.threshold_ms
     original = _predict(models["preselected"], rows)
     changed = [dict(row, targets={"newest_generation": [1000., 2000.]}) for row in rows]
     np.testing.assert_array_equal(original, _predict(models["preselected"], changed))
@@ -932,7 +1317,8 @@ def _self_test() -> None:
         pts = latest * 10_000_000 + 85_000_000
         filename = f"images/{index}.jpg"
         cameras.append({"frame": filename, "stream_epoch": 1 if index < 120 else 2,
-                        "pts_ns": pts, "received_monotonic_ns": epoch_zero + pts + 150_000_000})
+                        "pts_ns": pts, "running_time_ns": pts,
+                        "received_monotonic_ns": epoch_zero + pts + 150_000_000})
         payload = f"{(epoch_zero + latest * 10_000_000) // 1_000_000 % 1_000_000_000_000:012d}"
         decoded.append({"filename": filename, "qr_values_ms": [payload, None],
                         "validation": "rejected_by_old_assumption", "offset_interval_lower_ms": -9999,
@@ -949,7 +1335,8 @@ def _self_test() -> None:
         assert len(loaded.frames) == 240
         assert loaded.frames[0]["targets"]["newest_generation"] == [75.0, 85.0]
         assert loaded.frames[0]["targets"]["common_visibility"] == [75.0, 85.0]
-        assert all(value is None for value in loaded.frames[120]["features"])
+        assert all(value is None for value in loaded.frames[120]["features"][:16])
+        assert loaded.frames[120]["features"][16] == 150.0
         assert loaded.frames[121]["features"][0] == 20.0
         assert loaded.frames[0]["targets"] == loaded.frames[-1]["targets"]
         # A nonunique marker cannot be resolved by an assumed correction.

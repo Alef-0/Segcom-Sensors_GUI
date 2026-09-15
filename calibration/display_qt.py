@@ -34,6 +34,7 @@ try:
     from calibration.qr import (
         GRID_LAYOUTS,
         QUIET_ZONE_MODULES,
+        QR_MASK_PATTERNS,
         grid_bounds,
         grid_cell_names,
         grid_positions,
@@ -46,6 +47,7 @@ except ModuleNotFoundError:
     from qr import (
         GRID_LAYOUTS,
         QUIET_ZONE_MODULES,
+        QR_MASK_PATTERNS,
         grid_bounds,
         grid_cell_names,
         grid_positions,
@@ -90,12 +92,16 @@ class QRClockRenderer:
         height: int,
         visible_qrs: int = VISIBLE_QRS,
         grid_qrs: int = DEFAULT_GRID_QRS,
+        qr_mask_pattern: int | None = None,
     ):
         grid_shape(grid_qrs)
         if not 1 <= visible_qrs <= grid_qrs:
             raise ValueError(f"Visible QR codes must be from 1 to {grid_qrs}")
+        if qr_mask_pattern is not None and qr_mask_pattern not in QR_MASK_PATTERNS:
+            raise ValueError("QR mask pattern must be from 0 to 7")
         self.grid_qrs = grid_qrs
         self.visible_qrs = visible_qrs
+        self.qr_mask_pattern = qr_mask_pattern
         self.cell_names = grid_cell_names(grid_qrs)
         self.timestamps: list[int | None] = [None] * grid_qrs
         self.display_indices: list[int | None] = [None] * grid_qrs
@@ -129,11 +135,6 @@ class QRClockRenderer:
             self._underline(area)
             for area in self.areas
         )
-        self.images = {
-            timestamp_ns: self._qr_image(self.qr_rects[cell], self.matrices[timestamp_ns])
-            for cell, timestamp_ns in enumerate(self.timestamps)
-            if timestamp_ns is not None
-        }
         self._force_full_redraw = True
         self._dirty_cells.update(range(self.grid_qrs))
 
@@ -181,10 +182,13 @@ class QRClockRenderer:
 
         self.timestamps[cell] = timestamp_ns
         self.display_indices[cell] = display_index
-        matrix = qr_matrix(timestamp_payload(timestamp_ns))
+        matrix = qr_matrix(
+            timestamp_payload(timestamp_ns),
+            mask_pattern=self.qr_mask_pattern,
+        )
         self.matrices[timestamp_ns] = matrix
         if cache_pixmap:
-            self.images[timestamp_ns] = self._qr_image(self.qr_rects[cell], matrix)
+            self.images[timestamp_ns] = self._qr_image(matrix)
         self._dirty_cells.add(cell)
 
         self.newest_cell = cell
@@ -192,10 +196,8 @@ class QRClockRenderer:
         return cell
 
     @staticmethod
-    def _qr_image(rect: QRect, matrix) -> QPixmap:
-        modules = matrix.shape[0]
-        scale = max(1, min(rect.width(), rect.height()) // modules)
-        pixels = (255 - matrix * 255).repeat(scale, axis=0).repeat(scale, axis=1)
+    def _qr_image(matrix) -> QPixmap:
+        pixels = 255 - matrix * 255
         image = QImage(
             pixels.data,
             pixels.shape[1],
@@ -208,7 +210,9 @@ class QRClockRenderer:
 
     @staticmethod
     def _draw_qr(painter: QPainter, rect: QRect, image: QPixmap) -> QRect:
-        bounds = QRect(0, 0, image.width(), image.height())
+        modules = image.width()
+        scale = max(1, min(rect.width(), rect.height()) // modules)
+        bounds = QRect(0, 0, modules * scale, modules * scale)
         bounds.moveCenter(rect.center())
         painter.drawPixmap(bounds, image)
         return bounds
@@ -273,6 +277,7 @@ class QRClockRenderer:
     ) -> None:
         full_redraw = force_full_redraw or self._force_full_redraw
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         painter.setFont(self.font)
 
         if full_redraw:
@@ -306,6 +311,10 @@ class QRClockRenderer:
             "cell_order": list(self.cell_names),
             "cell_positions": [list(position) for position in grid_positions(self.grid_qrs)],
             "visible_qrs": self.visible_qrs,
+            "qr_mask_pattern": self.qr_mask_pattern,
+            "qr_mask_selection": (
+                "automatic" if self.qr_mask_pattern is None else "fixed"
+            ),
             "indicator_style": "underline",
             "indicator_width": UNDERLINE_HEIGHT,
             "corner_order": (
@@ -502,6 +511,7 @@ class QRClockWindow(QOpenGLWindow):
         visible_qrs: int,
         grid_qrs: int,
         timestamp_mode: str,
+        qr_mask_pattern: int | None,
     ):
         super().__init__(QOpenGLWindow.UpdateBehavior.PartialUpdateBlit)
 
@@ -510,6 +520,7 @@ class QRClockWindow(QOpenGLWindow):
         self.screen_metadata = screen_metadata
         self.visible_qrs = visible_qrs
         self.grid_qrs = grid_qrs
+        self.qr_mask_pattern = qr_mask_pattern
         if timestamp_mode not in TIMESTAMP_MODES:
             choices = ", ".join(TIMESTAMP_MODES)
             raise ValueError(f"Timestamp mode must be one of: {choices}")
@@ -533,6 +544,7 @@ class QRClockWindow(QOpenGLWindow):
             self.height(),
             self.visible_qrs,
             self.grid_qrs,
+            self.qr_mask_pattern,
         )
 
         context = self.context()
@@ -747,6 +759,7 @@ def run_calibration_display(
     visible_qrs: int = VISIBLE_QRS,
     grid_qrs: int = DEFAULT_GRID_QRS,
     timestamp_mode: str = DEFAULT_TIMESTAMP_MODE,
+    qr_mask_pattern: int | None = None,
     list_screens: bool = False,
 ) -> int:
     if width < 320 or height < 240:
@@ -754,6 +767,8 @@ def run_calibration_display(
     grid_shape(grid_qrs)
     if not 1 <= visible_qrs <= grid_qrs:
         raise ValueError(f"Visible QR codes must be from 1 to {grid_qrs}")
+    if qr_mask_pattern is not None and qr_mask_pattern not in QR_MASK_PATTERNS:
+        raise ValueError("QR mask pattern must be from 0 to 7")
 
     configure_surface_format()
 
@@ -802,6 +817,7 @@ def run_calibration_display(
         visible_qrs=visible_qrs,
         grid_qrs=grid_qrs,
         timestamp_mode=timestamp_mode,
+        qr_mask_pattern=qr_mask_pattern,
     )
     window.setScreen(screen)
 
@@ -897,6 +913,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--qr-mask-pattern",
+        type=int,
+        choices=QR_MASK_PATTERNS,
+        help=(
+            "Use a fixed QR mask (0-7) for faster generation; default: choose "
+            "the lowest-penalty mask automatically"
+        ),
+    )
+    parser.add_argument(
         "--list-screens",
         action="store_true",
         help="Print detected monitors and refresh rates, then exit",
@@ -925,6 +950,7 @@ def main() -> None:
             visible_qrs=arguments.visible_qrs,
             grid_qrs=arguments.grid_qrs,
             timestamp_mode=arguments.timestamp_mode,
+            qr_mask_pattern=arguments.qr_mask_pattern,
             list_screens=arguments.list_screens,
         )
     )

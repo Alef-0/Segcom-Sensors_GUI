@@ -129,21 +129,30 @@ A channel-4 calibration folder contains an `images/` directory with JPEGs plus:
 | `camera_recording_summary.json` | Start/stop, saved/drop counts, and transport totals |
 | `display_timestamps.jsonl` | Display geometry and per-marker sample/submission/flip timing, including warm-up |
 
-The JSONL journal is the single canonical frame manifest. A compact row stores
-the image path (new recordings use `images/camera_*.jpg`; legacy bare names are
-also accepted), stream epoch, PTS, running time, host receipt clocks, raw and
-interpreted reference timestamp, host-anchored media time, adjusted exposure
-estimate, save time, and flags. Repeated values such as decoder choice,
-pipeline latency, the 87.348 ms adjustment, and pipeline-zero anchors live in the
-session file.
+The JSONL journal is the single canonical frame manifest. Schema version 3
+stores the image path (new recordings use `images/camera_*.jpg`; legacy bare
+names are also accepted), stream/mapping/segment identity, raw PTS,
+segment-mapped running time, early application arrival, pull and conversion
+completion, the legacy post-conversion receipt fields, queue occupancy, raw and
+interpreted reference timestamp, mapped media time, provisional capture and
+arrival-delay estimates, save time, and flags. Repeated values such as decoder
+choice, pipeline latency, the configured adjustment, timing contract, and
+pipeline-zero anchors live in the session file.
 
-`media_unix_ns` is computed from the moment the pipeline clock was anchored to
-the host plus the frame running time. `estimated_exposure_unix_ns` subtracts the
-configured application adjustment exactly once. Reference NTP remains an
-independent observation and does not correct either value.
+`media_unix_ns` and `media_monotonic_ns` use the pipeline clock anchor plus the
+buffer timestamp converted through its GStreamer segment. The canonical arrival
+boundary is `application_arrival_monotonic_ns`, sampled at capture callback
+entry. `received_monotonic_ns` remains the legacy timestamp-policy sample taken
+after conversion. `estimated_exposure_unix_ns` is retained for compatibility;
+the explicitly named `estimated_capture_*` fields subtract the same configured
+application adjustment exactly once. `estimated_arrival_delay_ns` is
+application arrival minus that estimate. Reference NTP remains an independent
+observation and does not correct these values.
 
 The summary distinguishes confirmed frames not saved (writer overflow or
-invalid timing) from unusual PTS-gap candidates. `num_lost`, `num_late`,
+invalid timing) from unusual timing-gap candidates. Rejected/dropped frame
+events retain their reason and any timing available before rejection.
+`num_lost`, `num_late`,
 `num_duplicates`, and retransmission fields are aggregated RTP jitter-buffer
 packet counters; per-pipeline values are retained in
 `transport_stats_by_epoch` so a restart does not overwrite earlier evidence.

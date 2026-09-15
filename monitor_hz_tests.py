@@ -27,6 +27,16 @@ def _positive_float(value: str) -> float:
     return number
 
 
+def _spin_wait_us(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a whole number") from error
+    if not 0 <= number <= 5_000:
+        raise argparse.ArgumentTypeError("must be from 0 to 5000 microseconds")
+    return number
+
+
 def _screen_catalog() -> list[dict]:
     """Query Qt screens in a separate process so other GUI backends stay isolated."""
     result = subprocess.run(
@@ -272,6 +282,7 @@ def run_qt_test(args: argparse.Namespace, screen: dict, expected_hz: float) -> i
                     self.height(),
                     args.visible_qrs,
                     args.grid_qrs,
+                    args.qr_mask_pattern,
                 )
 
         def resizeGL(self, width: int, height: int) -> None:
@@ -409,6 +420,11 @@ def run_qt_test(args: argparse.Namespace, screen: dict, expected_hz: float) -> i
             "Swap behavior": str(actual_format.swapBehavior()),
             "Timestamp mode": args.timestamp_mode,
             "QR drawing": args.qt_draw_mode,
+            "QR mask": (
+                "automatic"
+                if args.qr_mask_pattern is None
+                else f"fixed {args.qr_mask_pattern}"
+            ),
             "Retained QR matrices / pixmaps": (
                 f"{len(window.renderer.matrices)} / {len(window.renderer.images)}"
                 if window.renderer is not None else "0 / 0"
@@ -463,6 +479,7 @@ def run_pygame_test(
                 surface,
                 visible_qrs=args.visible_qrs,
                 grid_qrs=args.grid_qrs,
+                qr_mask_pattern=args.qr_mask_pattern,
             )
             if args.workload == "qr"
             else None
@@ -472,10 +489,17 @@ def run_pygame_test(
         start_ns = time.monotonic_ns()
         collect_after_ns = start_ns + round(args.warmup * 1_000_000_000)
         stop_ns = collect_after_ns + round(args.duration * 1_000_000_000)
-        pacer = FramePacer(start_ns, expected_hz)
+        pacer = FramePacer(
+            start_ns,
+            expected_hz,
+            spin_wait_us=args.pygame_spin_wait_us,
+        )
         last_flip_ns: int | None = None
         frame_index = 0
         stopped = False
+
+        if renderer is not None and args.timestamp_mode == "predicted-flip":
+            renderer.prepare_qr(pacer.predict_next_flip(time.monotonic_ns()))
 
         def should_stop() -> bool:
             nonlocal stopped
@@ -551,6 +575,8 @@ def run_pygame_test(
                 )
             last_flip_ns = flip_ns
             frame_index += 1
+            if renderer is not None and args.timestamp_mode == "predicted-flip":
+                renderer.prepare_qr(pacer.predict_next_flip(time.monotonic_ns()))
     finally:
         pygame.quit()
         if gc_disabled_for_test and automatic_gc_was_enabled:
@@ -570,6 +596,12 @@ def run_pygame_test(
             "VSync requested": "yes",
             "Timestamp mode": args.timestamp_mode,
             "QR drawing": args.pygame_draw_mode,
+            "QR mask": (
+                "automatic"
+                if args.qr_mask_pattern is None
+                else f"fixed {args.qr_mask_pattern}"
+            ),
+            "Pygame spin wait": f"{args.pygame_spin_wait_us} us",
             "Reusable QR surface pairs": (
                 len(renderer._qr_surfaces) if renderer is not None else 0
             ),
@@ -671,6 +703,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--qr-mask-pattern",
+        type=int,
+        choices=range(8),
+        help=(
+            "use a fixed QR mask (0-7) to compare generation speed; default: "
+            "automatic lowest-penalty selection"
+        ),
+    )
+    parser.add_argument(
+        "--pygame-spin-wait-us",
+        type=_spin_wait_us,
+        default=1_000,
+        help=(
+            "Pygame final busy-wait duration in microseconds; lower values save "
+            "CPU but can add scheduling jitter (default: 1000)"
+        ),
+    )
+    parser.add_argument(
         "--disable-gc",
         action="store_true",
         help=(
@@ -718,6 +768,8 @@ def _forwarded_arguments(
         args.pygame_draw_mode,
         "--timestamp-mode",
         args.timestamp_mode,
+        "--pygame-spin-wait-us",
+        str(args.pygame_spin_wait_us),
         "--width",
         str(args.width),
         "--height",
@@ -729,6 +781,8 @@ def _forwarded_arguments(
         result.append("--windowed")
     if args.disable_gc:
         result.append("--disable-gc")
+    if args.qr_mask_pattern is not None:
+        result.extend(("--qr-mask-pattern", str(args.qr_mask_pattern)))
     return result
 
 

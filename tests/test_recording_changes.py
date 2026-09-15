@@ -283,21 +283,23 @@ class RecordingChangesTests(unittest.TestCase):
             metadata["received_unix_ns"],
             captured_ns + 145_000_000,
         )
-        self.assertEqual(
-            set(metadata),
-            {
-                "frame", "stream_epoch", "pts_ns", "running_time_ns",
-                "received_monotonic_ns", "received_unix_ns",
-                "reference_timestamp_raw_ns", "reference_clock",
-                "reference_ntp_ns", "media_unix_ns",
-                "estimated_exposure_unix_ns", "saved_unix_ns", "flags",
-            },
-        )
-        self.assertEqual(session["schema_version"], 2)
+        self.assertTrue({
+            "timestamp_schema_version", "frame", "stream_epoch", "pts_ns",
+            "running_time_ns", "media_monotonic_ns",
+            "application_arrival_monotonic_ns", "arrival_boundary",
+            "sample_pulled_monotonic_ns", "frame_converted_monotonic_ns",
+            "received_monotonic_ns", "received_unix_ns",
+            "reference_timestamp_raw_ns", "reference_clock",
+            "reference_ntp_ns", "media_unix_ns",
+            "estimated_exposure_unix_ns", "estimated_capture_monotonic_ns",
+            "estimated_arrival_delay_ns", "saved_unix_ns", "flags",
+        }.issubset(metadata))
+        self.assertEqual(session["schema_version"], 3)
         self.assertEqual(session["camera_channel"], 4)
         self.assertEqual(session["image_adjustment_ns"], 250_000_000)
         self.assertEqual(session["epochs"][0]["stream_epoch"], 3)
         self.assertEqual(summary["frames_saved"], 1)
+        self.assertEqual(summary["schema_version"], 3)
         self.assertEqual(summary["frames_dropped_writer_queue"], 0)
         self.assertEqual(summary["unusual_pts_gap_candidates"], 1)
         self.assertEqual(summary["confirmed_frames_not_saved"], 0)
@@ -335,6 +337,26 @@ class RecordingChangesTests(unittest.TestCase):
         self.assertEqual(recorder.frames_dropped, 1)
         self.assertEqual(drops[0]["reason"], "image writer queue is full")
         self.assertEqual(drops[0]["timing"]["pts_ns"], 2)
+
+    def test_invalid_timing_frame_is_retained_as_calibration_event(self):
+        with TemporaryDirectory() as folder:
+            recorder = camera_module.CameraSnapshotRecorder()
+            recorder.start({4: folder}, calibration=True)
+            recorder.note_invalid_timing_frame(
+                reason="frame PTS cannot be mapped to running time",
+                timing={"pts_ns": 123, "application_arrival_monotonic_ns": 456},
+            )
+            recorder.stop()
+            events = [
+                json.loads(line)
+                for line in (
+                    Path(folder) / camera_module.CAMERA_TIMING_EVENTS_NAME
+                ).read_text().splitlines()
+            ]
+
+        self.assertEqual(events[0]["event"], "frame_rejected_invalid_timing")
+        self.assertEqual(events[0]["reason"], "frame PTS cannot be mapped to running time")
+        self.assertEqual(events[0]["timing"]["pts_ns"], 123)
 
     def test_playback_loader_supports_new_and_legacy_metadata(self):
         timestamp = "2026-07-29T12:00:00+00:00"
