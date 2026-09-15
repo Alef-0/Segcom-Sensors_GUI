@@ -21,6 +21,7 @@ from sensors.camera.camera_pipeline import (
 )
 from sensors.camera.camera_reference_clock import ReferenceClockObserver
 from sensors.camera.camera_timebase import FrameTimestampPolicy
+from sensors.camera.timing_defaults import DEFAULT_CAMERA_TIMESTAMP_CORRECTION_MS
 
 gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst
@@ -61,7 +62,7 @@ class GStreamerPipeline:
         self.display_width = DEFAULT_DISPLAY_WIDTH
         self.display_height = DEFAULT_DISPLAY_HEIGHT
         self.pipeline_latency_ms = CAMERA_PIPELINE_LATENCY_MS
-        self.latency_adjustment_ms = 109.0
+        self.latency_adjustment_ms = DEFAULT_CAMERA_TIMESTAMP_CORRECTION_MS
         self.recording_frames_per_30 = CAMERA_FRAME_RATE
         self.calibration_mode = False
         self.calibration_recording = False

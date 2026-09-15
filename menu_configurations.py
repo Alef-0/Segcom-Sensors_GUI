@@ -4,6 +4,7 @@ from pathlib import Path
 import FreeSimpleGUI as sg
 
 from interface_core import Configurations as BaseConfigurations
+from sensors.camera.timing_defaults import DEFAULT_CAMERA_TIMESTAMP_CORRECTION_MS
 
 
 class Configurations(BaseConfigurations):
@@ -293,13 +294,22 @@ class Configurations(BaseConfigurations):
                 sg.Text("Camera latency"),
                 sg.Input("145", key="camera_pipeline_latency", size=(9, 1), justification="right"),
                 sg.Text("Pipeline Adjustment (ms)"),
-                sg.Input("109", key="camera_latency_adjustment", size=(9, 1), justification="right"),
+                sg.Input(
+                    f"{DEFAULT_CAMERA_TIMESTAMP_CORRECTION_MS:.3f}",
+                    key="camera_latency_adjustment",
+                    size=(9, 1),
+                    justification="right",
+                ),
                 sg.Button("APPLY LATENCIES", key="calibration_latency_apply"),
                 sg.Push(),
             ],
             [
                 sg.Push(),
-                sg.Text("Current latencies: 145 ms / 109 ms", key="calibration_latency_status"),
+                sg.Text(
+                    "Current latencies: "
+                    f"145 ms / {DEFAULT_CAMERA_TIMESTAMP_CORRECTION_MS:.3f} ms",
+                    key="calibration_latency_status",
+                ),
                 sg.Text("QR display"),
                 sg.Combo(
                     ("Qt / OpenGL", "Pygame / SDL"),

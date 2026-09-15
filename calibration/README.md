@@ -49,11 +49,14 @@ alignment.
 - `quantitative_analysis.py` compares correction strategies on clean evidence,
   writes the verdict, and creates all graphs with Matplotlib. PNG is the default;
   vector SVG copies are optional.
+- `distance_analysis.py` maps every decoded QR to its predicted and observed
+  software flip, fits an interval-aware host-arrival model, and estimates an
+  observation timestamp for frames with and without readable QR anchors.
 - `intrinsics.json` contains the default camera matrix, distortion coefficients,
   and calibration image size used for undistortion.
 - `../analyze_calibration_recording.py` is the normal entry point. It opens the
-  recording window first and runs the quantitative analyzer after the window
-  has created its two source files and closed.
+  recording window first and runs the distance analyzer after the window has
+  created its saved QR evidence and closed.
 
 ## Recording and analysis workflow
 
@@ -71,8 +74,8 @@ alignment.
    `calibration_analysis.json`, `calibration_frames.csv`, and
    `display_presentations.csv` in a sibling folder named
    `<recording>_analysis`.
-5. Close the inspection window. The root analyzer then creates the quantitative
-   verdict and graphs from those saved files.
+5. Close the inspection window. The root analyzer then creates the chronological
+   QR/flip map and arrival-derived observation timestamps from those saved files.
 
 Run the complete workflow with:
 
@@ -87,21 +90,17 @@ python3 analyze_calibration_recording.py /path/to/recording \
   --intrinsics /path/to/intrinsics.json
 ```
 
-To regenerate only the verdict and graphs from existing analysis files:
+To regenerate only the distance analysis from existing QR analysis files:
+
+```bash
+python3 -m calibration.distance_analysis /path/to/recording
+```
+
+The separate quantitative strategy analyzer can still be run explicitly:
 
 ```bash
 python3 -m calibration.quantitative_analysis /path/to/recording_analysis
 ```
-
-Add `--svg` when running this standalone command to also create vector copies:
-
-```bash
-python3 -m calibration.quantitative_analysis \
-  /path/to/recording_analysis --svg
-```
-
-The application and `analyze_calibration_recording.py` intentionally use the
-PNG-only default.
 
 The QR display can also be started directly:
 
@@ -142,7 +141,7 @@ later 30% is a chronological holdout that is not used to fit parameters.
 
 The report compares five strategies:
 
-- **Current fixed 109 ms** uses the existing correction without fitting.
+- **Current fixed 87.348 ms** uses the provisional default without fitting.
 - **Calibrated fixed median** uses the training median. A median minimizes total
   absolute error and is resistant to occasional large offsets.
 - **Calibrated fixed mean** uses the training mean. A mean minimizes squared
@@ -180,7 +179,18 @@ The inspection window creates:
   presentation return, including display index, cell, interval, prediction
   error, and timing issues.
 
-The quantitative analyzer then creates:
+The distance analyzer then creates:
+
+- `distance_analysis.json` — model parameters, chronological validation,
+  provenance, interval policy, and the complete frame/marker maps;
+- `distance_frames.csv` — one estimated observation timestamp per camera frame,
+  with anchor/interpolation/extrapolation status and PTS comparison;
+- `distance_markers.csv` — every QR observation tied to its display index,
+  predicted flip, observed presentation return, and replacement event.
+- `distance_analysis_overview.png` — fitted interval distance, holdout error,
+  arrival-delay drift, and mixed-generation evidence in one figure.
+
+The root analyzer then automatically runs the quantitative analyzer, which creates:
 
 - `calibration_verdict.md` — readable recommendation and strategy comparison;
 - `calibration_verdict.json` — metrics, fitted parameters, provenance hashes,
@@ -208,7 +218,7 @@ bins. Residual ranges are symmetric around zero.
 - Exclude timing-suspect rows and rows whose QR removal timing is unknown. A QR
   is removed after the configured number of newer visible codes; missing that
   replacement evidence is not a clean transition.
-- A recommended correction replaces the existing `109 ms` subtraction; it is
+- A recommended correction replaces the configured subtraction; it is
   never added to it.
 - The chronological holdout tests a later portion of the same recording. It is
   useful for comparison, but it is not independent session validation.

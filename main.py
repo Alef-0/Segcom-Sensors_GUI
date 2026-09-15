@@ -16,6 +16,7 @@ import application_core as base
 from calibration.qr import GRID_LAYOUTS
 from sensors.camera.camera_gstreamer import gstreamer_main
 from sensors.camera.camera_pipeline import available_decoder_backends
+from sensors.camera.timing_defaults import DEFAULT_CAMERA_TIMESTAMP_CORRECTION_MS
 from sensors.radar.connection_main import create_connection_communication
 from sensors.gps.gps_connection import main as gps_main
 from menu_configurations import Configurations
@@ -101,9 +102,12 @@ def _graph_range(values):
 
 
 def _camera_latency_settings(values):
+    default_adjustment = f"{DEFAULT_CAMERA_TIMESTAMP_CORRECTION_MS:.3f}"
     try:
         pipeline_latency_ms = int(str(values.get("camera_pipeline_latency", "145")).strip())
-        adjustment_ms = float(str(values.get("camera_latency_adjustment", "109")).strip())
+        adjustment_ms = float(
+            str(values.get("camera_latency_adjustment", default_adjustment)).strip()
+        )
     except ValueError as error:
         raise ValueError("Both camera latency values must be numeric") from error
     if pipeline_latency_ms < 0:

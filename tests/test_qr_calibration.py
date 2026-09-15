@@ -846,9 +846,10 @@ class QuantitativeVerdictTests(unittest.TestCase):
 
             self.assertEqual(report["data_quality"]["clean_frames"], 44)
             self.assertEqual(report["data_quality"]["timing_suspect_frames"], 1)
-            self.assertLess(
-                report["verdict"]["recommended_fixed_correction_ms"],
+            self.assertAlmostEqual(
                 report["verdict"]["current_correction_ms"],
+                87.348,
+                places=3,
             )
             self.assertTrue((output / "calibration_verdict.md").is_file())
             self.assertEqual(report["graph_formats"], ["png"])
@@ -877,33 +878,42 @@ class QuantitativeVerdictTests(unittest.TestCase):
                 self.assertIn("<svg", (output / filename).read_text())
                 self.assertIn(filename, svg_report["output_files"])
 
-    def test_root_launcher_does_not_request_svg_graphs(self):
+    def test_root_launcher_passes_recording_and_saved_qr_analysis_to_distance_model(self):
+        recording = Path("/recordings/sample")
         with TemporaryDirectory() as temporary:
             output = Path(temporary)
-            (output / "calibration_verdict.json").write_text(
-                json.dumps({"output_directory": str(output)}), encoding="utf-8"
-            )
+            (output / "distance_analysis.json").write_text("{}", encoding="utf-8")
             with (
                 patch.object(recording_launcher, "matplotlib_environment", return_value={}),
                 patch.object(recording_launcher.subprocess, "run") as run,
             ):
-                recording_launcher._run_quantitative_analysis(output)
-            command = run.call_args.args[0]
-            self.assertNotIn("--svg", command)
+                recording_launcher._run_distance_analysis(recording, output)
 
-    def test_root_launcher_runs_saved_data_verdict_after_the_window(self):
+            command = run.call_args.args[0]
+            self.assertEqual(
+                command[:3],
+                [recording_launcher.sys.executable, "-m", "calibration.distance_analysis"],
+            )
+            self.assertIn(str(recording), command)
+            self.assertIn(str(output), command)
+
+    def test_root_launcher_runs_distance_analysis_after_the_window(self):
         recording = Path("/recordings/sample")
         output = Path("/recordings/sample_analysis")
         with (
             patch.object(recording_launcher, "run_recording_display", return_value=output) as display,
-            patch.object(recording_launcher, "_run_quantitative_analysis", return_value={
+            patch.object(recording_launcher, "_run_distance_analysis", return_value={
                 "output_directory": str(output)
             }) as analyze,
+            patch.object(recording_launcher, "_run_quantitative_analysis", return_value={
+                "output_directory": str(output)
+            }) as quantitative,
             patch("sys.argv", ["analyze_calibration_recording.py", str(recording)]),
         ):
             recording_launcher.main()
         display.assert_called_once()
-        analyze.assert_called_once_with(output)
+        analyze.assert_called_once_with(recording, output)
+        quantitative.assert_called_once_with(output)
 
 
 if __name__ == "__main__":

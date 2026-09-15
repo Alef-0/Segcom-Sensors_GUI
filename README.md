@@ -128,11 +128,12 @@ metadata disciplines that PTS timeline gradually. Missing NTP falls back to
 PTS, large NTP steps require repeated confirmation, and invalid or non-forward
 PTS frames are rejected and counted.
 
-The separate camera latency adjustment defaults to 109 ms. It is subtracted
+The separate camera latency adjustment provisionally defaults to 87.348 ms. It is subtracted
 when associating a camera observation with radar time and is recorded in
 metadata. It does not replace or configure the RTSP jitter buffer. This value
-is a calibration result, so it should be rechecked after changes to the DVR,
-stream session, decoder, network path, or capture setup.
+comes from `recordings/01_calibration`; confirm it on an independent recording
+and recheck it after changes to the DVR, stream session, decoder, network path,
+or capture setup.
 
 See `sensors/camera/README.md` for the pipeline and timestamp policy in more detail.
 
@@ -210,30 +211,30 @@ NTP, and configured grid values are editable without automatically starting a
 scan. Finishing the full scan writes `calibration_analysis.json` and
 `calibration_frames.csv` to a sibling
 `<recording-folder-name>_analysis` directory. After the inspection window is
-closed, the root launcher reads those files and writes a quantitative verdict,
-per-frame strategy predictions, and five Matplotlib graphs as PNG files.
-The histogram figures use one strategy per panel with compact, independently
-adjusted bins and ranges.
+closed, the root launcher maps every decoded QR to its recorded display flip,
+fits the interval-aware frame-arrival model, and writes estimated observation
+times for every camera frame, including frames with QR gaps.
 
 ```bash
 python3 analyze_calibration_recording.py /path/to/calibration-recording
 python3 analyze_calibration_recording.py /path/to/calibration-recording \
   --intrinsics /path/to/intrinsics.json
 
-# Recreate only the verdict from existing analysis files (no window)
+# Recreate only the distance analysis from existing QR analysis files (no window)
+python3 -m calibration.distance_analysis \
+  /path/to/calibration-recording
+
+# Recreate only the quantitative strategy report and its five graphs
 python3 -m calibration.quantitative_analysis \
   /path/to/calibration-recording_analysis
-
-# Also save SVG copies when running the quantitative analyzer directly
-python3 -m calibration.quantitative_analysis \
-  /path/to/calibration-recording_analysis --svg
 ```
 
 For each decoded QR, the analyzer verifies the recorded quadrant and checks both
 its own flip timing and the following replacement. Suspect or missing replacement
 evidence stays visible but is excluded from the clean offset summary. The verdict
-compares 109 ms, calibrated fixed corrections, PTS-step groups, and a six-step
-causal PTS-history model on a chronological 70/30 split. A learned model remains
+compares the current 87.348 ms default, calibrated fixed corrections, PTS-step
+groups, and a six-step causal PTS-history model on a chronological 70/30 split.
+A learned model remains
 experimental until the preselected strategy is confirmed on a later independent
 recording. Readable codes alone do not establish physical exposure time.
 
@@ -278,8 +279,8 @@ See `tests/README.md` for the test-area map.
 | `interface_core.py` | Shared GUI layout and state transitions |
 | `sensors/` | Radar, RTSP camera, timestamp, and GPS integrations |
 | `processing/` | Plotting, filtering, recording, PCD reading, snapshots, and playback |
-| `calibration/` | QR display/decoding, recording viewer, quantitative verdict, and camera intrinsics |
-| `analyze_calibration_recording.py` | Runs the recording viewer, then the saved-data verdict |
+| `calibration/` | QR display/decoding, recording viewer, distance analysis, quantitative tools, and camera intrinsics |
+| `analyze_calibration_recording.py` | Runs the recording viewer, then the arrival-to-observation distance analysis |
 | `convert_to_csv.py` | Recursive PCD-to-CSV export |
 | `content/` | ARS40X technical-documentation extracts |
 | `recordings/` | Generated recording data, kept outside source packages |
@@ -295,8 +296,8 @@ are not independently proven by source alone:
 - The gateway packet timestamp is intentionally ignored in favor of host
   receipt time for radar frame recording.
 - Camera channel 4 is always the calibration camera.
-- The current 109 ms camera adjustment is the intended operational default for
-  this deployment.
+- The provisional 87.348 ms camera adjustment still needs confirmation on an
+  independent recording before it becomes the final deployment default.
 - Snapshot matching should continue to allow up to 500 ms residual error.
 - Recording camera frames into every selected radar folder is the desired data
   duplication model.

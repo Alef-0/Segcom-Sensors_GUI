@@ -108,7 +108,7 @@ Two settings have different purposes:
 
 - Pipeline latency, default 145 ms, configures the GStreamer RTSP jitter
   buffer and causes a pipeline restart when changed while connected.
-- Latency adjustment, default 109 ms, is an application-level camera-to-radar
+- Latency adjustment, provisional default 87.348 ms, is an application-level camera-to-radar
   alignment offset used by recording, snapshots, playback snapshots, and
   calibration metadata.
 

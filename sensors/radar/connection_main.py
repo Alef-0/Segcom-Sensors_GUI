@@ -150,7 +150,10 @@ def create_connection_communication(
 
     try:
         camera_delay_seconds = float(
-            initial_values.get("camera_latency_adjustment", 109)
+            initial_values.get(
+                "camera_latency_adjustment",
+                CAMERA_DELAY_SECONDS * 1000.0,
+            )
         ) / 1000.0
     except (TypeError, ValueError):
         camera_delay_seconds = CAMERA_DELAY_SECONDS

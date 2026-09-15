@@ -15,6 +15,9 @@ from processing.recording.paths import (
     image_reference,
     point_cloud_reference,
 )
+from sensors.camera.timing_defaults import (
+    DEFAULT_CAMERA_TIMESTAMP_CORRECTION_SECONDS,
+)
 
 try:
     from pypcd4 import PointCloud
@@ -105,7 +108,7 @@ OBJECT_PCD_TYPES = LEGACY_OBJECT_PCD_TYPES + (
 PCD_FIELDS = CLUSTER_PCD_FIELDS
 PCD_TYPES = CLUSTER_PCD_TYPES
 RADAR_LETTERS = {1: "A", 2: "B", 3: "C"}
-CAMERA_DELAY_SECONDS = 0.109
+CAMERA_DELAY_SECONDS = DEFAULT_CAMERA_TIMESTAMP_CORRECTION_SECONDS
 METADATA_FLUSH_SECONDS = 1.0
 RECORDING_METADATA_NAME = "recording.json"
 TIMESTAMPS_METADATA_NAME = "timestamps.json"

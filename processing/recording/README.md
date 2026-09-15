@@ -35,7 +35,7 @@ Each selected radar group gets its own folder named
   "frame_type": "cluster or object",
   "camera_frame": "images/camera_000001.jpg or null",
   "camera_recorded_at": "ISO-8601 camera time or null",
-  "camera_delay_ms": 109.0,
+  "camera_delay_ms": 87.348,
   "synchronization_error_ms": 0.0
 }
 ```
@@ -69,8 +69,8 @@ The camera frame is attached to the closest radar record that does not already
 have a camera frame. Pending camera notifications wait until a new-enough radar
 frame exists, or are resolved against available records when recording stops.
 
-The default delay is 109 ms. Metadata stores the actual value used so that a
-recording remains interpretable if the setting changes later.
+The provisional default delay is 87.348 ms. Metadata stores the actual value
+used so that a recording remains interpretable if the setting changes later.
 
 ## Queue and failure behavior
 
@@ -134,7 +134,7 @@ the image path (new recordings use `images/camera_*.jpg`; legacy bare names are
 also accepted), stream epoch, PTS, running time, host receipt clocks, raw and
 interpreted reference timestamp, host-anchored media time, adjusted exposure
 estimate, save time, and flags. Repeated values such as decoder choice,
-pipeline latency, the 109 ms adjustment, and pipeline-zero anchors live in the
+pipeline latency, the 87.348 ms adjustment, and pipeline-zero anchors live in the
 session file.
 
 `media_unix_ns` is computed from the moment the pipeline clock was anchored to

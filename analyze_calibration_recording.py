@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect a QR calibration recording, then create its quantitative verdict."""
+"""Inspect a QR calibration recording, then create its timing reports and graphs."""
 
 from __future__ import annotations
 
@@ -14,6 +14,25 @@ from calibration.recording_display import DEFAULT_INTRINSICS, run_recording_disp
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _run_distance_analysis(recording: Path, output: Path) -> dict:
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "calibration.distance_analysis",
+            str(recording),
+            "--analysis-directory",
+            str(output),
+            "--output-directory",
+            str(output),
+        ],
+        cwd=PROJECT_ROOT,
+        env=matplotlib_environment(),
+        check=True,
+    )
+    return json.loads((output / "distance_analysis.json").read_text(encoding="utf-8"))
 
 
 def _run_quantitative_analysis(output: Path) -> dict:
@@ -40,14 +59,22 @@ def main() -> None:
     output = run_recording_display(arguments.folder, arguments.intrinsics)
     if output is None:
         print(
-            "Quantitative verdict skipped because this window session did not finish "
+            "Distance analysis skipped because this window session did not finish "
             "creating analysis files.",
             flush=True,
         )
         return
 
+    report = _run_distance_analysis(arguments.folder, output)
     verdict = _run_quantitative_analysis(output)
-    print(f"Quantitative verdict saved in {verdict['output_directory']}", flush=True)
+    print(
+        f"Distance analysis saved in {report['output_directory']}",
+        flush=True,
+    )
+    print(
+        f"Quantitative verdict saved in {verdict['output_directory']}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

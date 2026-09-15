@@ -127,6 +127,9 @@ class CalibrationWorkflowTests(unittest.TestCase):
         self.assertFalse(any(type(element).__name__ == "VerticalSeparator"
                              for element in controls))
 
+    def test_camera_timestamp_correction_uses_provisional_default(self):
+        self.assertEqual(main._camera_latency_settings({}), (145, 87.348))
+
     def test_calibration_settings_use_narrow_grouped_rows(self):
         layout = main.Configurations._create_calibration_layout()
         first_row_keys = {getattr(element, "Key", None) for element in layout[0]}
