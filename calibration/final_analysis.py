@@ -9,15 +9,16 @@ Run from the project root (no old verdict/model files are read)::
 
 Recording directories with a sibling ``_analysis`` directory also work. Inputs
 are explicit: unrelated sibling recordings are never added automatically.
-Only this module is needed; NumPy and optional Matplotlib are existing project
-dependencies. ``--no-plots`` avoids Matplotlib. ``--self-test`` runs in memory.
+Run from this checkout with the companion evidence module; NumPy and optional
+Matplotlib are existing dependencies. ``--no-plots`` avoids Matplotlib.
+``--self-test`` runs in memory.
 
 The primary endpoint remains CONDITIONAL: the newest *decoded* code must also
 be the newest displayed generation for its next-refresh interval to be valid.
 Software swap returns are not physical exposure measurements. Wider visibility
 intervals are separate sensitivity checks, never a source of better labels.
-Saved QR identities have already been decoded/remapped by the upstream reader;
-this module cannot recover omitted detections or establish their pixel position.
+Saved QR identities and detection evidence come from the upstream reader;
+this module audits that evidence but cannot recover omitted detections.
 """
 
 from __future__ import annotations
@@ -38,11 +39,18 @@ import tempfile
 
 import numpy as np
 
+if __package__:
+    from calibration.evidence import assess_evidence
+else:
+    # The Matplotlib environment fallback re-executes this file directly.
+    from evidence import assess_evidence
 
-VERSION = 2
+
+VERSION = 3
 HISTORY = 12
 MIN_TRAIN = 40
 MIN_TEST = 20
+MIN_HISTORY_COVERAGE = 0.8
 TARGETS = ("newest_generation", "newest_visibility", "common_visibility")
 FEATURE_NAMES = (
     [f"running_time_gap_lag_{index}_ms" for index in range(HISTORY)]
@@ -320,6 +328,22 @@ def load_session(directory: str | Path) -> Session:
             and 0 < received - previous[2] <= 1_000_000_000
             and not any(previous[2] < pause <= received for pause in pauses)
         )
+        reset_reasons = []
+        if not continuous:
+            if previous is None:
+                reset_reasons.append("first_frame")
+            else:
+                if continuity_key != previous[0]:
+                    reset_reasons.append("stream_mapping_or_segment_changed")
+                if (running_time is None or previous[1] is None
+                        or not 0 < running_time - previous[1] <= 100_000_000):
+                    reset_reasons.append("invalid_or_large_running_time_gap")
+                if (received is None or previous[2] is None
+                        or not 0 < received - previous[2] <= 1_000_000_000):
+                    reset_reasons.append("invalid_or_large_arrival_gap")
+                if (received is not None and previous[2] is not None
+                        and any(previous[2] < pause <= received for pause in pauses)):
+                    reset_reasons.append("display_pause")
         if continuous:
             steps.append((running_time - previous[1]) / 1e6)
             arrivals.append((received - previous[2]) / 1e6)
@@ -384,6 +408,13 @@ def load_session(directory: str | Path) -> Session:
             targets["newest_visibility"] = _bounds(reference, times[latest], times[lifetimes[latest]])
         if usable and compatible:
             targets["common_visibility"] = _bounds(reference, common_start, common_end)
+        diagnostic_interval = targets["newest_generation"]
+        assessment = assess_evidence(
+            decoded_row, indices, transition=bool(complete and not compatible),
+        )
+        if not assessment["primary_usable"]:
+            targets["newest_generation"] = None
+            reasons.extend(assessment["reasons"])
         saved_reference = _integer(decoded_row.get("camera_reference_monotonic_ns"))
         flags = {
             "more_codes_than_configured_visible": len(indices) > visible,
@@ -403,6 +434,8 @@ def load_session(directory: str | Path) -> Session:
         }
         counts.update(key for key, enabled in flags.items() if enabled)
         counts.update(reasons)
+        counts["evidence_" + assessment["status"]] += 1
+        counts.update("history_reset_" + reason for reason in reset_reasons)
         output.append({
             "recording": directory.name, "frame_number": number, "filename": filename,
             "segment": segment, "pts_ns": pts,
@@ -423,6 +456,13 @@ def load_session(directory: str | Path) -> Session:
                 if received is not None and reference is not None else None
             ),
             "features": features,
+            "history_length": len(steps), "history_reset_reasons": reset_reasons,
+            "recorded_timing_flags": camera.get("flags", []),
+            "evidence_assessment": assessment,
+            "qr_evidence": decoded_row.get("qr_evidence"),
+            "decoded_display_indices": indices,
+            "diagnostic_newest_decoded_interval_ms": diagnostic_interval,
+            "image_path": str(recording / filename),
             "targets": targets, "flags": flags, "exclusion_reasons": reasons,
             "decoded_unique_qrs": len(indices), "grid_qrs": grid, "visible_qrs": visible,
             "latest_display_index": latest,
@@ -458,6 +498,7 @@ def load_session(directory: str | Path) -> Session:
     return Session(directory.name, directory, recording, output, provenance,
                    {"counts": dict(counts), "display_period_ms": period,
                     "grid_qrs": grid, "visible_qrs": visible,
+                    "history_support": [_history_support(output, depth) for depth in (1, 3, 6, 12)],
                     "presentation_semantics": metadata.get("presentation_semantics"),
                     "camera_journal_sha256": _hash(camera_path),
                     "unsaved_frame_accounting": {
@@ -620,10 +661,18 @@ def _recipes() -> dict[str, list[dict]]:
 
 
 def _fit(rows: list[dict], recipe: dict, goals: Goals) -> dict:
+    fallback = None
+    if "depth" in recipe:
+        fallback = _interval_constant(_arrays(rows)[1], goals)
+        rows = [row for row in rows if _has_history(row, recipe["depth"])]
+        if len(rows) < MIN_TRAIN:
+            raise ValueError("Insufficient complete timing history for this model")
     x, bounds = _arrays(rows)
     y = np.mean(bounds, axis=1)
     kind = recipe["kind"]
     model = {"recipe": recipe, "training_frames": len(rows)}
+    if fallback is not None:
+        model["fallback_correction_ms"] = fallback
     if kind == "fixed_midpoint":
         correction = float(np.median(y))
         return dict(model, correction_ms=correction)
@@ -702,7 +751,7 @@ def _fit(rows: list[dict], recipe: dict, goals: Goals) -> dict:
     return model
 
 
-def _predict(model: dict, rows: list[dict]) -> np.ndarray:
+def _predict_supported(model: dict, rows: list[dict]) -> np.ndarray:
     recipe = model["recipe"]
     if recipe["kind"] == "cadence_state":
         return np.asarray([
@@ -733,6 +782,34 @@ def _predict(model: dict, rows: list[dict]) -> np.ndarray:
     return np.column_stack((np.ones(len(design)), design)) @ model["coefficients"] + model["shift_ms"]
 
 
+def _has_history(row: dict, depth: int) -> bool:
+    values = np.asarray(row["features"][:depth], dtype=float)
+    return len(values) == depth and bool(np.isfinite(values).all())
+
+
+def _history_support(rows: list[dict], depth: int, *, minimum: int = MIN_TRAIN,
+                     require_variation: bool = True) -> dict:
+    complete = [row for row in rows if _has_history(row, depth)]
+    coverage = len(complete) / len(rows) if rows else 0.0
+    variable = bool(complete) and bool(np.any(np.ptp(
+        np.asarray([row["features"][:depth] for row in complete], dtype=float), axis=0,
+    ) > 1e-6))
+    return {"depth": depth, "complete_frames": len(complete), "total_frames": len(rows),
+            "coverage_pct": coverage * 100, "features_vary": variable,
+            "supported": len(complete) >= minimum and coverage >= MIN_HISTORY_COVERAGE
+                         and (variable or not require_variation)}
+
+
+def _predict(model: dict, rows: list[dict]) -> np.ndarray:
+    if not rows:
+        return np.asarray([], dtype=float)
+    prediction = _predict_supported(model, rows)
+    if "depth" in model["recipe"]:
+        complete = np.asarray([_has_history(row, model["recipe"]["depth"]) for row in rows])
+        prediction = np.where(complete, prediction, model["fallback_correction_ms"])
+    return prediction
+
+
 def _select_models(groups: list[list[dict]], goals: Goals) -> tuple[dict, dict]:
     """Select settings/family on two forward inner folds; never see outer labels."""
     training = [row for group in groups for row in _eligible(group)]
@@ -751,10 +828,23 @@ def _select_models(groups: list[list[dict]], goals: Goals) -> tuple[dict, dict]:
             folds.append((fit_rows, validation_groups))
     if not folds:
         raise ValueError("Insufficient chronological evidence for inner selection; use longer recordings")
-    models, trials = {}, {}
+    models, trials, unsupported = {}, {}, {}
     for family, recipes in _recipes().items():
         trials[family] = []
+        unsupported[family] = []
         for recipe in recipes:
+            if "depth" in recipe:
+                support = [_history_support(training, recipe["depth"])]
+                for fit_rows, validation_groups in folds:
+                    support.append(_history_support(fit_rows, recipe["depth"]))
+                    support.extend(_history_support(
+                        group, recipe["depth"], minimum=MIN_TEST, require_variation=False,
+                    ) for group in validation_groups)
+                if not all(item["supported"] for item in support):
+                    unsupported[family].append({"recipe": recipe,
+                                               "reason": "insufficient_continuous_or_variable_history",
+                                               "support": support})
+                    continue
             results = []
             for fit_rows, validation_groups in folds:
                 model = _fit(fit_rows, recipe, goals)
@@ -765,15 +855,17 @@ def _select_models(groups: list[list[dict]], goals: Goals) -> tuple[dict, dict]:
                     results.append(score)
             trials[family].append({"recipe": recipe, "fold_metrics": results,
                                    "worst_fold_rank": list(max(_rank(m, goals) for m in results))})
+        if not trials[family]:
+            continue
         choice = min(trials[family], key=lambda trial: tuple(trial["worst_fold_rank"]))
         models[family] = _fit(training, choice["recipe"], goals)
     # Escalate model complexity only when the simpler causal family fails the
     # strict inner-fold goals. Comparison baselines are never silently promoted.
-    deployable_families = (
+    deployable_families = [key for key in (
         "model_a_constant",
         "model_b_cadence_state",
         "model_c_interval_history",
-    )
+    ) if key in models]
     family = None
     for candidate in deployable_families:
         choice = min(
@@ -793,7 +885,9 @@ def _select_models(groups: list[list[dict]], goals: Goals) -> tuple[dict, dict]:
             ),
         )
     models["preselected"] = models[family]
-    return models, {"selected_family": family, "inner_folds": len(folds), "trials": trials}
+    return models, {"selected_family": family, "inner_folds": len(folds), "trials": trials,
+                    "unsupported_recipes": unsupported,
+                    "history_support": [_history_support(training, depth) for depth in (1, 3, 6, 12)]}
 
 
 def _block_uncertainty(rows: list[dict], absolute: np.ndarray, goals: Goals) -> dict:
@@ -848,6 +942,8 @@ def _evaluate(model: dict, rows: list[dict], goals: Goals) -> tuple[dict, list[d
     records = []
     for index, (row, predicted) in enumerate(zip(rows, prediction_all)):
         valid = bool(valid_estimate[index])
+        history_fallback = ("depth" in model["recipe"]
+                            and not _has_history(row, model["recipe"]["depth"]))
         interval = row["targets"]["newest_generation"]
         error = None
         if valid and interval is not None:
@@ -870,7 +966,8 @@ def _evaluate(model: dict, rows: list[dict], goals: Goals) -> tuple[dict, list[d
             "frame_number": row["frame_number"],
             "filename": row["filename"],
             "estimate_valid": valid,
-            "estimate_status": "valid" if valid else "model_returned_nonfinite",
+            "estimate_status": ("model_returned_nonfinite" if not valid else
+                                "constant_fallback_missing_history" if history_fallback else "valid"),
             "correction_ms": float(predicted) if valid else None,
             "estimated_capture_monotonic_ns": capture,
             "observable_arrival_minus_media_ms": row.get(
@@ -888,9 +985,11 @@ def _evaluate(model: dict, rows: list[dict], goals: Goals) -> tuple[dict, list[d
                 bool(abs(error) < goals.threshold_ms) if error is not None else None
             ),
             "residual_display_periods": (
-                int(round(error / row["display_period_ms"]))
+                float(error / row["display_period_ms"])
                 if error is not None else None
             ),
+            "evidence_status": row.get("evidence_assessment", {}).get("status", "unspecified"),
+            "evidence_reasons": row.get("evidence_assessment", {}).get("reasons", []),
         })
     if not eligible:
         return {
@@ -917,6 +1016,12 @@ def _evaluate(model: dict, rows: list[dict], goals: Goals) -> tuple[dict, list[d
                       np.abs(residual) < goals.threshold_ms)) / len(rows),
                   enough_evaluation_frames=len(eligible) >= MIN_TEST,
                   uncertainty=_block_uncertainty(eligible, np.abs(residual), goals))
+    finite_predictions = prediction_all[valid_estimate]
+    result["prediction_range_ms"] = [float(np.min(finite_predictions)), float(np.max(finite_predictions))]
+    result["history_fallback_frames"] = sum(
+        row["estimate_status"] == "constant_fallback_missing_history" for row in records
+    )
+    result["evidence_status_counts"] = dict(Counter(row["evidence_status"] for row in records))
     result["every_camera_frame_verified"] = bool(
         len(eligible) == len(rows)
         and not np.any(~valid_estimate)
@@ -1043,6 +1148,25 @@ def analyze_directories(directories: list[str | Path], *, goals: Goals | None = 
         row.get("metrics", {}).get("every_camera_frame_verified", False)
         for row in primary
     )
+    selected_checks = [row for row in experiments if row.get("strategy") == "preselected"]
+    failed_accuracy = any(row.get("metrics", {}).get("status") == "evaluated"
+                          and not row["metrics"]["conditional_goal_passed"] for row in selected_checks)
+    missing_evidence = (any(s.audit["counts"]["primary_scored_frames"] < len(s.frames) for s in sessions)
+                        or any(row.get("status") == "insufficient_training_evidence" for row in experiments))
+    blockers = []
+    if missing_evidence:
+        blockers.append("insufficient_trustworthy_evidence")
+    if failed_accuracy:
+        blockers.append("accuracy_criteria_failed")
+    if len(components) < 2:
+        blockers.append("missing_independent_stream_validation")
+    elif not independent_pass:
+        blockers.append("independent_validation_not_passed")
+    verdict_status = ("accuracy_criteria_failed" if failed_accuracy else
+                      "insufficient_trustworthy_evidence" if missing_evidence else
+                      "needs_independent_stream_evidence" if len(components) < 2 else
+                      "conditional_goals_met_all_frames_exposure_unverified" if independent_every_frame_verified else
+                      "independent_validation_not_passed")
     return {
         "schema_version": VERSION, "generated_at": datetime.now().astimezone().isoformat(),
         "goals": {"median_absolute_below_ms": goals.median_ms, "absolute_below_ms": goals.threshold_ms,
@@ -1051,10 +1175,10 @@ def analyze_directories(directories: list[str | Path], *, goals: Goals | None = 
                   "strict_threshold_comparison": True},
         "feature_order": FEATURE_NAMES,
         "evidence_policy": {
-            "primary": "Newest decoded generation to next presentation; conditional on no missed newer QR",
+            "primary": "Newest decoded generation to next presentation only with saved pixel evidence and no known ambiguity; still conditional on no undetected newer QR",
             "sensitivity": "Newest-marker lifetime and common lifetime of all markers; never used for selection",
             "contradiction": "Empty common visibility is unexplained; do not attribute it automatically to rolling shutter",
-            "saved_input_limit": "QR values were decoded/remapped upstream; original pixels and omitted detections are not reassessed",
+            "saved_input_limit": "Legacy inputs without detection evidence are unscorable until decoding is rerun. Diagnostic intervals are retained, never used to select or score models. Fully undetected/cropped codes remain a limitation.",
             "features": "Causal segment-running-time gaps plus recorded application-arrival gaps, arrival-minus-media state, and rolling diagnostics; deployed correction families use running-time history only",
             "forbidden_predictors": "QR values, cell IDs, display indices, absolute recording time, old fitted corrections",
             "reference": "Saved media monotonic time or pipeline-zero monotonic plus segment-mapped running time; raw PTS is legacy-only fallback",
@@ -1062,7 +1186,7 @@ def analyze_directories(directories: list[str | Path], *, goals: Goals | None = 
             "selection": "Two forward inner folds; advance from constant to cadence state to interval-regularized history only when simpler strict goals fail; freeze before outer scoring",
             "purge_frames": HISTORY, "primary_holdout_fraction": 0.3,
             "fit_target": "Primary models minimize distance outside permissible correction intervals; midpoint and neighbor fits remain labeled comparison baselines",
-            "missing_features": "Training-only median imputation plus explicit missing indicators; reset history at gaps/epochs/pauses",
+            "missing_features": "History recipes require at least 80% complete history, sufficient frames and variable training features in every inner split. Fit complete histories only; report constant fallback on incomplete evaluation histories. Preserve mapping/epoch/pause resets.",
             "uncertainty": "Report midpoint error, worst-endpoint error, interval width and block resampling alongside interval distance",
         },
         "sessions": [{"name": s.name, "recording_directory": str(s.recording),
@@ -1076,12 +1200,43 @@ def analyze_directories(directories: list[str | Path], *, goals: Goals | None = 
             "conditional_independent_goals_passed": bool(independent_pass),
             "independent_every_frame_verified": bool(independent_every_frame_verified),
             "physical_accuracy_established": False,
-            "status": ("conditional_goals_met_all_frames_exposure_unverified" if independent_every_frame_verified else
-                       "conditional_goals_met_incomplete_qr_coverage" if independent_pass else
-                       "needs_independent_stream_evidence" if len(components) < 2 else "conditional_goals_not_met"),
+            "status": verdict_status,
+            "blocking_reasons": blockers,
+            "evidence_complete": not missing_evidence,
+            "scored_accuracy_criteria_failed": failed_accuracy,
             "explanation": "Strict maximum and median results apply only to defensibly scored software-marker intervals; unscorable frames and physical exposure timing remain explicit limitations",
         },
     }
+
+
+def _diagnostic_rows(report: dict) -> list[dict]:
+    selected = defaultdict(list)
+    for prediction in report["predictions"]:
+        if prediction["strategy"] == "preselected":
+            selected[(prediction["recording"], prediction["frame_number"])].append(prediction)
+    output = []
+    for frame in report["frames"]:
+        assessment = frame["evidence_assessment"]
+        evidence = frame.get("qr_evidence") or {}
+        for prediction in selected.get((frame["recording"], frame["frame_number"]), [{}]):
+            output.append({
+                "recording": frame["recording"], "frame_number": frame["frame_number"],
+                "image_path": frame["image_path"], "experiment": prediction.get("experiment", "not_fitted"),
+                "decoded_indices": frame["decoded_display_indices"],
+                "evidence_status": assessment["status"], "reasons": frame["exclusion_reasons"],
+                "unreadable_groups": evidence.get("unreadable_groups"),
+                "clipped_regions": [d["bbox"] for d in evidence.get("detections", []) if d.get("clipped")],
+                "geometry_status": evidence.get("geometry", {}).get("status", "unavailable"),
+                "primary_interval_ms": frame["targets"]["newest_generation"],
+                "diagnostic_only_interval_ms": frame["diagnostic_newest_decoded_interval_ms"],
+                "correction_ms": prediction.get("correction_ms"),
+                "signed_error_ms": prediction.get("interval_residual_ms"),
+                "display_periods": prediction.get("residual_display_periods"),
+                "history_length": frame["history_length"],
+                "history_reset_reasons": frame["history_reset_reasons"],
+                "recorded_timing_flags": frame["recorded_timing_flags"],
+            })
+    return output
 
 
 def _markdown(report: dict) -> str:
@@ -1103,11 +1258,25 @@ def _markdown(report: dict) -> str:
                      f"{counts.get('recording_summary_frames_rejected_invalid_timing', 0)} | "
                      f"{counts.get('recording_summary_frames_dropped_writer_queue', 0)} | "
                      f"{counts.get('more_codes_than_configured_visible', 0)} | {counts.get('visibility_contradiction', 0)} |")
+    lines.extend(["", "## Evidence coverage and timing history", "",
+                  "Ambiguous frames remain in the camera-frame denominator. Missing pixel evidence requires rerunning decoding; it is not evidence of camera latency."])
+    for session in report["sessions"]:
+        counts = session["audit"]["counts"]
+        statuses = {key.removeprefix("evidence_"): value for key, value in counts.items()
+                    if key.startswith("evidence_")}
+        resets = {key.removeprefix("history_reset_"): value for key, value in counts.items()
+                  if key.startswith("history_reset_")}
+        lines.extend(["", f"- **{session['name']}**: evidence {statuses}; history resets {resets}."])
+        for support in session["audit"].get("history_support", []):
+            lines.append(f"  - Depth {support['depth']}: {support['coverage_pct']:.1f}% complete; "
+                         f"variable features: {support['features_vary']}; supported: {support['supported']}.")
+    lines.extend(["", "Blocking reasons: " + ", ".join(report["verdict"].get("blocking_reasons", [])) + "."])
     lines.extend(["", "## Models selected before evaluation", "",
                   "These rows use the model family and settings selected inside the training data. "
                   "All competing families are exported separately; the best outer result is not rebranded as a validated winner.", "",
                   "| Check | Source → target | Selected family | Median | Maximum | At/above threshold | No QR interval | Goal pass |",
                   "|---|---|---|---:|---:|---:|---:|---|"])
+    prediction_notes = []
     for row in report["experiments"]:
         if row.get("strategy") != "preselected" or row["status"] != "evaluated":
             continue
@@ -1116,6 +1285,25 @@ def _markdown(report: dict) -> str:
                      f"{row['selected_family']} | {m['median_absolute_ms']:.3f} | "
                      f"{m['maximum_absolute_ms']:.3f} | {m['errors_at_or_above_threshold']} | "
                      f"{m['frames_without_defensible_qr_interval']} | {m['conditional_goal_passed']} |")
+        prediction_notes.append(f"- {row['kind']} / {row['target']}: prediction range "
+                     f"{m['prediction_range_ms'][0]:.3f}–{m['prediction_range_ms'][1]:.3f} ms; "
+                     f"constant fallback frames: {m['history_fallback_frames']}; "
+                     f"scored coverage: {m['scored_camera_pct']:.1f}%; "
+                     f"below threshold / all camera frames: {m['below_threshold_all_camera_lower_bound_pct']:.1f}%.")
+    lines.extend(["", *prediction_notes])
+    diagnostics = _diagnostic_rows(report)
+    worst = sorted((row for row in diagnostics if row["signed_error_ms"] is not None),
+                   key=lambda row: abs(row["signed_error_ms"]), reverse=True)[:20]
+    ambiguous = [row for row in diagnostics if row["evidence_status"] != "usable_conditional"][:20]
+    for title, rows in (("Largest scored errors", worst), ("Ambiguous evidence examples", ambiguous)):
+        lines.extend(["", "## " + title, "", "All frame diagnostics are exported in final_analysis_diagnostics.csv.", "",
+                      "| Image | Check | Decoded indices | Evidence | Correction ms | Signed error ms | Display periods | Reasons |",
+                      "|---|---|---|---|---:|---:|---:|---|"])
+        for row in rows:
+            link = Path(row["image_path"]).as_uri()
+            lines.append(f"| [{row['recording']} / {row['frame_number']}]({link}) | {row['experiment']} | "
+                         f"{row['decoded_indices']} | {row['evidence_status']} | {row['correction_ms']} | "
+                         f"{row['signed_error_ms']} | {row['display_periods']} | {', '.join(row['reasons'])} |")
     skipped = [row for row in report["experiments"] if row["status"] != "evaluated"]
     lines.extend(["", "## Stream groups", "", *[f"- {', '.join(group)}" for group in report["stream_groups"]], "",
                   "Unknown stream identities cannot pass independent validation. All recordings sharing any stream epoch "
@@ -1180,7 +1368,11 @@ def _plot(report: dict, output: Path, svg: bool) -> list[str]:
         axis.set(title=f"{session['name']}: chronological holdout (conditional QR interval)",
                  xlabel="Absolute distance outside interval (ms)", ylabel="Frames at or below error (%)",
                  xlim=(0, None), ylim=(0, 101))
-        axis.legend(fontsize=8)
+        if axis.get_legend_handles_labels()[0]:
+            axis.legend(fontsize=8)
+        else:
+            axis.text(0.5, 0.5, "Insufficient usable evidence for model evaluation",
+                      ha="center", transform=axis.transAxes)
         axis.grid(alpha=0.2)
     save(figure, "final_analysis_residual_cdf")
     results = [row for row in report["experiments"] if row.get("strategy") == "preselected"
@@ -1248,12 +1440,13 @@ def write_report(report: dict, output_directory: str | Path, *, plots: bool = Tr
     output = Path(output_directory).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     files = ["final_analysis.json", "final_analysis.md", "final_analysis_frames.csv",
-             "final_analysis_predictions.csv", "final_analysis_results.csv"]
+             "final_analysis_predictions.csv", "final_analysis_results.csv", "final_analysis_diagnostics.csv"]
     if plots:
         files.extend(_plot(report, output, svg))
     report = dict(report, output_directory=str(output), output_files=files)
     _write_csv(output / "final_analysis_frames.csv", report["frames"])
     _write_csv(output / "final_analysis_predictions.csv", report["predictions"])
+    _write_csv(output / "final_analysis_diagnostics.csv", _diagnostic_rows(report))
     _write_csv(output / "final_analysis_results.csv", [
         {**{key: value for key, value in row.items() if key != "metrics"}, **row.get("metrics", {})}
         for row in report["experiments"]])
@@ -1321,6 +1514,8 @@ def _self_test() -> None:
                         "received_monotonic_ns": epoch_zero + pts + 150_000_000})
         payload = f"{(epoch_zero + latest * 10_000_000) // 1_000_000 % 1_000_000_000_000:012d}"
         decoded.append({"filename": filename, "qr_values_ms": [payload, None],
+                        "qr_evidence": {"version": 1, "detections": [{"display_index": latest}],
+                                        "geometry": {"status": "unavailable"}},
                         "validation": "rejected_by_old_assumption", "offset_interval_lower_ms": -9999,
                         "offset_interval_upper_ms": -9998})
     files = {analysis / "calibration_analysis.json": {"recording_directory": str(root), "frames": decoded},

@@ -240,6 +240,68 @@ For example, residuals of `+6 ms` and `-6 ms` both have an absolute residual of
 value met or improved upon by 95% of evaluated frames, so it exposes uncommon
 large errors that an average can hide.
 
+## Evidence quality in final analysis (schema 3)
+
+The newest decoded QR is not necessarily the newest displayed QR. The final
+analyzer now separates readable identities from usable timing evidence:
+
+- `usable_conditional`: saved detections have no known clipping, unresolved
+  regions, identity conflict, geometry disagreement, or visibility contradiction.
+  This still assumes there is no completely undetected newer code; it does not
+  establish physical exposure timing.
+- `potentially_missing_newer_generation`: an unreadable/clipped region, conflicting
+  identity, manual override, or invalid screen mapping prevents a narrow interval.
+- `multiple_generation_transition`: decoded marker lifetimes have no common
+  visibility interval. The cause is not automatically attributed to rolling shutter.
+- `unknown_pixel_evidence`: legacy evidence lacks the saved detection audit.
+- `no_reference`: there is no uniquely matched QR.
+
+Every frame remains in the report and coverage denominator. Ambiguous intervals
+are retained as `diagnostic_newest_decoded_interval_ms`, but are not training labels
+or primary scores. No generation is chosen by minimizing prediction error, and no
+frame is removed based on its residual. Rerun the decoding stage to populate
+`qr_evidence` for old recordings; running final analysis alone cannot recreate it.
+The JSON stores every detection's box, original-image coordinates, confidence,
+payload, journal identity, clipping status and overlap group. An unreadable retry
+overlapping a readable detection is not counted as a separate missing QR.
+
+History models require at least 80% complete history and enough frames in each
+inner fit/validation split, with variable training features. They fit complete
+histories only. Unsupported recipes are recorded and the constant baseline remains
+available. Evaluation frames missing history use an explicitly reported constant
+fallback. Mapping revisions, epochs, gaps and pauses still reset history; this does
+not repair the recorder's clock-identity problem. Reports include reset reasons,
+history coverage, prediction ranges, evidence coverage and all-camera success rates.
+
+Optional screen mapping uses `analysis_screen_geometry.json` in the recording
+directory. It changes position checks, not QR identities. Coordinates must refer
+to the **undistorted** image at the selected alpha, ordered top-left, top-right,
+bottom-right, bottom-left. For example (replace with measured coordinates):
+
+```json
+{
+  "default": {
+    "image_size": [1920, 1080],
+    "undistortion_alpha": 0.25,
+    "corners": [[300, 150], [1600, 180], [1650, 950], [250, 920]]
+  },
+  "frames": {}
+}
+```
+
+`frames` may map an exact journal filename, such as `images/camera_000421.jpg`,
+to an overriding entry with the same fields (or `null` to mark it unavailable).
+Without mapping, position checks retain the legacy camera-image grid and the
+report records geometry as unverified. Invalid polygons, changed image size/alpha,
+clipped screen corners and mapped-cell/journal disagreement flag the evidence.
+Movement that happens to preserve cell assignments is not automatically detectable;
+recalibrate the corners after movement. Fully cropped codes cannot be recovered.
+
+The final verdict lists separate blockers for insufficient trustworthy evidence,
+failed accuracy criteria and missing independent validation. The strict median
+and maximum thresholds are unchanged. A passing subset cannot establish accuracy
+for ambiguous frames or for physical exposure time.
+
 ## Generated files
 
 The inspection window creates:
@@ -258,6 +320,10 @@ The root analyzer creates an analysis-local `final_analysis/` directory with:
 - `final_analysis_predictions.csv` — every valid/invalid estimate, QR interval,
   interval residual, estimated capture time, `A-M`, and estimated arrival delay;
 - `final_analysis_results.csv` — one row per model/evaluation pair;
+- `final_analysis_diagnostics.csv` — every frame, image path, decoded indices,
+  evidence reasons, clipped/unreadable regions, timing resets and selected-model
+  predictions/errors when available; the Markdown report links worst scored frames
+  and ambiguous examples;
 - `final_analysis_residual_cdf.png` — held-out absolute interval errors;
 - `final_analysis_overview.png` — strict maximum and median results;
 - `final_analysis_interval_error_histograms.png` — one signed interval-error

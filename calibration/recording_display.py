@@ -24,6 +24,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from calibration.display_qt import DISPLAY_JOURNAL_NAME, timing_issues
+from calibration.evidence import assess_evidence, detection_evidence, screen_cell, screen_geometry
 from calibration.qr import (
     DETECTION_BATCH_SIZE,
     create_qreader,
@@ -465,6 +466,13 @@ class RecordingAnalyzer:
         self.cache: OrderedDict[tuple[int, float], dict] = OrderedDict()
         self.cache_limit = DETECTION_BATCH_SIZE * 2
         self.manual_values: dict[int, dict] = {}
+        geometry_path = self.folder / "analysis_screen_geometry.json"
+        self.screen_geometry_config = (
+            json.loads(geometry_path.read_text(encoding="utf-8"))
+            if geometry_path.is_file() else None
+        )
+        if self.screen_geometry_config is not None and not isinstance(self.screen_geometry_config, dict):
+            raise ValueError("analysis_screen_geometry.json must contain an object")
 
     def pts_monotonic_ns(self, row: dict) -> int | None:
         for key in ("frame_monotonic_ns", "captured_monotonic_ns"):
@@ -800,6 +808,16 @@ class RecordingAnalyzer:
             (undistorted.shape[1], undistorted.shape[0]),
             self.grid_qrs,
         )
+        geometry = screen_geometry(
+            self.screen_geometry_config, row["filename"],
+            (undistorted.shape[1], undistorted.shape[0]), alpha,
+        )
+        for detection in detections:
+            mapped_cell = screen_cell(detection["center"], geometry, self.cell_positions)
+            detection["screen_cell"] = mapped_cell
+            detection["position_basis"] = "screen_geometry" if mapped_cell is not None else "camera_image_grid"
+            if mapped_cell is not None:
+                detection["cell"] = mapped_cell
         reference_ns = self.pts_monotonic_ns(row)
         observations = []
         for detection in detections:
@@ -842,6 +860,9 @@ class RecordingAnalyzer:
             "original": original,
             "undistorted": undistorted,
             "observations": observations,
+            "qr_evidence": detection_evidence(
+                observations, (undistorted.shape[1], undistorted.shape[0]), geometry,
+            ),
             "latest": latest,
             "pts_monotonic_ns": reference_ns,
         }
@@ -958,6 +979,7 @@ class RecordingAnalyzer:
                     "validation": validation,
                     "reason": check["reason"],
                     "manual_values": bool(values["manual"]),
+                    "qr_evidence": result.get("qr_evidence"),
                     "pts_ns": values["pts_ns"],
                     "ntp_ns": values["ntp_ns"],
                     "grid_qrs": self.grid_qrs,
@@ -1025,6 +1047,11 @@ class RecordingAnalyzer:
                         "offset_interval_upper_ms"
                     ),
                 }
+                indices = frame_report["display_indices"]
+                frame_report["evidence_assessment"] = assess_evidence(
+                    frame_report, indices,
+                    transition=bool(indices and max(indices) - min(indices) >= self.timeline.visible_qrs),
+                )
                 if self.grid_qrs == 4:
                     frame_report.update({
                         "qr_top_left_ms": values["qrs"][0],
