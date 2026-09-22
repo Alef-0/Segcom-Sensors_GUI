@@ -45,6 +45,10 @@ class CalibrationWorkflowTests(unittest.TestCase):
             self.assertEqual(display_options["screen_index"], 0)
             self.assertEqual(display_options["visible_qrs"], 2)
             self.assertEqual(display_options["grid_qrs"], 4)
+            self.assertEqual(
+                display_options["qr_mask_pattern"],
+                main.CALIBRATION_QR_MASK_PATTERN,
+            )
             self.assertEqual(display_options["display_backend"], "qt")
             self.assertNotIn("visible_frames", display_options)
             main._service_calibration(config, runtime, camera)
@@ -98,6 +102,10 @@ class CalibrationWorkflowTests(unittest.TestCase):
         self.assertEqual(display_options["screen_index"], 1)
         self.assertEqual(display_options["grid_qrs"], 12)
         self.assertEqual(display_options["visible_qrs"], 8)
+        self.assertEqual(
+            display_options["qr_mask_pattern"],
+            main.CALIBRATION_QR_MASK_PATTERN,
+        )
         self.assertEqual(display_options["refresh_hz"], 144.0)
 
     def test_calibration_layout_has_fixed_qr_mode_without_amount_control(self):
@@ -258,10 +266,13 @@ class CalibrationWorkflowTests(unittest.TestCase):
             "visible_qrs": 8,
         }
 
-        with patch(
-            "calibration.display.run_calibration_display",
-            return_value=None,
-        ) as run_display:
+        with (
+            patch(
+                "calibration.display.run_calibration_display",
+                return_value=None,
+            ) as run_display,
+            patch.object(main, "CalibrationSchedulerPriority") as priority,
+        ):
             main._run_calibration_clock_process(stop_event, error_queue, options)
 
         run_display.assert_called_once_with(
@@ -271,6 +282,8 @@ class CalibrationWorkflowTests(unittest.TestCase):
             visible_qrs=8,
         )
         error_queue.put.assert_not_called()
+        priority.assert_called_once_with("QR calibration display")
+        priority.return_value.enable.assert_called_once_with()
 
     def test_grid_and_visible_qr_selections_are_validated_together(self):
         self.assertEqual(main._calibration_grid_qrs({

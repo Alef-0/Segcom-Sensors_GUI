@@ -51,20 +51,16 @@ alignment.
   each decoded newest QR was active, lists intervening display events between
   camera frames, and classifies stable, boundary-transition, stale, and future
   observations. Frame-arrival intervals remain separate transport diagnostics.
-- `quantitative_analysis.py` compares correction strategies on clean evidence,
-  writes the verdict, and creates all graphs with Matplotlib. PNG is the default;
-  vector SVG copies are optional.
-- `distance_analysis.py` maps every decoded QR to its predicted and observed
-  software flip, fits an interval-aware host-arrival model, and estimates an
-  observation timestamp for frames with and without readable QR anchors.
-- `final_analysis.py` is the current integrated estimator evaluation. It uses
-  raw journals, segment-mapped media time, strict maximum/median interval goals,
-  explicit stream holdouts, and causal model inputs.
-- `intrinsics.json` contains the default camera matrix, distortion coefficients,
-  and calibration image size used for undistortion.
-- `../analyze_calibration_recording.py` is the normal entry point. It opens the
-  recording window first and runs only the final analyzer after the window has
-  created its saved QR evidence and closed.
+- `final_analysis.py` now contains only journal reconstruction, stream grouping,
+  and conditional interval scoring. Model fitting and its old CLI were retired.
+- `../analyze_pts_anchor.py` calibrates one laboratory offset and evaluates it on
+  independent streams without test-time recalibration.
+- `quantitative_analysis.py` is the pre-branch legacy comparison tool, restored
+  without the branch's added models. It is outside the anchor workflow and its
+  historical default must not be treated as the current calibration.
+- `intrinsics.json` supplies camera intrinsics for undistortion.
+- `../analyze_calibration_recording.py` opens the inspection window, saving QR
+  evidence. It evaluates only when given a previously frozen `--offset-file`.
 
 ## Recording and analysis workflow
 
@@ -73,49 +69,35 @@ alignment.
    the complete recording, then close it so its journal is flushed.
 2. Open **Visualization** for the recording, or start the root analyzer from a
    terminal.
-3. Review the initially decoded frame. Correct editable PTS, NTP, or QR values
+3. If `<recording>_analysis/calibration_analysis.json` exists, the window first
+   loads the saved QR values by image filename and any compatible saved boxes.
+   Browsing these results does not run QReader or overwrite files. Missing frames
+   in a partial analysis are labeled as having no saved results. Otherwise the
+   current image is decoded as before. Correct editable PTS, NTP, or QR values
    only when the recording visibly supports the correction.
-4. Select **GO — DECODE FULL FOLDER**. Each frame is shown as it finishes
+4. Select **GO — DECODE FULL FOLDER** to explicitly start a fresh decode,
+   replacing the saved analysis when the scan is saved. Each frame is shown as it finishes
    decoding. Frames without any valid readable QR are skipped; other readable
    values remain usable even when several grid cells are unreadable. When the
    scan finishes, it automatically creates
    `calibration_analysis.json`, `calibration_frames.csv`, and
    `display_presentations.csv` in a sibling folder named
    `<recording>_analysis`.
-5. Close the inspection window. The root analyzer then creates the final
-   interval-constrained report and per-model graphs from those saved files.
-
-Run the complete workflow with:
+5. Close the inspection window after a completed scan. Saved evidence is ready
+   for laboratory calibration or independent evaluation. The GUI does not fit
+   an offset automatically. Reviewing saved results does not rewrite them.
 
 ```bash
 python3 analyze_calibration_recording.py /path/to/recording
-```
-
-Use another intrinsic calibration when needed:
-
-```bash
 python3 analyze_calibration_recording.py /path/to/recording \
-  --intrinsics /path/to/intrinsics.json
+  --intrinsics /path/to/intrinsics.json --offset-file /path/to/offset-v1.json
+python3 analyze_pts_anchor.py calibrate /path/to/lab_analysis \
+  --minimum-stream-age-seconds 30 --output /path/to/offset-v1.json
+python3 analyze_pts_anchor.py evaluate /path/to/test_analysis \
+  --offset-file /path/to/offset-v1.json --output-directory /path/to/anchor-report
 ```
 
-To regenerate final analysis from explicit existing QR analysis folders:
-
-```bash
-python3 -m calibration.final_analysis /path/to/recording_analysis \
-  --output-directory /path/to/final_analysis
-```
-
-The older distance analysis can still be run explicitly:
-
-```bash
-python3 -m calibration.distance_analysis /path/to/recording
-```
-
-The separate quantitative strategy analyzer can still be run explicitly:
-
-```bash
-python3 -m calibration.quantitative_analysis /path/to/recording_analysis
-```
+See [ANCHOR_EXPERIMENT.md](ANCHOR_EXPERIMENT.md) for the predeclared protocol.
 
 The QR display can also be started directly:
 
@@ -159,119 +141,48 @@ be converted to the host monotonic clock through a recorded stream epoch.
 The analyzer reads source images without modifying them. Undistortion is applied
 only to the in-memory image used for inspection and decoding.
 
-## Final analysis strategies
+## Evidence quality in anchor evaluation
 
-`analyze_calibration_recording.py` now launches only
-`calibration.final_analysis` after the inspection window. The final analyzer
-reconstructs the media reference from saved `media_monotonic_ns` or from the
-recorded pipeline-zero anchor plus segment-mapped `running_time_ns`; raw PTS is
-used only for legacy recordings that lack running-time data.
-
-The primary model sequence is deliberately simple:
-
-- **Model A: constant interval correction** fits one correction against the
-  permissible QR intervals.
-- **Model B: cadence state** uses only causal mapped-running-time gaps. Arrival
-  state remains separate: `q=A-M`, and estimated arrival delay is `q+c`.
-- **Model C: regularized interval history** uses causal mapped-running-time
-  history and minimizes distance outside the training intervals. It advances
-  beyond simpler models only when their inner chronological checks fail.
-
-Midpoint and nearest-neighbor strategies remain labeled comparison baselines.
-QR identities, cells, display indices, recording identity, future frames, and
-absolute recording time are not runtime predictors. Application-arrival gaps,
-queue occupancy, and `A-M` are retained as diagnostics but cannot move the
-capture estimate merely because downstream delivery was delayed.
-
-The primary pass rule is strict: maximum absolute interval error must be below
-10 ms and median absolute interval error below 5 ms. A single defensibly scored
-frame at or above 10 ms fails the evaluation. MAE, P95, P99, the number and
-proportion at or above 10 ms, unscorable frames, invalid estimates, interval
-widths, and distance to the farther interval endpoint are supplementary report
-fields. A finite test result is evidence for those recordings, not a guarantee
-for future road conditions.
-
-## Legacy standalone quantitative strategies
-
-Every accepted frame with finite ordered presentation bounds is retained;
-timing flags and partial QR readability remain explicit diagnostics. Legacy
-reports without interval bounds fall back only to clean finite offsets. The
-first 70% of usable frames is the training portion and the later 30% is a
-chronological holdout that is not used to fit parameters.
-
-The report compares these strategies:
-
-- **Current fixed 87.348 ms** uses the provisional default without fitting.
-- **Calibrated fixed median** uses the training median. A median minimizes total
-  absolute error and is resistant to occasional large offsets.
-- **Calibrated fixed mean** uses the training mean. A mean minimizes squared
-  error but is more sensitive to outliers.
-- **PTS-step median** groups the current camera PTS interval into 5 ms buckets
-  and uses the training median for the matching bucket.
-- **PTS cadence state** selects a compact one-, two-, or three-step categorical
-  5 ms cadence state inside the training portion.
-- **Selected-length PTS history** compares regularized linear histories from one
-  through six PTS steps on an inner chronological validation split, then refits
-  the selected length on the complete training portion.
-- **Regularized six-step PTS history** preserves the explicit six-step candidate
-  for comparison. No PTS strategy uses QR values, future frames, display index,
-  generation labels, or elapsed recording time as predictors.
-
-Readability is scored separately for full and partial grids. Each prediction
-row also contains the selected interval shifted by one and two measured display
-periods. These newer-generation alternatives expose the consequence of a
-missing latest QR, but the analyzer never chooses an alternative by minimizing
-its residual and never supplies these alternatives to a live predictor.
-
-For each frame, the signed residual is:
-
-```text
-observed QR-derived offset - predicted correction
-```
-
-The **absolute residual** removes its direction:
-
-```text
-abs(observed QR-derived offset - predicted correction)
-```
-
-For example, residuals of `+6 ms` and `-6 ms` both have an absolute residual of
-`6 ms`. MAE is the average absolute residual. The P95 absolute residual is the
-value met or improved upon by 95% of evaluated frames, so it exposes uncommon
-large errors that an average can hide.
-
-## Evidence quality in final analysis (schema 3)
-
-The newest decoded QR is not necessarily the newest displayed QR. The final
-analyzer now separates readable identities from usable timing evidence:
+The newest decoded QR is not necessarily the newest displayed QR. The evidence
+loader separates readable identities from usable timing evidence:
 
 - `usable_conditional`: saved detections have no known clipping, unresolved
   regions, identity conflict, geometry disagreement, or visibility contradiction.
   This still assumes there is no completely undetected newer code; it does not
   establish physical exposure timing.
-- `potentially_missing_newer_generation`: an unreadable/clipped region, conflicting
-  identity, manual override, or invalid screen mapping prevents a narrow interval.
-- `multiple_generation_transition`: decoded marker lifetimes have no common
-  visibility interval. The cause is not automatically attributed to rolling shutter.
+- `usable_newest_readable_with_artifacts`: the newest successfully decoded QR
+  supplies the interval. Older generations, unreadable regions and clipped QR
+  regions remain warnings; they do not discard this interval. This assumes the
+  newest readable QR represents the observed state, even if a newer unreadable
+  QR may exist. The artifact's physical cause is not inferred.
+- `potentially_missing_newer_generation`: conflicting identity, manual override,
+  or invalid screen mapping prevents a narrow interval.
+- `suspected_stale_visual_state`: the same newest readable QR persists across
+  consecutive camera images longer than its journal interval plus one normal
+  display period (at least two periods). The whole repeated run is excluded
+  from timing fitting/scoring, retained in diagnostics and the camera-frame
+  denominator. `temporal_evidence` records its duration and threshold. Checks
+  reset on missing reads or timing discontinuities and respect journal pauses.
+  This cannot distinguish a held display, repeated camera/DVR content, or a
+  newer unreadable QR; brief holds below the threshold can escape detection.
 - `unknown_pixel_evidence`: legacy evidence lacks the saved detection audit.
 - `no_reference`: there is no uniquely matched QR.
 
-Every frame remains in the report and coverage denominator. Ambiguous intervals
-are retained as `diagnostic_newest_decoded_interval_ms`, but are not training labels
-or primary scores. No generation is chosen by minimizing prediction error, and no
+Every frame remains in the report and coverage denominator. Identity/geometry
+failures retain diagnostic intervals without using them for training or scoring.
+Artifact warnings are exported separately from exclusions; their scores remain
+conditional and cannot verify every frame. No generation is chosen by minimizing prediction error, and no
 frame is removed based on its residual. Rerun the decoding stage to populate
 `qr_evidence` for old recordings; running final analysis alone cannot recreate it.
 The JSON stores every detection's box, original-image coordinates, confidence,
 payload, journal identity, clipping status and overlap group. An unreadable retry
 overlapping a readable detection is not counted as a separate missing QR.
 
-History models require at least 80% complete history and enough frames in each
-inner fit/validation split, with variable training features. They fit complete
-histories only. Unsupported recipes are recorded and the constant baseline remains
-available. Evaluation frames missing history use an explicitly reported constant
-fallback. Mapping revisions, epochs, gaps and pauses still reset history; this does
-not repair the recorder's clock-identity problem. Reports include reset reasons,
-history coverage, prediction ranges, evidence coverage and all-camera success rates.
+Stream grouping uses the recorded pipeline base time when available, so jitter
+in sampled anchors cannot turn one stream into independent sessions. Recording
+attaches to the running pipeline and retains its anchor. Only an actual stream
+restart establishes a new stream. Native clock identity is compared instead of
+temporary Python wrapper IDs. Timing discontinuities remain explicit diagnostics.
 
 Optional screen mapping uses `analysis_screen_geometry.json` in the recording
 directory. It changes position checks, not QR identities. Coordinates must refer
@@ -297,72 +208,24 @@ clipped screen corners and mapped-cell/journal disagreement flag the evidence.
 Movement that happens to preserve cell assignments is not automatically detectable;
 recalibrate the corners after movement. Fully cropped codes cannot be recovered.
 
-The final verdict lists separate blockers for insufficient trustworthy evidence,
-failed accuracy criteria and missing independent validation. The strict median
-and maximum thresholds are unchanged. A passing subset cannot establish accuracy
-for ambiguous frames or for physical exposure time.
-
 ## Generated files
 
-The inspection window creates:
+The inspection window saves `calibration_analysis.json`, `calibration_frames.csv`,
+and `display_presentations.csv`. Calibration writes a versioned offset JSON with
+its estimator, age cutoff, source hashes, stream identities and per-stream results.
+It refuses to overwrite an existing offset file.
 
-- `calibration_analysis.json` — complete per-frame evidence and scan summary;
-- `calibration_frames.csv` — the same per-frame evidence in tabular form;
-- `display_presentations.csv` — every predicted marker and observed software
-  presentation return, including display index, cell, interval, prediction
-  error, and timing issues.
+Evaluation writes `pts_anchor_analysis.json`, `pts_anchor_analysis.md`, and
+`pts_anchor_predictions.csv`. Every saved camera frame has a prediction row,
+including missing predictions and unscorable evidence. Rows include QR interval
+bounds, signed error, diagnostic intervals, evidence warnings and exclusions.
+The JSON also retains dropped/rejected frame counts from recording metadata.
+There is no model selection, target-prefix calibration, or automatic live update.
 
-The root analyzer creates an analysis-local `final_analysis/` directory with:
-
-- `final_analysis.json` and `final_analysis.md` — timing contract, input audit,
-  frozen models, strict metrics, limitations, and verdict;
-- `final_analysis_frames.csv` — every camera frame, including unscorable rows;
-- `final_analysis_predictions.csv` — every valid/invalid estimate, QR interval,
-  interval residual, estimated capture time, `A-M`, and estimated arrival delay;
-- `final_analysis_results.csv` — one row per model/evaluation pair;
-- `final_analysis_diagnostics.csv` — every frame, image path, decoded indices,
-  evidence reasons, clipped/unreadable regions, timing resets and selected-model
-  predictions/errors when available; the Markdown report links worst scored frames
-  and ambiguous examples;
-- `final_analysis_residual_cdf.png` — held-out absolute interval errors;
-- `final_analysis_overview.png` — strict maximum and median results;
-- `final_analysis_interval_error_histograms.png` — one signed interval-error
-  histogram for each model family;
-- `final_analysis_evidence.png` — QR readability and contradiction audit.
-
-The older distance, quantitative, and cross-recording modules remain available
-as explicit standalone tools for comparison, but the root launcher does not run
-or combine them automatically.
-
-With `--svg`, the final analyzer also creates an `.svg` copy beside each PNG.
-The legacy quantitative analyzer keeps the same opt-in SVG behavior. Final
-interval-error histogram panels never overlap model families, use symmetric
-signed ranges around zero, and mark both strict ±10 ms boundaries.
-
-## Interpreting the verdict safely
-
-- Review timing-suspect and partial-readability subsets separately. They remain
-  usable when their recorded presentation interval is complete, but they must
-  not be mistaken for fully readable evidence.
-- A recommended correction replaces the configured subtraction; it is
-  never added to it.
-- The chronological holdout tests a later portion of the same recording. It is
-  useful for comparison, but it is not independent session validation.
-- Do not enable a learned dynamic correction from one recording. Preselect the
-  strategy and confirm it on a later, independently recorded calibration first.
-- Final acceptance uses entire restarted stream groups as holdouts. Unknown or
-  overlapping stream identities cannot count as independent validation.
-  Restart both the camera stream and calibration display when collecting
-  calibration, selection, and untouched evaluation evidence.
-- Keep the software-marker result separate from claims about physical exposure
-  timing, RTSP transport delay, or radar alignment.
-- Treat each decoded newest QR as an interval constraint: its state is active
-  from its software presentation return until the following presentation. The
-  host-anchored segment-running-time interval is primary; arrival-time fields include
-  transport, buffering, decoding, and callback delay and are diagnostic only.
-- `presentation_return_ns` is sampled at Qt `frameSwapped` or immediately after
-  `pygame.display.flip()` returns. It does not measure monitor processing,
-  physical scanout, photon output, exposure duration, or rolling shutter.
+The strict goals are maximum interval error <10 ms and median <5 ms. A passing
+subset does not verify unscorable or unsaved frames. Software display returns
+are not exposure or photon timestamps. Any eventual configured correction
+replaces the existing subtraction; never add a second correction.
 
 ## Dependencies and checks
 
@@ -375,10 +238,11 @@ Run the focused non-visual checks with:
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   python3 -m pytest -q tests/test_qr_calibration.py \
+  tests/test_pts_anchor.py tests/test_calibration_evidence.py \
   tests/test_final_analysis.py tests/test_camera_pipeline_policy.py \
   tests/test_recording_changes.py tests/test_calibration_workflow.py
 ```
 
 These checks validate data handling and orchestration. Confirm the real display,
-camera framing, editable controls, and generated graph readability manually on
+camera framing and editable controls manually on
 the target system.

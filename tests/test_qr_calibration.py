@@ -49,6 +49,7 @@ from calibration.qr import (
     timestamp_payload,
 )
 from calibration.recording_display import (
+    CalibrationWindow,
     DEFAULT_INTRINSICS,
     PRESENTATIONS_CSV,
     DisplayTimeline,
@@ -242,6 +243,20 @@ class QRHelpersTests(unittest.TestCase):
         )
         self.assertEqual(renderer.metadata()["qr_mask_pattern"], 3)
         self.assertEqual(renderer.metadata()["qr_mask_selection"], "fixed")
+
+    def test_qt_prepared_qr_is_reused_by_deadline_render(self):
+        self.qt_app = QGuiApplication.instance() or QGuiApplication(["qr-test"])
+        renderer = QRClockRenderer(960, 540, qr_mask_pattern=3)
+        timestamp_ns = 10_000_000_000
+
+        with patch("calibration.display_qt.qr_matrix", wraps=qr_matrix) as build_matrix:
+            renderer.prepare_qr(timestamp_ns)
+            renderer.render_next(timestamp_ns, 0)
+            self.assertEqual(build_matrix.call_count, 1)
+            self.assertEqual(build_matrix.call_args.kwargs["mask_pattern"], 3)
+
+            renderer.render_next(timestamp_ns + 20_000_000, 1)
+            self.assertEqual(build_matrix.call_count, 2)
 
     def test_qt_renderer_retains_unchanged_cells_and_clears_expired_cell(self):
         self.qt_app = QGuiApplication.instance() or QGuiApplication(["qr-test"])
@@ -497,6 +512,200 @@ class RecordingTests(unittest.TestCase):
                  [60, 60, 80, 80], [10, 60, 30, 80])
         reader = FakeReader([timestamp_payload(row["marker_ns"]) for row in selected], boxes)
         return RecordingAnalyzer(folder, DEFAULT_INTRINSICS, reader=reader), frames
+
+    def test_saved_media_monotonic_time_is_used_directly(self):
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            self.fixture(folder)
+            model = RecordingAnalyzer(folder, DEFAULT_INTRINSICS, reader=FakeReader([], []))
+            row = {**model.rows[0], "media_monotonic_ns": 12_345_678_901}
+
+            self.assertEqual(model.pts_monotonic_ns(row), 12_345_678_901)
+
+    def test_saved_review_restores_values_and_boxes_without_decoding_or_writing(self):
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "recording"
+            folder.mkdir()
+            model, _ = self.four_value_model(folder)
+            report = model.summarize(0.25, threading.Event(), lambda *_: None)
+            model.save_report(report)
+            path = model.output_folder / "calibration_analysis.json"
+            before = path.read_bytes()
+            with patch("calibration.recording_display.create_qreader", side_effect=AssertionError("must not decode")):
+                reopened = RecordingAnalyzer(folder, DEFAULT_INTRINSICS)
+                result = reopened.inspect(0)
+                check = reopened.check_frame(result)
+            self.assertEqual(list(check["values"]["qrs"]), report["frames"][0]["qr_values_ms"])
+            self.assertEqual(check["latest_marker"]["index"], report["frames"][0]["latest_display_index"])
+            self.assertEqual(len(result["observations"]), len(report["frames"][0]["qr_evidence"]["detections"]))
+            self.assertIn("Saved QR results", result["review_notice"])
+            self.assertEqual(reopened.cache, {})
+            self.assertIsNone(reopened.reader)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_missing_saved_frame_stays_unanalyzed_until_explicit_fresh_decode(self):
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "recording"
+            folder.mkdir()
+            rows = self.fixture(folder)
+            output = folder.with_name("recording_analysis")
+            output.mkdir()
+            path = output / "calibration_analysis.json"
+            path.write_text(json.dumps({"frames": [], "analysis_alpha": 0.25}))
+            reader = FakeReader([timestamp_payload(rows[3]["marker_ns"])], [[60, 60, 80, 80]])
+            with patch("calibration.recording_display.create_qreader", return_value=reader) as factory:
+                model = RecordingAnalyzer(folder, DEFAULT_INTRINSICS)
+                saved = model.inspect(0)
+                self.assertIn("No saved QR results", saved["review_notice"])
+                self.assertFalse(model.check_frame(saved)["valid"])
+                factory.assert_not_called()
+                model.begin_fresh_analysis()
+                fresh = model.inspect(0)
+                self.assertTrue(model.check_frame(fresh)["valid"])
+                factory.assert_called_once()
+                self.assertNotIn("saved_values", fresh)
+
+    def test_saved_boxes_hidden_for_different_undistortion_but_values_retained(self):
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "recording"
+            folder.mkdir()
+            model, _ = self.four_value_model(folder)
+            report = model.summarize(0.25, threading.Event(), lambda *_: None)
+            model.save_report(report)
+            reopened = RecordingAnalyzer(folder, DEFAULT_INTRINSICS)
+            result = reopened.inspect(0, alpha=0.5)
+            self.assertEqual(result["observations"], [])
+            self.assertTrue(reopened.check_frame(result)["valid"])
+            self.assertIn("do not match", result["review_notice"])
+
+    def test_saved_values_are_matched_by_filename_not_report_order(self):
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "recording"
+            folder.mkdir()
+            rows = self.fixture(folder)
+            journal = folder / "camera_timestamps.jsonl"
+            first = json.loads(journal.read_text())
+            second = {**first, "frame": "images/camera_000002.jpg"}
+            (folder / second["frame"]).write_bytes((folder / first["frame"]).read_bytes())
+            journal.write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+            saved = []
+            for camera, marker in ((first, rows[2]), (second, rows[3])):
+                values = [None] * 4
+                values[marker["cell"]] = timestamp_payload(marker["marker_ns"])
+                saved.append({"filename": camera["frame"], "qr_values_ms": values})
+            output = folder.with_name("recording_analysis")
+            output.mkdir()
+            (output / "calibration_analysis.json").write_text(json.dumps({"frames": saved[::-1]}))
+            with patch("calibration.recording_display.create_qreader", side_effect=AssertionError("must not decode")):
+                model = RecordingAnalyzer(folder, DEFAULT_INTRINSICS)
+                for index in (0, 1):
+                    self.assertEqual(list(model.frame_values(model.inspect(index))["qrs"]), saved[index]["qr_values_ms"])
+
+    def test_malformed_saved_analysis_reports_error_without_automatic_decode(self):
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "recording"
+            folder.mkdir()
+            self.fixture(folder)
+            output = folder.with_name("recording_analysis")
+            output.mkdir()
+            path = output / "calibration_analysis.json"
+            path.write_text("{broken")
+            with patch("calibration.recording_display.create_qreader", side_effect=AssertionError("must not decode")):
+                model = RecordingAnalyzer(folder, DEFAULT_INTRINSICS)
+                self.assertIn("Could not load saved analysis", model.saved_analysis_notice)
+                self.assertFalse(model.check_frame(model.inspect(0))["valid"])
+            self.assertEqual(path.read_text(), "{broken")
+
+    def test_overlay_hides_unreadable_and_draws_selected_qr_in_black_and_white(self):
+        class Variable:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        class Canvas:
+            def __init__(self):
+                self.polygons = []
+                self.texts = []
+
+            def delete(self, *_):
+                pass
+
+            def winfo_width(self):
+                return 100
+
+            def winfo_height(self):
+                return 100
+
+            def create_image(self, *_args, **_kwargs):
+                pass
+
+            def create_polygon(self, _points, **options):
+                self.polygons.append(options)
+
+            def create_text(self, *_args, **options):
+                self.texts.append(options)
+                return len(self.texts)
+
+            def bbox(self, _label):
+                return 0, 0, 20, 10
+
+            def create_rectangle(self, *_args, **_kwargs):
+                return 1
+
+            def tag_raise(self, *_args):
+                pass
+
+        window = CalibrationWindow.__new__(CalibrationWindow)
+        window.resize_job = None
+        window.canvas = Canvas()
+        window.variant = Variable("Undistorted")
+        window.draw_all_boxes = Variable(True)
+        window.show_all_times = Variable(True)
+        pixels = np.zeros((100, 100, 3), dtype=np.uint8)
+        points = np.asarray(((10, 10), (30, 10), (30, 30), (10, 30)))
+        window.current = {
+            "undistorted": pixels,
+            "original": pixels,
+            "observations": [
+                {
+                    "raw": None,
+                    "display_index": None,
+                    "cell": 0,
+                    "undistorted_points": points,
+                    "original_points": points,
+                },
+                {
+                    "raw": "invalid",
+                    "display_index": None,
+                    "cell": 1,
+                    "undistorted_points": points,
+                    "original_points": points,
+                },
+                {
+                    "raw": "000000012345",
+                    "display_index": 5,
+                    "cell": 2,
+                    "undistorted_points": points,
+                    "original_points": points,
+                },
+            ],
+        }
+        window.current_check = {
+            "valid": True,
+            "latest_marker": {"index": 5},
+            "values": {},
+        }
+
+        with patch("calibration.recording_display.ImageTk.PhotoImage", return_value=object()):
+            window.draw()
+
+        self.assertEqual(
+            [polygon["outline"] for polygon in window.canvas.polygons],
+            ["#000000", "#ffffff"],
+        )
+        self.assertEqual([text["text"] for text in window.canvas.texts], ["12.345 s"])
 
     def test_timeline_checks_following_replacement(self):
         with TemporaryDirectory() as temporary:
@@ -802,6 +1011,33 @@ class RecordingTests(unittest.TestCase):
                 {"3": 1},
             )
 
+    def test_scan_excludes_sustained_repeat_from_offset_summary(self):
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            rows = self.fixture(folder, count=12)
+            original = json.loads((folder / "camera_timestamps.jsonl").read_text())
+            cameras = []
+            for i in range(3):
+                filename = f"images/camera_{i+1:06d}.jpg"
+                (folder / filename).write_bytes((folder / original["frame"]).read_bytes())
+                cameras.append({**original, "frame": filename,
+                                "pts_ns": original["pts_ns"] + i * 40_000_000})
+            (folder / "camera_timestamps.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in cameras))
+            model = RecordingAnalyzer(folder, DEFAULT_INTRINSICS, reader=FakeReader(
+                [timestamp_payload(rows[5]["marker_ns"])], [[10, 10, 30, 30]]))
+            report = model.summarize(0.25, threading.Event(), lambda *_: None)
+            self.assertEqual(report["counts"]["accepted_frames"], 0)
+            self.assertEqual(report["counts"]["frames_suspected_stale_visual_state"], 3)
+            self.assertIsNone(report["median_offset_ms"])
+            self.assertEqual(len(report["frames"]), 3)
+            self.assertTrue(all(row["validation"] == "skipped_suspected_stale_visual_state"
+                                for row in report["frames"]))
+            saved = model.save_report(report)
+            text = (Path(saved["output_directory"]) / "calibration_frames.csv").read_text()
+            self.assertIn("temporal_evidence", text)
+            self.assertIn("newest_qr_repeated_beyond_presentation_interval", text)
+
     def test_scan_skips_only_when_no_readable_qr_matches(self):
         with TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -878,81 +1114,6 @@ class RecordingTests(unittest.TestCase):
 
 
 class QuantitativeVerdictTests(unittest.TestCase):
-    def test_report_separates_readability_and_preserves_generation_alternatives(self):
-        with TemporaryDirectory() as temporary:
-            output = Path(temporary)
-            frames = []
-            pts_ns = 0
-            for index in range(60):
-                step_ms = 20.0 if index % 3 == 1 else 40.0
-                pts_ns += int(step_ms * 1e6)
-                midpoint = 77.0 if step_ms == 20.0 else 87.0
-                partial = index % 4 == 0
-                frames.append({
-                    "frame_number": index + 1,
-                    "filename": f"camera_{index + 1:06d}.jpg",
-                    "validation": "accepted_clean",
-                    "timing_status": "Clean",
-                    "pts_ns": pts_ns,
-                    "pts_minus_latest_qr_ms": midpoint,
-                    "offset_interval_lower_ms": midpoint - 5.0,
-                    "offset_interval_upper_ms": midpoint + 5.0,
-                    "matched_readable_qrs": 8 if partial else 10,
-                    "grid_qrs": 10,
-                    "qr_values_ms": [
-                        None if partial and cell in (1, 4) else f"qr-{cell}"
-                        for cell in range(10)
-                    ],
-                    "latest_cell": index % 10,
-                    "latest_cell_name": f"Cell {index % 10}",
-                })
-            source = {
-                "recording_directory": "/recordings/sample",
-                "grid": {"qr_count": 10},
-                "frames": frames,
-            }
-            (output / "calibration_analysis.json").write_text(
-                json.dumps(source), encoding="utf-8"
-            )
-            with (output / "calibration_frames.csv").open(
-                "w", encoding="utf-8", newline=""
-            ) as destination:
-                writer = csv.DictWriter(destination, fieldnames=frames[0].keys())
-                writer.writeheader()
-                writer.writerows(frames)
-
-            def graph_file(path, *_args, **_kwargs):
-                path.write_bytes(b"PNG")
-
-            with (
-                patch("calibration.quantitative_analysis._write_timeline_graph", side_effect=graph_file),
-                patch("calibration.quantitative_analysis._write_residual_graph", side_effect=graph_file),
-                patch("calibration.quantitative_analysis._write_histogram", side_effect=graph_file),
-                patch("calibration.quantitative_analysis._write_readability_graph", side_effect=graph_file),
-            ):
-                report = analyze_output_directory(output)
-
-            readability = report["readability_analysis"]
-            self.assertEqual(readability["fully_readable_frames"], 45)
-            self.assertEqual(readability["partial_readability_frames"], 15)
-            self.assertEqual(len(readability["selected_newest_by_cell"]), 10)
-            self.assertEqual(len(readability["per_cell_readability"]), 10)
-            self.assertEqual(readability["per_cell_readability"][1]["readable_pct"], 75.0)
-            self.assertIn("pts_cadence_state", report["strategies"])
-            self.assertIn("pts_history_selected_linear", report["strategies"])
-            self.assertEqual(
-                report["strategies"]["pts_history6_linear"]["parameters"]["ridge"],
-                1e-3,
-            )
-            with (output / "calibration_strategy_predictions.csv").open(
-                encoding="utf-8", newline=""
-            ) as source_file:
-                prediction = next(csv.DictReader(source_file))
-            self.assertEqual(prediction["readability_class"], "partial")
-            self.assertNotEqual(
-                prediction["newer_generation_1_interval_lower_ms"], ""
-            )
-
     def test_saved_analysis_defaults_to_png_and_optionally_saves_svg_graphs(self):
         with TemporaryDirectory() as temporary:
             output = Path(temporary)
@@ -996,16 +1157,14 @@ class QuantitativeVerdictTests(unittest.TestCase):
                 patch("calibration.quantitative_analysis._write_timeline_graph", side_effect=graph_file),
                 patch("calibration.quantitative_analysis._write_residual_graph", side_effect=graph_file),
                 patch("calibration.quantitative_analysis._write_histogram", side_effect=graph_file),
-                patch("calibration.quantitative_analysis._write_readability_graph", side_effect=graph_file),
             ):
                 report = analyze_output_directory(output)
 
             self.assertEqual(report["data_quality"]["clean_frames"], 44)
             self.assertEqual(report["data_quality"]["timing_suspect_frames"], 1)
-            self.assertAlmostEqual(
+            self.assertLess(
+                report["verdict"]["recommended_fixed_correction_ms"],
                 report["verdict"]["current_correction_ms"],
-                87.348,
-                places=3,
             )
             self.assertTrue((output / "calibration_verdict.md").is_file())
             self.assertEqual(report["graph_formats"], ["png"])
@@ -1015,7 +1174,6 @@ class QuantitativeVerdictTests(unittest.TestCase):
                 "calibration_offset_histogram",
                 "calibration_fixed_residual_histogram",
                 "calibration_pts_residual_histogram",
-                "calibration_readability_diagnostics",
             )
             for stem in graph_stems:
                 self.assertTrue((output / f"{stem}.png").is_file())
@@ -1026,7 +1184,6 @@ class QuantitativeVerdictTests(unittest.TestCase):
                 patch("calibration.quantitative_analysis._write_timeline_graph", side_effect=graph_file),
                 patch("calibration.quantitative_analysis._write_residual_graph", side_effect=graph_file),
                 patch("calibration.quantitative_analysis._write_histogram", side_effect=graph_file),
-                patch("calibration.quantitative_analysis._write_readability_graph", side_effect=graph_file),
             ):
                 svg_report = analyze_output_directory(output, save_svg=True)
 
@@ -1036,39 +1193,57 @@ class QuantitativeVerdictTests(unittest.TestCase):
                 self.assertIn("<svg", (output / filename).read_text())
                 self.assertIn(filename, svg_report["output_files"])
 
-    def test_root_launcher_runs_only_final_analysis_with_explicit_output(self):
+    def test_root_launcher_runs_only_pts_anchor_analysis_with_explicit_output(self):
         with TemporaryDirectory() as temporary:
             output = Path(temporary)
-            destination = output / "final_analysis"
+            destination = output / "pts_anchor_analysis"
             destination.mkdir()
-            (destination / "final_analysis.json").write_text(
+            (destination / "pts_anchor_analysis.json").write_text(
                 json.dumps({"output_directory": str(destination)}),
                 encoding="utf-8",
             )
             with patch.object(recording_launcher.subprocess, "run") as run:
-                report = recording_launcher._run_final_analysis(output)
+                report = recording_launcher._run_anchor_analysis(output, Path("/offset.json"))
 
             command = run.call_args.args[0]
             self.assertEqual(
                 command[:3],
-                [recording_launcher.sys.executable, "-m", "calibration.final_analysis"],
+                [recording_launcher.sys.executable, str(recording_launcher.PROJECT_ROOT / "analyze_pts_anchor.py"), "evaluate"],
             )
             self.assertIn(str(output), command)
             self.assertEqual(report["output_directory"], str(destination))
 
-    def test_root_launcher_runs_final_analysis_after_the_window(self):
+    def test_root_launcher_runs_pts_anchor_analysis_after_the_window(self):
         recording = Path("/recordings/sample")
         output = Path("/recordings/sample_analysis")
         with (
             patch.object(recording_launcher, "run_recording_display", return_value=output) as display,
-            patch.object(recording_launcher, "_run_final_analysis", return_value={
-                "output_directory": str(output / "final_analysis")
+            patch.object(recording_launcher, "_run_anchor_analysis", return_value={
+                "output_directory": str(output / "pts_anchor_analysis")
             }) as analyze,
-            patch("sys.argv", ["analyze_calibration_recording.py", str(recording)]),
+            patch("sys.argv", ["analyze_calibration_recording.py", str(recording), "--offset-file", "/offset.json"]),
         ):
             recording_launcher.main()
         display.assert_called_once()
-        analyze.assert_called_once_with(output)
+        analyze.assert_called_once_with(output, Path("/offset.json"))
+
+    def test_closing_saved_review_does_not_rerun_pts_anchor_analysis(self):
+        with (
+            patch.object(recording_launcher, "run_recording_display", return_value=None),
+            patch.object(recording_launcher, "_run_anchor_analysis") as analyze,
+            patch("sys.argv", ["analyze_calibration_recording.py", "/recordings/sample"]),
+        ):
+            recording_launcher.main()
+        analyze.assert_not_called()
+
+    def test_fresh_decode_without_offset_only_exports_evidence(self):
+        with (
+            patch.object(recording_launcher, "run_recording_display", return_value=Path("/recordings/lab_analysis")),
+            patch.object(recording_launcher, "_run_anchor_analysis") as analyze,
+            patch("sys.argv", ["analyze_calibration_recording.py", "/recordings/lab"]),
+        ):
+            recording_launcher.main()
+        analyze.assert_not_called()
 
 
 if __name__ == "__main__":

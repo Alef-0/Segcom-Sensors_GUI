@@ -119,10 +119,73 @@ def detection_evidence(observations: list[dict], size: tuple[int, int],
             "conflicting_groups": conflicts}
 
 
+def repeated_state_checks(frames: list[dict], presentation_times: list[int],
+                          paused_indices=()) -> list[dict | None]:
+    """Flag sustained newest-QR repeats without fitting a camera correction.
+
+    Inputs use latest_display_index, media_reference_monotonic_ns, and segment.
+    A repeat must exceed the local journal interval plus one median display
+    period (at least two periods). This tolerates normal camera oversampling.
+    All members are suspect: a repeated old readable QR cannot establish which
+    image, if any, represents its original presentation interval. This is an
+    offline exclusion, not proof of a display freeze or a runtime timing input.
+    """
+    checks = [None] * len(frames)
+    if len(presentation_times) < 2:
+        return checks
+    periods = np.diff(np.asarray(presentation_times, dtype=np.int64))
+    if np.any(periods <= 0):
+        return checks
+    period = float(np.median(periods))
+    paused = set(paused_indices)
+    run = []
+
+    def finish():
+        if len(run) < 2:
+            return
+        latest = frames[run[0]]["latest_display_index"]
+        if latest in paused or not 0 <= latest < len(presentation_times) - 1:
+            return
+        span = (frames[run[-1]]["media_reference_monotonic_ns"]
+                - frames[run[0]]["media_reference_monotonic_ns"])
+        interval = presentation_times[latest + 1] - presentation_times[latest]
+        threshold = max(2 * period, interval + period)
+        if span <= threshold:
+            return
+        detail = {"status": "suspected_stale_visual_state",
+                  "reason": "newest_qr_repeated_beyond_presentation_interval",
+                  "latest_display_index": latest,
+                  "camera_span_ms": span / 1e6,
+                  "threshold_ms": threshold / 1e6,
+                  "run_frames": len(run),
+                  "cause": "display_hold_camera_repeat_or_missing_newer_qr_unresolved"}
+        for position in run:
+            checks[position] = dict(detail)
+
+    for position, frame in enumerate(frames):
+        latest = frame.get("latest_display_index")
+        reference = frame.get("media_reference_monotonic_ns")
+        if latest is None or reference is None or reference < 0:
+            finish()
+            run = []
+            continue
+        if run:
+            previous = frames[run[-1]]
+            if (latest != previous["latest_display_index"]
+                    or frame.get("segment") != previous.get("segment")
+                    or not 0 < reference - previous["media_reference_monotonic_ns"] <= 1_000_000_000):
+                finish()
+                run = []
+        run.append(position)
+    finish()
+    return checks
+
+
 def assess_evidence(frame: dict, indices: list[int], *, transition: bool = False) -> dict:
-    """Evidence gates never use predicted correction or measured residual."""
+    """Score the newest readable QR; retain older/partial artifacts as warnings."""
     evidence = frame.get("qr_evidence")
     reasons = []
+    warnings = []
     if not indices:
         return {"status": "no_reference", "reasons": ["no_matched_qr"], "primary_usable": False}
     if not isinstance(evidence, dict) or evidence.get("version") != EVIDENCE_VERSION:
@@ -133,11 +196,11 @@ def assess_evidence(frame: dict, indices: list[int], *, transition: bool = False
         if matched != set(indices):
             reasons.append("saved_identities_disagree_with_pixel_evidence")
         if evidence.get("unreadable_groups"):
-            reasons.append("unreadable_regions_may_contain_newer_qr")
+            warnings.append("unreadable_regions_may_contain_newer_qr")
         if evidence.get("conflicting_groups"):
             reasons.append("conflicting_payloads_in_one_region")
         if any(d.get("clipped") for d in detections):
-            reasons.append("clipped_qr_regions")
+            warnings.append("clipped_qr_regions")
         geometry = evidence.get("geometry", {})
         if geometry.get("status") in ("invalid", "clipped"):
             reasons.append("screen_geometry_" + geometry["status"])
@@ -146,15 +209,21 @@ def assess_evidence(frame: dict, indices: list[int], *, transition: bool = False
             for d in detections
         ):
             reasons.append("screen_geometry_disagrees_with_journal")
+    temporal = frame.get("temporal_evidence") or {}
+    if temporal.get("status") == "suspected_stale_visual_state":
+        reasons.append("newest_qr_repeated_beyond_presentation_interval")
     if frame.get("manual_values"):
         reasons.append("manual_identity_requires_separate_review")
     if transition:
-        reasons.append("multiple_generations_without_common_visibility")
-    if transition:
-        status = "multiple_generation_transition"
+        warnings.append("multiple_generations_without_common_visibility")
+    if temporal.get("status") == "suspected_stale_visual_state":
+        status = "suspected_stale_visual_state"
     elif reasons:
         status = "potentially_missing_newer_generation" if evidence else "unknown_pixel_evidence"
+    elif warnings:
+        status = "usable_newest_readable_with_artifacts"
     else:
         status = "usable_conditional"
     return {"status": status, "reasons": reasons, "primary_usable": not reasons,
+            "warnings": warnings,
             "geometry_verified": bool(evidence and evidence.get("geometry", {}).get("status") == "valid")}

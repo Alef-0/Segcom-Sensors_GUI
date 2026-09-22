@@ -107,6 +107,9 @@ class QRClockRenderer:
         self.display_indices: list[int | None] = [None] * grid_qrs
         self.matrices: dict[int, object] = {}
         self.images: dict[int, QPixmap] = {}
+        self._prepared_payload: str | None = None
+        self._prepared_matrix = None
+        self._prepared_image: QPixmap | None = None
         self._dirty_cells: set[int] = set()
         self._dirty_underlines: set[int] = set()
         self._force_full_redraw = True
@@ -182,13 +185,17 @@ class QRClockRenderer:
 
         self.timestamps[cell] = timestamp_ns
         self.display_indices[cell] = display_index
-        matrix = qr_matrix(
-            timestamp_payload(timestamp_ns),
-            mask_pattern=self.qr_mask_pattern,
-        )
+        if cache_pixmap:
+            matrix, image = self._prepared_qr(timestamp_ns)
+        else:
+            matrix = qr_matrix(
+                timestamp_payload(timestamp_ns),
+                mask_pattern=self.qr_mask_pattern,
+            )
+            image = None
         self.matrices[timestamp_ns] = matrix
         if cache_pixmap:
-            self.images[timestamp_ns] = self._qr_image(matrix)
+            self.images[timestamp_ns] = image
         self._dirty_cells.add(cell)
 
         self.newest_cell = cell
@@ -207,6 +214,31 @@ class QRClockRenderer:
         )
         # Detach from the temporary NumPy storage before returning.
         return QPixmap.fromImage(image.copy())
+
+    def prepare_qr(self, timestamp_ns: int) -> None:
+        """Prepare the predicted next QR before the paint callback."""
+        payload = timestamp_payload(timestamp_ns)
+        if payload == self._prepared_payload:
+            return
+        matrix = qr_matrix(
+            payload,
+            mask_pattern=self.qr_mask_pattern,
+        )
+        self._prepared_payload = payload
+        self._prepared_matrix = matrix
+        self._prepared_image = self._qr_image(matrix)
+
+    def _prepared_qr(self, timestamp_ns: int) -> tuple[object, QPixmap]:
+        payload = timestamp_payload(timestamp_ns)
+        if (
+            payload != self._prepared_payload
+            or self._prepared_matrix is None
+            or self._prepared_image is None
+        ):
+            self.prepare_qr(timestamp_ns)
+        assert self._prepared_matrix is not None
+        assert self._prepared_image is not None
+        return self._prepared_matrix, self._prepared_image
 
     @staticmethod
     def _draw_qr(painter: QPainter, rect: QRect, image: QPixmap) -> QRect:
@@ -566,6 +598,11 @@ class QRClockWindow(QOpenGLWindow):
             "opengl_profile": str(actual_format.profile()),
             "update_behavior": "PartialUpdateBlit",
             "timestamp_mode": self.timestamp_mode,
+            "qr_preparation": (
+                "one-predicted-marker-ahead"
+                if self.timestamp_mode == "predicted-flip"
+                else "none"
+            ),
             "timestamp_semantics": (
                 "marker_ns and the QR payload predict the next frameSwapped time"
                 if self.timestamp_mode == "predicted-flip"
@@ -667,8 +704,13 @@ class QRClockWindow(QOpenGLWindow):
 
         if not self.paused:
             # Qt documents frameSwapped -> update() as the preferred way to
-            # continuously repaint synchronized to vertical refresh.
+            # continuously repaint synchronized to vertical refresh. Request
+            # the update before preparing the predicted marker so QR creation
+            # uses time Qt otherwise spends scheduling the paint callback.
+            next_marker_ns = self.monitor.predict_next_swap(time.monotonic_ns())
             self.update()
+            if self.renderer is not None and self.timestamp_mode == "predicted-flip":
+                self.renderer.prepare_qr(next_marker_ns)
 
     def keyPressEvent(self, event) -> None:
         if event.isAutoRepeat():

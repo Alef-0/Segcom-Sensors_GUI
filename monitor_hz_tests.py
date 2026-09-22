@@ -378,6 +378,10 @@ def run_qt_test(args: argparse.Namespace, screen: dict, expected_hz: float) -> i
             self.last_flip_ns = flip_ns
             self.frame_index += 1
             self.update()
+            if self.renderer is not None and args.timestamp_mode == "predicted-flip":
+                self.renderer.prepare_qr(
+                    self.monitor.predict_next_swap(time.monotonic_ns())
+                )
 
     window = TestWindow()
     window.setScreen(qt_screens[args.screen])

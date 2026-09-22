@@ -60,7 +60,7 @@ class FrameTimestampPolicy:
         self._last_application_arrival_monotonic_ns: int | None = None
         self._pipeline_zero_unix_ns: int | None = None
         self._pipeline_zero_monotonic_ns: int | None = None
-        self._clock_object_id: int | None = None
+        self._clock = None
         self._pipeline_base_time_ns: int | None = None
         self._segment_signature: tuple | None = None
         self._segment_epoch = 0
@@ -74,7 +74,7 @@ class FrameTimestampPolicy:
         self._last_application_arrival_monotonic_ns = None
         self._pipeline_zero_unix_ns = None
         self._pipeline_zero_monotonic_ns = None
-        self._clock_object_id = None
+        self._clock = None
         self._pipeline_base_time_ns = None
         self._segment_signature = None
         self._segment_epoch = 0
@@ -254,7 +254,9 @@ class FrameTimestampPolicy:
                 timing=dict(initial_timing, pts_ns=int(pts), running_time_ns=running_time_ns),
             )
         current_running_time_ns, mapping_before_ns, mapping_after_ns, clock, base_time_ns = mapping
-        clock_changed = self._clock_object_id is not None and id(clock) != self._clock_object_id
+        # Retain the GObject and compare its native identity. Temporary Python
+        # wrappers can have different ids while referring to the same clock.
+        clock_changed = self._clock is not None and clock != self._clock
         base_time_changed = (
             self._pipeline_base_time_ns is not None
             and base_time_ns != self._pipeline_base_time_ns
@@ -266,7 +268,7 @@ class FrameTimestampPolicy:
             self._last_pts = None
             self._last_running_time_ns = None
             flags.append("pipeline_clock_changed" if clock_changed else "pipeline_base_time_changed")
-        self._clock_object_id = id(clock)
+        self._clock = clock
         self._pipeline_base_time_ns = base_time_ns
         mapping_monotonic_ns = (mapping_before_ns + mapping_after_ns) // 2
         mapping_uncertainty_ns = max(1, (mapping_after_ns - mapping_before_ns + 1) // 2)

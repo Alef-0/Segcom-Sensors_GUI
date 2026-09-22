@@ -85,6 +85,8 @@ anchors pipeline running time to host realtime and monotonic time. The pipeline
 clock read is bracketed by two host-monotonic samples; the half-window is stored
 as mapping-sample uncertainty. A clock, base-time, or segment change starts a
 new mapping/segment revision instead of silently reusing the prior history.
+The policy retains the clock object and compares its native identity; a new
+Python wrapper for the same clock does not reset the anchor or frame history.
 
 The capture appsink callback records `application_arrival_*` before pulling the
 sample or converting it to an image. Separate pull-complete, conversion-complete,
@@ -134,6 +136,12 @@ validated from a calibration recording for the current stream session and
 hardware path.
 
 ## Recording and loss reporting
+
+Starting a recording attaches the image writer to the running RTSP pipeline.
+The preview, decoder reference frames, stream epoch, and timing anchor continue
+across recording boundaries. The calibration session records
+`pipeline_restarted_for_recording: false` and the current `stream_epoch_at_start`.
+Reconnects and camera configuration changes still rebuild the pipeline.
 
 The camera recorder can select any integer number of frames from each nominal
 set of 30. Selection uses an accumulator, so rates lower than 30 are spread

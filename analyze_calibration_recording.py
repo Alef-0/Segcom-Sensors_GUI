@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect a QR calibration recording, then create its final analysis."""
+"""Inspect QR evidence; optionally evaluate a previously frozen anchor offset."""
 
 from __future__ import annotations
 
@@ -15,14 +15,16 @@ from calibration.recording_display import DEFAULT_INTRINSICS, run_recording_disp
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
-def _run_final_analysis(output: Path) -> dict:
-    destination = output / "final_analysis"
+def _run_anchor_analysis(output: Path, offset_file: Path) -> dict:
+    destination = output / "pts_anchor_analysis"
     subprocess.run(
         [
             sys.executable,
-            "-m",
-            "calibration.final_analysis",
+            str(PROJECT_ROOT / "analyze_pts_anchor.py"),
+            "evaluate",
             str(output),
+            "--offset-file",
+            str(offset_file.resolve()),
             "--output-directory",
             str(destination),
         ],
@@ -30,13 +32,15 @@ def _run_final_analysis(output: Path) -> dict:
         check=True,
     )
     return json.loads(
-        (destination / "final_analysis.json").read_text(encoding="utf-8")
+        (destination / "pts_anchor_analysis.json").read_text(encoding="utf-8")
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("folder", type=Path, help="Calibration recording folder")
+    parser.add_argument("--offset-file", type=Path,
+                        help="Previously calibrated offset from independent laboratory streams")
     parser.add_argument(
         "--intrinsics",
         type=Path,
@@ -48,15 +52,19 @@ def main() -> None:
     output = run_recording_display(arguments.folder, arguments.intrinsics)
     if output is None:
         print(
-            "Final analysis skipped because this window session did not finish "
-            "creating analysis files.",
+            "Anchor evaluation was not rerun: this window session did not complete "
+            "a fresh decode. Saved results can be reviewed without rerunning analysis.",
             flush=True,
         )
         return
 
-    report = _run_final_analysis(output)
+    if arguments.offset_file is None:
+        print(f"QR evidence saved in {output}. Use analyze_pts_anchor.py calibrate for laboratory "
+              "data, or evaluate --offset-file for an independent test stream.", flush=True)
+        return
+    report = _run_anchor_analysis(output, arguments.offset_file)
     print(
-        f"Final analysis saved in {report['output_directory']}",
+        f"Anchor evaluation saved in {report['output_directory']}",
         flush=True,
     )
 

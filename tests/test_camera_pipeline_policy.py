@@ -452,6 +452,45 @@ class CameraPipelinePolicyTests(unittest.TestCase):
         self.assertEqual(result.camera_ntp_ns, 126 * Gst.SECOND + 100 * Gst.MSECOND)
         self.assertEqual(result.source, "host-anchored-segment-running-time")
 
+    def test_new_wrappers_for_same_clock_keep_anchor_and_history(self):
+        class ClockWrapper(FakeClock):
+            def __eq__(self, other):
+                return isinstance(other, ClockWrapper)
+
+        class WrappedPipeline(FakePipeline):
+            def get_clock(self):
+                return ClockWrapper(self.clock.value)
+
+        pipeline = WrappedPipeline(Gst.SECOND)
+        policy = FrameTimestampPolicy()
+        policy.reset(pipeline)
+        first = policy.timestamp_for_sample(FakeSample(FakeBuffer(Gst.SECOND)))
+        anchor = policy.epoch_metadata["pipeline_zero_monotonic_ns"]
+        pipeline.clock.value += 50 * Gst.MSECOND
+        second = policy.timestamp_for_sample(FakeSample(FakeBuffer(Gst.SECOND + 30 * Gst.MSECOND)))
+        self.assertEqual(second.timing["mapping_revision"], 0)
+        self.assertNotIn("pipeline_clock_changed", second.timing["flags"])
+        self.assertEqual(policy.epoch_metadata["pipeline_zero_monotonic_ns"], anchor)
+        self.assertEqual(second.timing["running_time_delta_ns"], 30 * Gst.MSECOND)
+        self.assertEqual(second.timing["media_monotonic_ns"] - first.timing["media_monotonic_ns"],
+                         30 * Gst.MSECOND)
+
+    def test_real_clock_or_base_time_change_still_creates_new_mapping(self):
+        for change in ("clock", "base_time"):
+            with self.subTest(change=change):
+                pipeline = FakePipeline(Gst.SECOND)
+                policy = FrameTimestampPolicy()
+                policy.reset(pipeline)
+                policy.timestamp_for_sample(FakeSample(FakeBuffer(Gst.SECOND)))
+                if change == "clock":
+                    pipeline.clock = FakeClock(2 * Gst.SECOND)
+                else:
+                    pipeline.get_base_time = lambda: 100 * Gst.MSECOND
+                result = policy.timestamp_for_sample(FakeSample(FakeBuffer(Gst.SECOND + 30 * Gst.MSECOND)))
+                self.assertEqual(result.timing["mapping_revision"], 1)
+                self.assertIsNone(result.timing["running_time_delta_ns"])
+                self.assertIn(f"pipeline_{change}_changed", result.timing["flags"])
+
     def test_unknown_reference_clock_is_preserved_without_conversion(self):
         policy = FrameTimestampPolicy()
         policy.reset(FakePipeline(Gst.SECOND))

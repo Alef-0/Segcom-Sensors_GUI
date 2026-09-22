@@ -8,6 +8,7 @@ import cv2 as cv
 import gi
 import numpy as np
 
+from calibration.scheduler_priority import CalibrationSchedulerPriority
 from processing import CameraSnapshotRecorder
 from processing.visualization.transposition import (
     RADAR_GROUP_B,
@@ -69,6 +70,9 @@ class GStreamerPipeline:
         self.recording_frames_per_30 = CAMERA_FRAME_RATE
         self.calibration_mode = False
         self.calibration_recording = False
+        self.calibration_scheduler_priority = CalibrationSchedulerPriority(
+            "calibration camera and recorder"
+        )
         self.snapshot_recorder = CameraSnapshotRecorder(
             self._report_snapshot,
             self._report_recording_drop,
@@ -177,8 +181,23 @@ class GStreamerPipeline:
         self._last_pts_gap_warning = now
 
     def _start_snapshot_recording(self, value):
+        """Attach the writer to the running stream, preserving decoder history."""
+        if self.snapshot_recorder.active:
+            self._put_status("camera_recording_error", "Camera recording is already active")
+            return
+        if not self.connected:
+            self._put_status("camera_recording_error", "Connect the camera before starting camera recording")
+            self._put_status(
+                "calibration_recording_state" if value.get("calibration") else "camera_recording_state",
+                {"active": False},
+            )
+            return
         calibration = bool(value.get("calibration"))
         try:
+            if calibration:
+                # Also covers callers that start a calibration recording
+                # without first toggling the calibration-camera control.
+                self.calibration_scheduler_priority.enable()
             self._last_writer_drop_warning = 0.0
             self._last_pts_gap_warning = 0.0
             self._pending_pts_gap_candidates = 0
@@ -191,7 +210,13 @@ class GStreamerPipeline:
                     "decoder_backend": self.current_decoder_backend.name,
                     "pipeline_latency_ms": self.pipeline_latency_ms,
                     "stream_epoch_at_start": self.stream_epoch,
+                    "pipeline_restarted_for_recording": False,
                     "display_journal": value.get("display_journal"),
+                    "scheduler_priority": (
+                        self.calibration_scheduler_priority.status()
+                        if calibration
+                        else None
+                    ),
                     "timing_contract": {
                         "media_reference": (
                             "pipeline clock anchor plus segment-mapped buffer running time"
@@ -282,6 +307,8 @@ class GStreamerPipeline:
     def _set_calibration_camera(self, active):
         active = bool(active)
         if active:
+            # New GStreamer and image-writer threads inherit this preference.
+            self.calibration_scheduler_priority.enable()
             self.calibration_mode = True
             self.channel = 4
             self.channel_changed = True
@@ -290,6 +317,7 @@ class GStreamerPipeline:
             if not self.connected:
                 self.calibration_mode = False
                 self.channel = self.normal_channel
+                self.calibration_scheduler_priority.restore()
             if self.connected:
                 self.exit_reason = _RESULT_RESTART
             self._put_status(
@@ -306,6 +334,7 @@ class GStreamerPipeline:
         self._fail_manual_snapshot("Calibration camera closed before taking the snapshot")
         self._put_status("change_cam", False)
         self._put_status("calibration_camera_state", {"active": False, "channel": 4})
+        self.calibration_scheduler_priority.restore()
         return True
 
     def _set_latency_settings(self, value):

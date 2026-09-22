@@ -14,6 +14,7 @@ import FreeSimpleGUI as sg
 
 import application_core as base
 from calibration.qr import GRID_LAYOUTS
+from calibration.scheduler_priority import CalibrationSchedulerPriority
 from sensors.camera.camera_gstreamer import gstreamer_main
 from sensors.camera.camera_pipeline import available_decoder_backends
 from sensors.camera.timing_defaults import DEFAULT_CAMERA_TIMESTAMP_CORRECTION_MS
@@ -34,6 +35,7 @@ CALIBRATION_DISPLAY_BACKENDS = {
     "Qt / OpenGL": "qt",
     "Pygame / SDL": "pygame",
 }
+CALIBRATION_QR_MASK_PATTERN = 3
 
 
 @dataclass
@@ -249,6 +251,8 @@ def _qt_screen_choices():
 
 def _run_calibration_clock_process(stop_event, error_queue, display_options):
     try:
+        scheduler_priority = CalibrationSchedulerPriority("QR calibration display")
+        scheduler_priority.enable()
         options = dict(display_options)
         display_backend = options.pop("display_backend", "qt")
         if display_backend == "qt":
@@ -394,6 +398,10 @@ def _start_calibration_clock(values, config, runtime):
         "screen_index": screen_index,
         "visible_qrs": visible_qrs,
         "grid_qrs": grid_qrs,
+        # Avoid evaluating all eight QR masks for every 10 ms timestamp.
+        # Pattern 3 had the best penalty distribution across representative
+        # calibration payloads, and the journal records that it is fixed.
+        "qr_mask_pattern": CALIBRATION_QR_MASK_PATTERN,
     }
     if display_backend == "pygame":
         refresh_hz = _calibration_screen_refresh_hz(values)

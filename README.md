@@ -204,8 +204,10 @@ analysis.
 The Visualization tab opens the single analyzer with the project's copied
 camera intrinsics, an undistorted image, and alpha 0.25 by default. QReader
 detects every QR bounding box, retries grid cells without a readable result,
-and orders detections by grid cell. The first frame is decoded when the viewer
-opens; full-folder decoding begins only after **GO — DECODE FULL FOLDER** is
+and orders detections by grid cell. When an existing sibling `_analysis` folder
+contains saved results, opening the viewer loads those QR values and compatible
+boxes for review without decoding or writing files. Otherwise the first frame is
+decoded when the viewer opens. Fresh full-folder decoding begins only after **GO — DECODE FULL FOLDER** is
 pressed, and each completed frame is shown. A frame is accepted when at least
 one readable QR matches its journal; camera-grid position disagreements remain
 visible as warnings. Unreadable and invalid detections are retained as
@@ -213,32 +215,30 @@ diagnostics while the latest journal-matched QR supplies the offset. The PTS,
 NTP, and configured grid values are editable without automatically starting a
 scan. Finishing the full scan writes `calibration_analysis.json` and
 `calibration_frames.csv` to a sibling
-`<recording-folder-name>_analysis` directory. After the inspection window is
-closed, the root launcher runs only `calibration.final_analysis`. It reconstructs
-the media reference from segment-mapped running time, keeps callback arrival
-separate from capture correction, fits interval-constrained causal models, and
-writes a strict maximum/median evaluation plus one interval-error histogram for
-each model family.
+`<recording-folder-name>_analysis` directory. The launcher now saves evidence only
+unless you supply `--offset-file` from a separate laboratory calibration. With
+that file, it evaluates one frozen correction after a fresh scan. Reviewing
+saved results does not rewrite evidence or reports.
 
 ```bash
 python3 analyze_calibration_recording.py /path/to/calibration-recording
-python3 analyze_calibration_recording.py /path/to/calibration-recording \
-  --intrinsics /path/to/intrinsics.json
 
-# Analyze explicit existing recording analyses without opening the window
-python3 -m calibration.final_analysis \
-  /path/to/01_calibration_analysis /path/to/02_calibration_analysis \
-  --output-directory /path/to/final_analysis
+# Establish c0 using laboratory streams only, before examining the test stream
+python3 analyze_pts_anchor.py calibrate /path/to/lab_analysis \
+  --minimum-stream-age-seconds 30 --output /path/to/offset-v1.json
+
+# Restart the stream, record independently, decode, then evaluate unchanged c0
+python3 analyze_pts_anchor.py evaluate /path/to/test_analysis \
+  --offset-file /path/to/offset-v1.json --output-directory /path/to/anchor-report
 ```
 
-For each decoded QR, the final analyzer uses the next actual presentation event
-as the end of the permissible correction interval. It starts with a constant,
-then a compact mapped-cadence state, then regularized mapped-time history only if
-simpler inner checks fail. Delivery timing changes `A-M` and estimated arrival
-delay, not capture correction. Any scored error at or above 10 ms fails the
-maximum goal; unscorable frames remain in the report. Results stay conditional
-on the decoded QR being the newest displayed generation and do not establish
-physical exposure time.
+The sole estimate is `pipeline_zero_monotonic_ns + running_time_ns - c0`.
+Each pipeline epoch supplies its clock anchor; the offset stays fixed across
+independent tests. QR intervals only score test predictions. Maximum interval
+error must be below 10 ms and median below 5 ms. Missing evidence remains in
+the denominator; these software intervals do not establish physical exposure time.
+See [the experiment protocol](calibration/ANCHOR_EXPERIMENT.md) for the offset
+strategy, startup experiment, scope of this simplification, and next steps.
 
 ## CSV conversion
 
@@ -281,8 +281,8 @@ See `tests/README.md` for the test-area map.
 | `interface_core.py` | Shared GUI layout and state transitions |
 | `sensors/` | Radar, RTSP camera, timestamp, and GPS integrations |
 | `processing/` | Plotting, filtering, recording, PCD reading, snapshots, and playback |
-| `calibration/` | QR display/decoding, recording viewer, final interval analysis, legacy comparison tools, and camera intrinsics |
-| `analyze_calibration_recording.py` | Runs the recording viewer, then only the final interval analysis |
+| `calibration/` | QR display/decoding, recording viewer, anchor evidence/scoring, and camera intrinsics |
+| `analyze_calibration_recording.py` | Runs the recording viewer; optionally evaluates a frozen offset |
 | `convert_to_csv.py` | Recursive PCD-to-CSV export |
 | `content/` | ARS40X technical-documentation extracts |
 | `recordings/` | Generated recording data, kept outside source packages |

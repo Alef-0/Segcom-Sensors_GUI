@@ -5,8 +5,9 @@ import unittest
 
 import numpy as np
 
-from calibration.evidence import assess_evidence, detection_evidence, screen_cell, screen_geometry
-from calibration.final_analysis import Goals, _evaluate, _select_models, analyze_directories, load_session, write_report
+from calibration.evidence import assess_evidence, detection_evidence, repeated_state_checks, screen_cell, screen_geometry
+from calibration.final_analysis import _stream_components, load_session
+from analyze_pts_anchor import score_predictions
 
 
 def observation(index=10, box=(10, 10, 40, 40)):
@@ -64,18 +65,26 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(len(saved["detections"]), 2)
         self.assertTrue(assess_evidence({"qr_evidence": saved}, [10])["primary_usable"])
 
-    def test_missing_newer_clipped_region_prevents_definite_timing_score(self):
+    def test_unreadable_clipped_region_allows_conditional_newest_readable_score(self):
         saved = detection_evidence([observation(944), observation(None, (60, 70, 95, 100))],
                                    (100, 100), {})
         result = assess_evidence({"qr_evidence": saved}, [944])
-        self.assertFalse(result["primary_usable"])
-        self.assertIn("clipped_qr_regions", result["reasons"])
-        self.assertIn("unreadable_regions_may_contain_newer_qr", result["reasons"])
+        self.assertTrue(result["primary_usable"])
+        self.assertIn("clipped_qr_regions", result["warnings"])
+        self.assertIn("unreadable_regions_may_contain_newer_qr", result["warnings"])
+
+    def test_older_readable_artifacts_do_not_veto_newest(self):
+        saved = detection_evidence([observation(10), observation(11, (60, 60, 90, 90))],
+                                   (100, 100), {})
+        result = assess_evidence({"qr_evidence": saved}, [10, 11], transition=True)
+        self.assertTrue(result["primary_usable"])
+        self.assertEqual(result["status"], "usable_newest_readable_with_artifacts")
+        self.assertIn("multiple_generations_without_common_visibility", result["warnings"])
 
     def test_payload_conflicts_and_transition_are_not_fitted(self):
         saved = detection_evidence([observation(10), observation(11)], (100, 100), {})
         result = assess_evidence({"qr_evidence": saved}, [10, 11], transition=True)
-        self.assertEqual(result["status"], "multiple_generation_transition")
+        self.assertIn("multiple_generations_without_common_visibility", result["warnings"])
         self.assertIn("conflicting_payloads_in_one_region", result["reasons"])
         self.assertFalse(result["primary_usable"])
 
@@ -92,6 +101,59 @@ class EvidenceTests(unittest.TestCase):
         config["frames"] = {"a.jpg": {**config["default"], "corners": [[-5, 100], [900, 150], [880, 500], [0, 480]]}}
         self.assertEqual(screen_geometry(config, "a.jpg", (1000, 800), 0.25)["status"], "clipped")
 
+    def test_repeated_state_flags_entire_run_without_fitted_offset(self):
+        times = [i * 16_666_667 for i in range(170)]
+        rows = [{"latest_display_index": latest,
+                 "media_reference_monotonic_ns": 5_000_000_000 + elapsed,
+                 "segment": 1}
+                for latest, elapsed in ((146, 0), (146, 40_000_000),
+                                        (146, 59_975_294), (152, 99_942_150),
+                                        (155, 139_899_708), (158, 159_853_021))]
+        checks = repeated_state_checks(rows, times)
+        self.assertEqual([item is not None for item in checks], [True, True, True, False, False, False])
+        self.assertAlmostEqual(checks[0]["camera_span_ms"], 59.975294)
+        result = assess_evidence({"qr_evidence": evidence(146), "temporal_evidence": checks[0]}, [146])
+        self.assertFalse(result["primary_usable"])
+        self.assertEqual(result["status"], "suspected_stale_visual_state")
+
+    def test_normal_oversampling_long_journal_holds_and_pauses_are_not_stale(self):
+        rows = [{"latest_display_index": 2, "media_reference_monotonic_ns": n,
+                 "segment": 1} for n in (0, 10_000_000, 20_000_000)]
+        times = [i * 16_666_667 for i in range(6)]
+        self.assertEqual(repeated_state_checks(rows, times), [None] * 3)
+        rows[-1]["media_reference_monotonic_ns"] = 60_000_000
+        self.assertEqual(repeated_state_checks(rows, times, {2}), [None] * 3)
+        times[3:] = [150_000_000, 166_666_667, 183_333_334]
+        self.assertEqual(repeated_state_checks(rows, times), [None] * 3)
+
+    def test_repeated_state_does_not_bridge_missing_reads_or_segment_resets(self):
+        times = [i * 10_000_000 for i in range(6)]
+        for middle in ({"latest_display_index": None}, {"media_reference_monotonic_ns": None},
+                       {"segment": 2}, {"media_reference_monotonic_ns": -1}):
+            with self.subTest(middle=middle):
+                rows = [{"latest_display_index": 2, "media_reference_monotonic_ns": n,
+                         "segment": 1} for n in (0, 20_000_000, 40_000_000)]
+                rows[1].update(middle)
+                self.assertEqual(repeated_state_checks(rows, times), [None] * 3)
+
+    def test_final_analysis_recomputes_stale_runs_and_retains_diagnostics(self):
+        with TemporaryDirectory() as temp:
+            analysis = recording(Path(temp), count=8)
+            path = analysis / "calibration_analysis.json"
+            source = json.loads(path.read_text())
+            for row in source["frames"][1:3]:
+                row["qr_values_ms"] = source["frames"][0]["qr_values_ms"]
+                row["qr_evidence"] = evidence(10)
+            path.write_text(json.dumps(source))
+            session = load_session(analysis)
+            self.assertEqual(session.audit["counts"]["primary_scored_frames"], 5)
+            self.assertEqual(session.audit["counts"]["evidence_suspected_stale_visual_state"], 3)
+            self.assertEqual(len(session.frames), 8)
+            for row in session.frames[:3]:
+                self.assertIsNotNone(row["diagnostic_newest_decoded_interval_ms"])
+                self.assertTrue(all(target is None for target in row["targets"].values()))
+                self.assertFalse(row["evidence_assessment"]["primary_usable"])
+
     def test_stale_geometry_mismatch_is_flagged(self):
         saved = evidence(10)
         saved["geometry"] = {"status": "valid"}
@@ -102,26 +164,33 @@ class EvidenceTests(unittest.TestCase):
     def test_legacy_intervals_are_diagnostic_only_and_report_does_not_pass(self):
         with TemporaryDirectory() as temp:
             analysis = recording(Path(temp), legacy=True)
-            report = analyze_directories([analysis])
-            self.assertEqual(report["verdict"]["status"], "insufficient_trustworthy_evidence")
-            self.assertFalse(report["verdict"]["independent_every_frame_verified"])
-            self.assertEqual(report["sessions"][0]["audit"]["counts"]["primary_scored_frames"], 0)
-            self.assertIsNotNone(report["frames"][0]["diagnostic_newest_decoded_interval_ms"])
-            self.assertIsNone(report["frames"][0]["targets"]["newest_generation"])
-            saved = write_report(report, Path(temp) / "output", plots=False)
-            self.assertIn("final_analysis_diagnostics.csv", saved["output_files"])
-            self.assertIn("unknown_pixel_evidence", (Path(temp)/"output/final_analysis.md").read_text())
+            session = load_session(analysis)
+            self.assertEqual(session.audit["counts"]["primary_scored_frames"], 0)
+            self.assertIsNotNone(session.frames[0]["diagnostic_newest_decoded_interval_ms"])
+            self.assertIsNone(session.frames[0]["targets"]["newest_generation"])
 
-    def test_resets_disable_history_models_but_allow_constant_baseline(self):
+    def test_resets_preserve_continuity_diagnostics(self):
         with TemporaryDirectory() as temp:
             session = load_session(recording(Path(temp), resets=True))
-            models, selection = _select_models([session.frames], Goals())
-            self.assertEqual(selection["selected_family"], "model_a_constant")
-            self.assertNotIn("model_c_interval_history", models)
-            self.assertNotIn("model_b_cadence_state", models)
-            self.assertTrue(selection["unsupported_recipes"]["model_c_interval_history"])
-            self.assertEqual(session.frames[1]["history_reset_reasons"], ["stream_mapping_or_segment_changed"])
-            self.assertEqual(session.frames[1]["history_length"], 0)
+            self.assertEqual(session.frames[1]["continuity_reset_reasons"],
+                             ["stream_mapping_or_segment_changed"])
+
+    def test_remapped_anchors_do_not_make_same_pipeline_independent(self):
+        with TemporaryDirectory() as temp:
+            sessions = []
+            for i, base_time in enumerate((123_000_000, 123_000_000, 456_000_000)):
+                root = Path(temp) / str(i)
+                root.mkdir()
+                analysis = recording(root)
+                path = root / "recording" / "camera_timing_session.json"
+                saved = json.loads(path.read_text())
+                saved["epochs"][0]["pipeline_zero_monotonic_ns"] += i * 10_000
+                saved["epochs"][0]["pipeline_base_time_ns"] = base_time
+                path.write_text(json.dumps(saved))
+                sessions.append(load_session(analysis))
+            self.assertEqual(sessions[0].stream_keys, sessions[1].stream_keys)
+            self.assertNotEqual(sessions[0].stream_keys, sessions[2].stream_keys)
+            self.assertEqual(sorted(map(len, _stream_components(sessions))), [1, 2])
 
     def test_ambiguous_frames_stay_in_denominator_and_cannot_verify_every_frame(self):
         with TemporaryDirectory() as temp:
@@ -129,25 +198,14 @@ class EvidenceTests(unittest.TestCase):
             rows = session.frames[:2]
             rows[1]["targets"]["newest_generation"] = None
             rows[1]["evidence_assessment"] = {"status": "potentially_missing_newer_generation", "reasons": ["clipped_qr_regions"]}
-            model = {"recipe": {"kind": "fixed_interval"}, "correction_ms": 80.0}
-            metrics, predictions = _evaluate(model, rows, Goals())
-            self.assertEqual(metrics["n"], 1)
+            predictions = [{"estimated_monotonic_ns": r["media_reference_monotonic_ns"] - 80_000_000}
+                           for r in rows]
+            metrics = score_predictions(rows, predictions)
+            self.assertEqual(metrics["scored_frames"], 1)
             self.assertEqual(metrics["camera_frames"], 2)
-            self.assertEqual(metrics["scored_camera_pct"], 50)
-            self.assertEqual(metrics["below_threshold_all_camera_lower_bound_pct"], 50)
-            self.assertFalse(metrics["every_camera_frame_verified"])
-            self.assertIsNone(predictions[1]["interval_residual_ms"])
+            self.assertFalse(metrics["every_saved_frame_meets_goals"])
 
-    def test_complete_variable_history_is_supported_and_fallback_is_explicit(self):
-        with TemporaryDirectory() as temp:
-            session = load_session(recording(Path(temp)))
-            models, _ = _select_models([session.frames], Goals())
-            self.assertIn("model_c_interval_history", models)
-            _, predictions = _evaluate(models["model_c_interval_history"], session.frames, Goals())
-            self.assertEqual(predictions[0]["estimate_status"], "constant_fallback_missing_history")
-            self.assertEqual(predictions[-1]["estimate_status"], "valid")
-
-    def test_export_preserves_pixel_evidence_and_final_analysis_gates_it(self):
+    def test_export_preserves_artifacts_without_discarding_newest_interval(self):
         from collections import OrderedDict
         from unittest.mock import Mock
         from calibration.recording_display import DisplayTimeline, RecordingAnalyzer
@@ -179,20 +237,28 @@ class EvidenceTests(unittest.TestCase):
             (analysis / "calibration_analysis.json").write_text(json.dumps(source))
             frame = load_session(analysis).frames[0]
             self.assertEqual(len(frame["qr_evidence"]["detections"]), 2)
-            self.assertIsNone(frame["targets"]["newest_generation"])
+            self.assertIsNotNone(frame["targets"]["newest_generation"])
             self.assertIsNotNone(frame["diagnostic_newest_decoded_interval_ms"])
-            self.assertIn("clipped_qr_regions", frame["exclusion_reasons"])
+            self.assertIn("clipped_qr_regions", frame["evidence_assessment"]["warnings"])
 
-    def test_positive_report_exports_diagnostics_without_changing_thresholds(self):
+    def test_existing_saved_decode_can_be_reanalyzed_with_older_generations(self):
         with TemporaryDirectory() as temp:
-            report = analyze_directories([recording(Path(temp))])
-            self.assertTrue(report["predictions"])
-            saved = write_report(report, Path(temp) / "output", plots=False)
-            text = (Path(temp) / "output/final_analysis.md").read_text()
-            self.assertIn("prediction range", text)
-            self.assertIn("Largest scored errors", text)
-            self.assertEqual(saved["goals"]["absolute_below_ms"], 10)
-            self.assertIn("missing_independent_stream_validation", saved["verdict"]["blocking_reasons"])
+            analysis = recording(Path(temp))
+            path = analysis / "calibration_analysis.json"
+            source = json.loads(path.read_text())
+            for i, row in enumerate(source["frames"]):
+                latest = 2 * i + 10
+                older = latest - 1
+                row["qr_values_ms"][older % 4] = f"{(10_000_000_000 + older * 10_000_000)//1_000_000:012d}"
+                row["qr_evidence"] = detection_evidence(
+                    [observation(older), observation(latest, (60, 60, 90, 90))], (100, 100), {})
+            path.write_text(json.dumps(source))
+            session = load_session(analysis)
+            self.assertEqual(session.audit["counts"]["primary_scored_frames"], 180)
+            for frame in session.frames:
+                self.assertEqual(frame["targets"]["newest_generation"],
+                                 frame["diagnostic_newest_decoded_interval_ms"])
+                self.assertIsNone(frame["targets"]["common_visibility"])
 
 
 if __name__ == "__main__":

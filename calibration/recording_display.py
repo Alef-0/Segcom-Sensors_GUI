@@ -24,7 +24,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from calibration.display_qt import DISPLAY_JOURNAL_NAME, timing_issues
-from calibration.evidence import assess_evidence, detection_evidence, screen_cell, screen_geometry
+from calibration.evidence import assess_evidence, detection_evidence, repeated_state_checks, screen_cell, screen_geometry
 from calibration.qr import (
     DETECTION_BATCH_SIZE,
     create_qreader,
@@ -45,7 +45,8 @@ CELL_COLORS = (
     "#47d9ff", "#ffc857", "#b8ee69", "#ed9cff", "#ff8f70", "#8de0a6",
     "#9eb8ff", "#f4a8d8", "#d8c66b", "#74d8c8", "#c4a4ff", "#ffb36b",
 )
-LATEST_COLOR = "#fff176"
+SELECTED_QR_FOREGROUND = "#ffffff"
+SELECTED_QR_BACKGROUND = "#000000"
 PARALLEL_FRAME_WORKERS = 2
 PRESENTATIONS_CSV = "display_presentations.csv"
 
@@ -462,7 +463,7 @@ class RecordingAnalyzer:
         self.intrinsics = intrinsics.resolve()
         self.undistorter = Undistorter(self.intrinsics)
         self.parallel_scan = reader is None
-        self.reader = reader or create_qreader()
+        self.reader = reader
         self.cache: OrderedDict[tuple[int, float], dict] = OrderedDict()
         self.cache_limit = DETECTION_BATCH_SIZE * 2
         self.manual_values: dict[int, dict] = {}
@@ -473,8 +474,93 @@ class RecordingAnalyzer:
         )
         if self.screen_geometry_config is not None and not isinstance(self.screen_geometry_config, dict):
             raise ValueError("analysis_screen_geometry.json must contain an object")
+        self.saved_frames = {}
+        self.saved_analysis_alpha = 0.25
+        self.saved_analysis_notice = ""
+        self.review_saved = (self.output_folder / "calibration_analysis.json").is_file()
+        if self.review_saved:
+            self._read_saved_analysis()
+
+    def _read_saved_analysis(self) -> None:
+        path = self.output_folder / "calibration_analysis.json"
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+            if report.get("grid", {}).get("qr_count", self.grid_qrs) != self.grid_qrs:
+                raise ValueError("saved QR grid differs from this recording")
+            alpha = float(report.get("analysis_alpha", 0.25))
+            if not np.isfinite(alpha) or not 0 <= alpha <= 1:
+                raise ValueError("invalid saved undistortion setting")
+            rows = report.get("frames")
+            if not isinstance(rows, list):
+                raise ValueError("saved analysis has no frame list")
+            filenames = {row["filename"] for row in self.rows}
+            saved = {}
+            for row in rows:
+                filename = row.get("filename")
+                if filename not in filenames:
+                    continue
+                values = row.get("qr_values_ms")
+                if (filename in saved or not isinstance(values, list)
+                        or len(values) != self.grid_qrs
+                        or any(value is not None and (
+                            not isinstance(value, str) or len(value) != 12 or not value.isdigit()
+                        ) for value in values)
+                        or any(row.get(key) is not None and not isinstance(row[key], int)
+                               for key in ("pts_ns", "ntp_ns"))):
+                    raise ValueError(f"invalid or duplicate saved values for {filename}")
+                saved[filename] = row
+            self.saved_frames = saved
+            self.saved_analysis_alpha = alpha
+            self.saved_analysis_notice = (
+                f"Saved results: {len(saved)} / {len(self.rows)} frames. "
+                "Browse to check them; GO starts a fresh decode and replaces the saved analysis."
+            )
+        except (OSError, ValueError, TypeError, AttributeError) as error:
+            self.saved_analysis_notice = f"Could not load saved analysis: {error}. GO starts a fresh decode."
+
+    def inspect(self, index: int, alpha: float = 0.25) -> dict:
+        """Review saved values without loading QReader or populating its cache."""
+        if not self.review_saved:
+            return self.analyze(index, alpha)
+        row, original, undistorted = self._load_frame(index, alpha)
+        saved = self.saved_frames.get(row["filename"])
+        evidence = (saved or {}).get("qr_evidence") or {}
+        boxes_match = (
+            abs(alpha - self.saved_analysis_alpha) < 1e-9
+            and evidence.get("image_size") == [original.shape[1], original.shape[0]]
+        )
+        decoded = []
+        if boxes_match:
+            for item in evidence.get("detections", []):
+                box = np.asarray(item.get("bbox"), dtype=float)
+                if box.shape != (4,) or not np.isfinite(box).all():
+                    continue
+                decoded.append({"raw": item.get("raw"), "bbox": box,
+                                "center": ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2),
+                                "confidence": item.get("confidence", 0.0)})
+        result = self._finish_analysis(index, row, original, undistorted, decoded, alpha, cache_result=False)
+        result["saved_values"] = {
+            "pts_ns": saved.get("pts_ns", row.get("pts_ns")) if saved else row.get("pts_ns"),
+            "ntp_ns": saved.get("ntp_ns") if saved else row.get("reference_ntp_ns"),
+            "qrs": tuple(saved["qr_values_ms"]) if saved else (None,) * self.grid_qrs,
+            "manual": bool(saved and saved.get("manual_values")),
+        }
+        result["review_notice"] = (
+            "Saved QR results — no decoding performed."
+            if saved else "No saved QR results for this frame. GO starts a fresh decode."
+        )
+        if saved and not boxes_match:
+            result["review_notice"] += " Saved boxes are unavailable or do not match the current image/undistortion setting."
+        result["qr_evidence"] = evidence
+        return result
+
+    def begin_fresh_analysis(self) -> None:
+        self.review_saved = False
+        self.cache.clear()
 
     def pts_monotonic_ns(self, row: dict) -> int | None:
+        if row.get("media_monotonic_ns") is not None:
+            return int(row["media_monotonic_ns"])
         for key in ("frame_monotonic_ns", "captured_monotonic_ns"):
             if row.get(key) is not None:
                 return int(row[key])
@@ -515,6 +601,8 @@ class RecordingAnalyzer:
     def frame_values(self, result: dict) -> dict:
         if result["index"] in self.manual_values:
             return self.manual_values[result["index"]]
+        if "saved_values" in result:
+            return result["saved_values"]
         row = result["row"]
         return {
             "pts_ns": row.get("pts_ns"),
@@ -542,7 +630,7 @@ class RecordingAnalyzer:
         received_ns = int(received_ns) if received_ns is not None else None
         candidates = []
         ignored = []
-        if values["manual"]:
+        if values["manual"] or "saved_values" in result:
             source_values = [
                 {"cell": cell, "raw": raw}
                 for cell, raw in enumerate(values["qrs"])
@@ -802,6 +890,8 @@ class RecordingAnalyzer:
         undistorted: np.ndarray,
         decoded: list[dict],
         alpha: float,
+        *,
+        cache_result: bool = True,
     ) -> dict:
         detections = order_by_cell(
             decoded,
@@ -866,11 +956,12 @@ class RecordingAnalyzer:
             "latest": latest,
             "pts_monotonic_ns": reference_ns,
         }
-        key = index, alpha
-        self.cache[key] = result
-        self.cache.move_to_end(key)
-        while len(self.cache) > self.cache_limit:
-            self.cache.popitem(last=False)
+        if cache_result:
+            key = index, alpha
+            self.cache[key] = result
+            self.cache.move_to_end(key)
+            while len(self.cache) > self.cache_limit:
+                self.cache.popitem(last=False)
         return result
 
     def analyze_batch(
@@ -891,6 +982,8 @@ class RecordingAnalyzer:
                 pending.append(index)
 
         if executor is None:
+            if pending and self.reader is None:
+                self.reader = create_qreader()
             loaded = [self._load_frame(index, alpha) for index in pending]
             decoded_batches = decode_qrs_with_grid_retries_batch(
                 self.reader,
@@ -1074,6 +1167,31 @@ class RecordingAnalyzer:
         finally:
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=True)
+        temporal_rows = [{
+            "latest_display_index": frame.get("latest_display_index"),
+            "media_reference_monotonic_ns": frame.get("camera_reference_monotonic_ns"),
+            "segment": tuple(self.rows[frame["frame_number"] - 1].get(key)
+                             for key in ("stream_epoch", "mapping_revision", "segment_epoch")),
+        } for frame in frame_reports]
+        for frame, temporal in zip(frame_reports, repeated_state_checks(
+                temporal_rows, self.timeline.presentation_times, self.timeline.paused)):
+            frame["temporal_evidence"] = temporal
+            if temporal is None:
+                continue
+            frame["evidence_assessment"] = assess_evidence(
+                frame, frame["display_indices"],
+                transition=bool(frame["display_indices"] and
+                                max(frame["display_indices"]) - min(frame["display_indices"])
+                                >= self.timeline.visible_qrs),
+            )
+            if frame["validation"].startswith("accepted"):
+                counts["accepted_frames"] -= 1
+            frame["validation"] = "skipped_suspected_stale_visual_state"
+            frame["reason"] = temporal["reason"]
+            counts["frames_suspected_stale_visual_state"] += 1
+        clean_offsets = [frame["pts_minus_latest_qr_ms"] for frame in frame_reports
+                         if frame["validation"] == "accepted_clean"
+                         and frame.get("pts_minus_latest_qr_ms") is not None]
         interval_analysis = self._annotate_interval_analysis(frame_reports)
         return {
             "recording_directory": str(self.folder),
@@ -1176,10 +1294,11 @@ class AnalysisWorker(threading.Thread):
             kind, request, payload = job
             try:
                 if kind == "frame":
-                    result = self.model.analyze(payload["index"], payload["alpha"])
+                    result = self.model.inspect(payload["index"], payload["alpha"])
                     self.results.put((kind, request, result))
                 elif kind == "scan":
                     self.cancel.clear()
+                    self.model.begin_fresh_analysis()
                     result = self.model.summarize(
                         payload["alpha"], self.cancel,
                         lambda done, total, frame: self.results.put(
@@ -1217,19 +1336,20 @@ class CalibrationWindow:
         self.current_check = None
         self.saved_output: Path | None = None
         self.variant = tk.StringVar(value="Undistorted")
-        self.alpha = tk.StringVar(value=f"{alpha:g}")
+        self.alpha = tk.StringVar(value=f"{model.saved_analysis_alpha if model.review_saved else alpha:g}")
         self.show_all_times = tk.BooleanVar(value=True)
         self.draw_all_boxes = tk.BooleanVar(value=True)
         self.position = tk.StringVar(value="1")
         self.title = tk.StringVar(value="Loading first frame…")
         self.pts_edit = tk.StringVar()
         self.ntp_edit = tk.StringVar()
+        self.monotonic_time = tk.StringVar()
         self.qr_edits = [tk.StringVar() for _ in range(model.grid_qrs)]
-        self.exhibited = tk.StringVar(value="LATEST EXHIBITED TIME\nLoading…")
+        self.exhibited = tk.StringVar(value="SELECTED DISPLAYED QR TIME\nLoading…")
         self.codes = tk.StringVar(value="")
         self.status = tk.StringVar(value="QReader uses the undistorted image at alpha 0.25.")
         self.summary = tk.StringVar(
-            value="Press GO to decode the full folder and create the analysis files."
+            value=model.saved_analysis_notice or "Press GO to decode the full folder and create the analysis files."
         )
         self.scan_progress = tk.StringVar(value=f"Ready: 0 / {len(model.rows)}")
         self._build()
@@ -1299,13 +1419,21 @@ class CalibrationWindow:
         ttk.Entry(information, textvariable=self.pts_edit).grid(row=1, column=0, sticky="ew", padx=(0, 4))
         ttk.Label(information, text="NTP Unix time (seconds)").grid(row=0, column=1, sticky="w")
         ttk.Entry(information, textvariable=self.ntp_edit).grid(row=1, column=1, sticky="ew", padx=4)
+        ttk.Label(information, text="Computer monotonic time (seconds)").grid(
+            row=0, column=2, sticky="w"
+        )
+        ttk.Entry(
+            information,
+            textvariable=self.monotonic_time,
+            state="readonly",
+        ).grid(row=1, column=2, sticky="ew", padx=4)
         ttk.Button(information, text="APPLY AND CONTINUE", command=self.apply_edits).grid(
-            row=1, column=2, padx=(8, 4)
+            row=1, column=3, padx=(8, 4)
         )
         ttk.Button(information, text="RESTORE DETECTED", command=self.restore_detected).grid(
-            row=1, column=3, padx=(4, 0)
+            row=1, column=4, padx=(4, 0)
         )
-        for column in range(2):
+        for column in range(3):
             information.columnconfigure(column, weight=1)
 
         qr_information = ttk.LabelFrame(
@@ -1336,9 +1464,17 @@ class CalibrationWindow:
         for column in range(self.model.timeline.grid_columns):
             qr_information.columnconfigure(column, weight=1)
         style = ttk.Style(self.root)
-        style.configure("Latest.TLabel", background=LATEST_COLOR, foreground="#191600")
+        style.configure(
+            "Selected.TLabel",
+            background=SELECTED_QR_BACKGROUND,
+            foreground=SELECTED_QR_FOREGROUND,
+        )
         ttk.Label(
-            outer, textvariable=self.exhibited, padding=8, anchor="center", style="Latest.TLabel"
+            outer,
+            textvariable=self.exhibited,
+            padding=8,
+            anchor="center",
+            style="Selected.TLabel",
         ).pack(fill="x")
         ttk.Label(outer, textvariable=self.codes, wraplength=1350).pack(anchor="w", fill="x")
         self.canvas = tk.Canvas(outer, background="#15191e", highlightthickness=0)
@@ -1373,8 +1509,9 @@ class CalibrationWindow:
         self.position.set(str(self.index + 1))
         self.slider.set(self.index + 1)
         filename = self.model.rows[self.index]["filename"]
-        self.title.set(f"{filename} — {self.index + 1} / {len(self.model.rows)} — decoding…")
-        self.status.set("QReader is decoding the undistorted image.")
+        action = "loading saved results…" if self.model.review_saved else "decoding…"
+        self.title.set(f"{filename} — {self.index + 1} / {len(self.model.rows)} — {action}")
+        self.status.set("Loading saved QR results." if self.model.review_saved else "QReader is decoding the undistorted image.")
         self.canvas.delete("all")
         self.worker.submit("frame", self.request, index=self.index, alpha=float(self.alpha.get()))
 
@@ -1458,17 +1595,22 @@ class CalibrationWindow:
         )
         self.pts_edit.set(editable_seconds(values["pts_ns"]))
         self.ntp_edit.set(editable_seconds(values["ntp_ns"]))
+        self.monotonic_time.set(
+            editable_seconds(
+                self.model.pts_monotonic_for_value(row, values["pts_ns"])
+            )
+        )
         for variable, raw in zip(self.qr_edits, values["qrs"]):
             variable.set(raw or "")
         if not check["valid"]:
             prefix = "Frame skipped" if check.get("skippable") else "Validation stopped"
-            self.exhibited.set(f"LATEST EXHIBITED TIME\n{prefix}: {check['reason']}")
+            self.exhibited.set(f"SELECTED DISPLAYED QR TIME\n{prefix}: {check['reason']}")
         else:
             offset = "" if check["offset_ms"] is None else (
                 f" · camera PTS minus displayed QR {check['offset_ms']:.3f} ms"
             )
             self.exhibited.set(
-                f"LATEST VALID DISPLAYED QR TIME\n{payload_time(check['latest_raw'])} · "
+                f"SELECTED VALID DISPLAYED QR TIME\n{payload_time(check['latest_raw'])} · "
                 f"{self.model.cell_names[check['latest_cell']]} · {check['timing_status']}{offset}"
             )
         code_lines = [
@@ -1477,7 +1619,8 @@ class CalibrationWindow:
         ]
         self.codes.set("   |   ".join(code_lines) if code_lines else "No QR code detected.")
         if not check["valid"]:
-            source = "manual values" if values["manual"] else "QReader detections"
+            source = ("manual values" if values["manual"] else
+                      "saved results" if "saved_values" in result else "QReader detections")
             action = "Skipped" if check.get("skippable") else "Stopped"
             self.status.set(f"{action} on {source}: {check['reason']}")
         else:
@@ -1489,14 +1632,16 @@ class CalibrationWindow:
                 (
                     "Manual values accepted. "
                     if values["manual"]
-                    else f"{check['matched_readable_qrs']} journal-matched QR value(s) accepted; latest selected. "
+                    else f"{check['matched_readable_qrs']} journal-matched QR value(s) accepted; one selected. "
                 )
                 + position_warning
-                + "Latest display timing: " + (
+                + "Selected display timing: " + (
                     ", ".join(check["issues"])
                     if check["issues"] else "clean."
                 )
             )
+        if result.get("review_notice"):
+            self.status.set(result["review_notice"] + " " + self.status.get())
         self.draw()
 
     def show_summary(self, report: dict) -> None:
@@ -1584,26 +1729,51 @@ class CalibrationWindow:
         )
         values = check["values"]
         for item in self.current["observations"]:
-            is_latest = (
+            raw = item.get("raw")
+            if not isinstance(raw, str) or not raw.isdigit() or len(raw) != 12:
+                continue
+            is_selected = (
                 item["display_index"] == latest_display_index
             )
-            if not is_latest and not self.draw_all_boxes.get() and not self.show_all_times.get():
+            if not is_selected and not self.draw_all_boxes.get() and not self.show_all_times.get():
                 continue
             points = item[
                 "undistorted_points" if self.variant.get() == "Undistorted" else "original_points"
             ] * scale + np.array([left, top])
-            color = LATEST_COLOR if is_latest else CELL_COLORS[item["cell"] % len(CELL_COLORS)]
-            if is_latest or self.draw_all_boxes.get():
+            color = (
+                SELECTED_QR_FOREGROUND
+                if is_selected
+                else CELL_COLORS[item["cell"] % len(CELL_COLORS)]
+            )
+            if is_selected:
+                coordinates = points.ravel().tolist()
                 self.canvas.create_polygon(
-                    points.ravel().tolist(), fill="", outline=color, width=4 if is_latest else 2
+                    coordinates,
+                    fill="",
+                    outline=SELECTED_QR_BACKGROUND,
+                    width=7,
                 )
-            if is_latest or self.show_all_times.get():
-                text = ("LATEST · " if is_latest else "") + payload_time(item["raw"])
+                self.canvas.create_polygon(
+                    coordinates,
+                    fill="",
+                    outline=SELECTED_QR_FOREGROUND,
+                    width=3,
+                )
+            elif self.draw_all_boxes.get():
+                self.canvas.create_polygon(
+                    points.ravel().tolist(), fill="", outline=color, width=2
+                )
+            if is_selected or self.show_all_times.get():
+                text = payload_time(raw)
                 label = self.canvas.create_text(
                     points[:, 0].min() + 4, max(4, points[:, 1].min() - 26), text=text, fill=color,
                     anchor="nw", font=("TkDefaultFont", 10, "bold"),
                 )
-                background = self.canvas.create_rectangle(self.canvas.bbox(label), fill="#15191e", outline=color)
+                background = self.canvas.create_rectangle(
+                    self.canvas.bbox(label),
+                    fill=(SELECTED_QR_BACKGROUND if is_selected else "#15191e"),
+                    outline=color,
+                )
                 self.canvas.tag_raise(label, background)
 
     def close(self) -> None:

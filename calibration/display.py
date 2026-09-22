@@ -542,6 +542,11 @@ def run_calibration_display(
             "display_driver": pygame.display.get_driver(),
             "vsync_requested": True,
             "timestamp_mode": timestamp_mode,
+            "qr_preparation": (
+                "one-predicted-marker-ahead"
+                if timestamp_mode == "predicted-flip"
+                else "none"
+            ),
             "timestamp_semantics": (
                 "marker_ns and the QR payload predict the current pacing deadline"
                 if timestamp_mode == "predicted-flip"
