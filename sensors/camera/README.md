@@ -35,10 +35,10 @@ The pipeline policy recognizes three backends:
 | `orin` | `nvv4l2decoder` plus `nvvidconv` | NVIDIA Jetson |
 | `cpu` | `avdec_h264` plus `videoconvert` | Software fallback |
 
-Only backends whose required GStreamer elements exist are attempted. A stream
-that cannot produce a first frame within five seconds is retried, then moves to
-the next backend when available. After three failed pipeline attempts, the
-camera is reported closed.
+Only backends whose required GStreamer elements exist are attempted. Each
+backend gets a five-second first-frame timeout. If an attempt produces no frame,
+the camera immediately advances to the next available backend. After the final
+backend, three failed attempts close the camera.
 
 Set `SEGCOM_CAMERA_DECODER=rtx`, `orin`, or `cpu` to request a path explicitly.
 Hardware requests still fall back to CPU when their elements are missing.
@@ -106,7 +106,7 @@ explicitly identify an NTP or Unix clock. It is retained as diagnostic evidence
 and never moves the segment-derived image time. Unknown reference clocks remain raw
 and are flagged instead of being guessed.
 
-Each calibration row keeps the independent observations needed to recompute the
+Each saved camera row keeps the independent observations needed to recompute the
 relationship: raw PTS, segment running time, the early application-arrival
 boundary, later processing timestamps, queue occupancy, declared reference-clock
 data, mapped media time, provisional estimate, and flags. Mapping anchors are
@@ -114,7 +114,8 @@ stored by pipeline restart, mapping revision, and segment revision in the sessio
 file rather than repeated in every row.
 
 Invalid-timing frames and writer-queue drops are not saved as images, but their
-reason and available timing fields are retained in `camera_timing_events.jsonl`.
+reason and available timing fields are retained in `camera_timing_events.jsonl`
+for both normal and calibration recordings.
 A mapped running-time interval above 1.75 nominal frame periods is reported as
 an unusual-gap candidate, not as confirmed frame loss.
 This avoids misclassifying the observed alternating 20/40 ms cadence and its

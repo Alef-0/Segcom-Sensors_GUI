@@ -3,6 +3,10 @@ from pathlib import Path
 
 import FreeSimpleGUI as sg
 
+from calibration import (
+    CALIBRATION_PIPELINE_RESTART_DELAY_SECONDS,
+    CALIBRATION_RECORDING_DELAY_SECONDS,
+)
 from interface_core import Configurations as BaseConfigurations
 from sensors.camera.timing_defaults import DEFAULT_CAMERA_TIMESTAMP_CORRECTION_MS
 
@@ -376,7 +380,9 @@ class Configurations(BaseConfigurations):
             ],
             [
                 sg.Text(
-                    "The fullscreen QR view records after 3 seconds and stops recording when closed.",
+                    f"The camera stream restarts after {CALIBRATION_PIPELINE_RESTART_DELAY_SECONDS:g} seconds. "
+                    f"The fullscreen QR view records after {CALIBRATION_RECORDING_DELAY_SECONDS:g} "
+                    "seconds from its first QR frame and stops recording when closed.",
                     expand_x=True,
                     justification="center",
                 )

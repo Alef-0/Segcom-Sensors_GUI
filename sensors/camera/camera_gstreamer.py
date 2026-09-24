@@ -8,6 +8,7 @@ import cv2 as cv
 import gi
 import numpy as np
 
+from calibration import CALIBRATION_PIPELINE_RESTART_DELAY_SECONDS
 from calibration.scheduler_priority import CalibrationSchedulerPriority
 from processing import CameraSnapshotRecorder
 from processing.visualization.transposition import (
@@ -70,6 +71,8 @@ class GStreamerPipeline:
         self.recording_frames_per_30 = CAMERA_FRAME_RATE
         self.calibration_mode = False
         self.calibration_recording = False
+        self.calibration_pipeline_restart_delay_seconds: float | None = None
+        self.calibration_restart_waiting_for_preview = False
         self.calibration_scheduler_priority = CalibrationSchedulerPriority(
             "calibration camera and recorder"
         )
@@ -77,6 +80,7 @@ class GStreamerPipeline:
             self._report_snapshot,
             self._report_recording_drop,
         )
+        self.snapshot_recorder.prepare()
         self.timestamp_policy = FrameTimestampPolicy(
             capture_correction_ms=self.latency_adjustment_ms,
             capture_calibration_version=DEFAULT_CAMERA_CALIBRATION_VERSION,
@@ -181,7 +185,7 @@ class GStreamerPipeline:
         self._last_pts_gap_warning = now
 
     def _start_snapshot_recording(self, value):
-        """Attach the writer to the running stream, preserving decoder history."""
+        """Enable the waiting writer on the running stream, preserving decoder history."""
         if self.snapshot_recorder.active:
             self._put_status("camera_recording_error", "Camera recording is already active")
             return
@@ -810,6 +814,26 @@ class GStreamerPipeline:
                         self._connect_camera()
                 elif event == "calibration_camera":
                     restart = self._set_calibration_camera(value.get("active")) or restart
+                elif event == "calibration_pipeline_restart":
+                    if not self.connected or not self.calibration_mode:
+                        self._put_status(
+                            "calibration_pipeline_restart_error",
+                            {"message": "Camera 4 must be open before restarting for calibration"},
+                        )
+                    elif self.snapshot_recorder.active:
+                        self._put_status(
+                            "calibration_pipeline_restart_error",
+                            {"message": "Stop the current camera recording before restarting for calibration"},
+                        )
+                    else:
+                        self.calibration_pipeline_restart_delay_seconds = float(
+                            value.get(
+                                "delay_seconds",
+                                CALIBRATION_PIPELINE_RESTART_DELAY_SECONDS,
+                            )
+                        )
+                        self.exit_reason = _RESULT_RESTART
+                        restart = True
                 elif event == "camera_decoder_backend":
                     restart = self._set_decoder_backend(value) or restart
                 elif event == "camera_latency_settings":
@@ -869,6 +893,12 @@ class GStreamerPipeline:
                 self._put_status("transposition_error", str(error))
         cv.imshow("CALIBRATION CAMERA 4" if self.calibration_mode else "CAMERA", frame)
         cv.waitKey(1)
+        if self.calibration_restart_waiting_for_preview:
+            self.calibration_restart_waiting_for_preview = False
+            self._put_status(
+                "calibration_pipeline_ready",
+                {"channel": self.channel, "stream_epoch": self.stream_epoch},
+            )
         return GLib.SOURCE_CONTINUE
 
     def check_first_frame(self):
@@ -1040,6 +1070,22 @@ def gstreamer_main(connection, pool, shutdown_event, transposition_channel=None)
     try:
         while not shutdown_event.is_set():
             pipeline.process_commands()
+            if (
+                pipeline.calibration_pipeline_restart_delay_seconds is not None
+                and pipeline.main_loop is None
+            ):
+                delay = pipeline.calibration_pipeline_restart_delay_seconds
+                pipeline.calibration_pipeline_restart_delay_seconds = None
+                if not pipeline.connected:
+                    pipeline._put_status(
+                        "calibration_pipeline_restart_error",
+                        {"message": "Camera 4 closed before its video preview resumed"},
+                    )
+                    continue
+                shutdown_event.wait(delay)
+                if shutdown_event.is_set():
+                    continue
+                pipeline.calibration_restart_waiting_for_preview = True
             if pipeline.channel_changed:
                 failed_attempts = 0
                 pipeline.channel_changed = False
@@ -1049,7 +1095,29 @@ def gstreamer_main(connection, pool, shutdown_event, transposition_channel=None)
                 continue
 
             result, received_frame = pipeline.run()
-            if result in (_RESULT_RESTART, _RESULT_CLOSED):
+            if result == _RESULT_RESTART:
+                delay = pipeline.calibration_pipeline_restart_delay_seconds
+                if delay is not None:
+                    pipeline.calibration_pipeline_restart_delay_seconds = None
+                    shutdown_event.wait(delay)
+                    if shutdown_event.is_set():
+                        continue
+                    pipeline.calibration_restart_waiting_for_preview = True
+                failed_attempts = 0
+                continue
+            if result == _RESULT_CLOSED:
+                if pipeline.calibration_pipeline_restart_delay_seconds is not None:
+                    pipeline.calibration_pipeline_restart_delay_seconds = None
+                    pipeline._put_status(
+                        "calibration_pipeline_restart_error",
+                        {"message": "Camera 4 closed before its video preview resumed"},
+                    )
+                if pipeline.calibration_restart_waiting_for_preview:
+                    pipeline.calibration_restart_waiting_for_preview = False
+                    pipeline._put_status(
+                        "calibration_pipeline_restart_error",
+                        {"message": "Camera 4 closed before its video preview resumed"},
+                    )
                 failed_attempts = 0
                 continue
             if shutdown_event.is_set() or not pipeline.connected:
@@ -1075,6 +1143,12 @@ def gstreamer_main(connection, pool, shutdown_event, transposition_channel=None)
                         f"{pipeline.current_decoder_backend.name} pipeline"
                     )
                 )
+                if pipeline.calibration_restart_waiting_for_preview:
+                    pipeline.calibration_restart_waiting_for_preview = False
+                    pipeline._put_status(
+                        "calibration_pipeline_restart_error",
+                        {"message": "Camera video did not return after the calibration restart"},
+                    )
                 pipeline.connected = False
                 pipeline._fail_manual_snapshot("Camera pipeline failed before taking the snapshot")
                 if pipeline.snapshot_recorder.active:
@@ -1093,6 +1167,7 @@ def gstreamer_main(connection, pool, shutdown_event, transposition_channel=None)
             shutdown_event.wait(PIPELINE_RETRY_DELAY_SECONDS)
     finally:
         pipeline._stop_snapshot_recording()
+        pipeline.snapshot_recorder.close()
         pipeline._fail_manual_snapshot("Camera process stopped before taking the snapshot")
         pipeline._remove_sources()
         if pipeline.pipeline:

@@ -132,11 +132,10 @@ a timing event with the information available at rejection.
 
 The separate camera latency adjustment provisionally defaults to 87.348 ms. It is subtracted
 when associating a camera observation with radar time and is recorded in
-metadata. It does not replace or configure the RTSP jitter buffer. The current
-repeated recordings keep their interval-aware fixed candidates within 2 ms, but
-they share one camera stream epoch. Keep the value provisional until it passes
-a separately restarted camera/display session, and recheck it after changes to
-the DVR, decoder, network path, or capture setup.
+metadata. It does not replace or configure the RTSP jitter buffer. Keep the
+value provisional until it passes a separately restarted camera/display
+session, and recheck it after changes to the DVR, decoder, network path, or
+capture setup.
 
 See `sensors/camera/README.md` for the pipeline and timestamp policy in more detail.
 
@@ -206,15 +205,16 @@ camera intrinsics, an undistorted image, and alpha 0.25 by default. QReader
 detects every QR bounding box, retries grid cells without a readable result,
 and orders detections by grid cell. When an existing sibling `_analysis` folder
 contains saved results, opening the viewer loads those QR values and compatible
-boxes for review without decoding or writing files. Otherwise the first frame is
-decoded when the viewer opens. Fresh full-folder decoding begins only after **GO — DECODE FULL FOLDER** is
-pressed, and each completed frame is shown. A frame is accepted when at least
-one readable QR matches its journal; camera-grid position disagreements remain
-visible as warnings. Unreadable and invalid detections are retained as
-diagnostics while the latest journal-matched QR supplies the offset. The PTS,
-NTP, and configured grid values are editable without automatically starting a
-scan. Finishing the full scan writes `calibration_analysis.json` and
-`calibration_frames.csv` to a sibling
+boxes for review without decoding or writing files. When saved results are
+absent or incomplete, opening a frame does not decode it; **GO · Decode
+recording** explicitly starts a fresh full-folder scan. The current frame stays
+displayed while the status line reports scan progress. A frame is accepted when
+at least one readable QR matches its journal; camera-grid position
+disagreements remain visible as warnings. Unreadable and invalid detections are
+retained as diagnostics while the latest journal-matched QR supplies the
+offset. The viewer has no editable PTS, NTP, or grid controls. Finishing the
+full scan writes `calibration_analysis.json`, `calibration_frames.csv`, and
+`display_presentations.csv` to a sibling
 `<recording-folder-name>_analysis` directory. The launcher now saves evidence only
 unless you supply `--offset-file` from a separate laboratory calibration. With
 that file, it evaluates one frozen correction after a fresh scan. Reviewing

@@ -1,13 +1,17 @@
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
 
 from calibration.evidence import assess_evidence, detection_evidence, repeated_state_checks, screen_cell, screen_geometry
-from calibration.final_analysis import _stream_components, load_session
+from calibration.anchor_analysis import _stream_components, load_session
+from calibration.qr import timestamp_payload
+from calibration.recording_display import RecordingAnalyzer
 from analyze_pts_anchor import score_predictions
+from tests.calibration.support import build_calibration_analysis_recording
 
 
 def observation(index=10, box=(10, 10, 40, 40)):
@@ -20,44 +24,91 @@ def evidence(index):
     return detection_evidence([observation(index)], (100, 100), {"status": "unavailable"})
 
 
-def recording(root, *, legacy=False, resets=False, count=180):
-    folder = root / "recording"
-    folder.mkdir()
-    analysis = root / "recording_analysis"
-    analysis.mkdir()
-    zero = 10_000_000_000
-    display = [{"kind": "session", "grid_qrs": 4, "visible_qrs": 1}]
-    for i in range(count * 2 + 20):
-        stamp = zero + i * 10_000_000
-        display.append({"kind": "frame", "index": i, "cell": i % 4,
-                        "marker_ns": stamp, "presentation_return_ns": stamp})
-    cameras, decoded = [], []
-    for i in range(count):
-        latest = 2 * i + 10
-        pts = latest * 10_000_000 + 85_000_000 + (i % 2) * 1_000_000
-        filename = f"images/camera_{i+1:06d}.jpg"
-        cameras.append({"frame": filename, "stream_epoch": 1, "segment_epoch": 1,
-                        "mapping_revision": i if resets else 0,
-                        "running_time_ns": pts, "pts_ns": pts,
-                        "media_monotonic_ns": zero + pts,
-                        "application_arrival_monotonic_ns": zero + pts + 50_000_000})
-        values = [None] * 4
-        values[latest % 4] = f"{(zero + latest * 10_000_000)//1_000_000:012d}"
-        row = {"filename": filename, "qr_values_ms": values}
-        if not legacy:
-            row["qr_evidence"] = evidence(latest)
-        decoded.append(row)
-    for name, rows in (("display_timestamps.jsonl", display), ("camera_timestamps.jsonl", cameras)):
-        (folder / name).write_text("".join(json.dumps(row) + "\n" for row in rows))
-    (folder / "camera_timing_session.json").write_text(json.dumps({"epochs": [
-        {"stream_epoch": 1, "mapping_revision": 0, "segment_epoch": 1,
-         "pipeline_zero_monotonic_ns": zero}]}))
-    (analysis / "calibration_analysis.json").write_text(json.dumps({
-        "recording_directory": str(folder), "frames": decoded}))
-    return analysis
+def temporal_confirmation_pair():
+    timeline_frames = [
+        {"index": index, "cell": index % 4,
+         "marker_ns": 10_000_000_000_000 + index * 16_000_000}
+        for index in range(8)
+    ]
+
+    def detection(group, display_index, cell, box, *, raw=None, confidence=0.9):
+        if raw is None and display_index is not None:
+            raw = timestamp_payload(timeline_frames[display_index]["marker_ns"])
+        return {
+            "group": group, "display_index": display_index, "raw": raw,
+            "detected_cell": cell, "screen_cell": None,
+            "position_basis": "camera_image_grid",
+            "journal_cell": timeline_frames[display_index]["cell"] if display_index is not None else None,
+            "bbox": list(box), "original_points": [[box[0], box[1]], [box[2], box[1]],
+                                                     [box[2], box[3]], [box[0], box[3]]],
+            "confidence": confidence, "clipped": False,
+        }
+
+    previous_detections = [
+        detection(0, 4, 0, (5, 5, 25, 25)),
+        detection(1, 5, 1, (10, 10, 30, 30)),
+        detection(2, None, 2, (40, 10, 60, 30), raw=None),
+    ]
+    following_detections = [
+        detection(0, 5, 1, (11, 11, 31, 31)),
+        detection(1, 6, 2, (41, 11, 61, 31)),
+    ]
+
+    def result(index, detections, unreadable_groups=()):
+        observations = [{"undistorted_points": np.asarray(row["original_points"], dtype=float)}
+                        for row in detections]
+        return {
+            "index": index,
+            "row": {"stream_epoch": 1, "mapping_revision": 0, "segment_epoch": 1},
+            "observations": observations,
+            "qr_evidence": {"image_size": [100, 100], "detections": detections,
+                            "unreadable_groups": list(unreadable_groups), "conflicting_groups": []},
+        }
+
+    model = RecordingAnalyzer.__new__(RecordingAnalyzer)
+    model.manual_values = {}
+    model.timeline = SimpleNamespace(frames=timeline_frames)
+    return model, result(18, previous_detections, (2,)), result(19, following_detections)
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_temporal_successor_is_inferred_after_sequence_and_position_confirmation(self):
+        model, previous, following = temporal_confirmation_pair()
+
+        inferred = model._confirm_temporal_successor(previous, following)
+
+        self.assertEqual(len(inferred), 1)
+        self.assertEqual(inferred[0]["display_index"], 6)
+        self.assertEqual(inferred[0]["raw"], timestamp_payload(model.timeline.frames[6]["marker_ns"]))
+        self.assertEqual(inferred[0]["cell"], 2)
+        self.assertEqual(inferred[0]["supporting_readable_display_indices"], [4, 5])
+        self.assertEqual(inferred[0]["confirmation_frame_number"], 20)
+        self.assertGreaterEqual(inferred[0]["candidate_bbox_iou"], 0.35)
+        self.assertGreaterEqual(inferred[0]["predecessor_bbox_iou"], 0.35)
+
+    def test_temporal_successor_requires_two_consecutive_readable_predecessors(self):
+        model, previous, following = temporal_confirmation_pair()
+        previous["qr_evidence"]["detections"] = previous["qr_evidence"]["detections"][1:]
+        previous["qr_evidence"]["unreadable_groups"] = [2]
+        previous["observations"] = previous["observations"][1:]
+
+        self.assertEqual(model._confirm_temporal_successor(previous, following), [])
+
+    def test_temporal_successor_requires_same_candidate_and_predecessor_cells(self):
+        for target, row_index, changed_cell in (("previous", 2, 3), ("following", 0, 0)):
+            with self.subTest(target=target, cell=changed_cell):
+                model, previous, following = temporal_confirmation_pair()
+                frame = previous if target == "previous" else following
+                frame["qr_evidence"]["detections"][row_index]["detected_cell"] = changed_cell
+
+                self.assertEqual(model._confirm_temporal_successor(previous, following), [])
+
+    def test_temporal_successor_requires_bbox_overlap_in_both_tracks(self):
+        model, previous, following = temporal_confirmation_pair()
+        following["qr_evidence"]["detections"][1]["bbox"] = [70, 10, 90, 30]
+
+        self.assertEqual(model._confirm_temporal_successor(previous, following), [])
+
     def test_unreadable_retry_of_readable_region_is_not_missing_code(self):
         saved = detection_evidence([observation(), observation(None)], (100, 100), {})
         self.assertEqual(saved["physical_detection_groups"], 1)
@@ -136,9 +187,9 @@ class EvidenceTests(unittest.TestCase):
                 rows[1].update(middle)
                 self.assertEqual(repeated_state_checks(rows, times), [None] * 3)
 
-    def test_final_analysis_recomputes_stale_runs_and_retains_diagnostics(self):
+    def test_anchor_analysis_recomputes_stale_runs_and_retains_diagnostics(self):
         with TemporaryDirectory() as temp:
-            analysis = recording(Path(temp), count=8)
+            analysis = build_calibration_analysis_recording(Path(temp), count=8)
             path = analysis / "calibration_analysis.json"
             source = json.loads(path.read_text())
             for row in source["frames"][1:3]:
@@ -163,7 +214,7 @@ class EvidenceTests(unittest.TestCase):
 
     def test_legacy_intervals_are_diagnostic_only_and_report_does_not_pass(self):
         with TemporaryDirectory() as temp:
-            analysis = recording(Path(temp), legacy=True)
+            analysis = build_calibration_analysis_recording(Path(temp), legacy=True)
             session = load_session(analysis)
             self.assertEqual(session.audit["counts"]["primary_scored_frames"], 0)
             self.assertIsNotNone(session.frames[0]["diagnostic_newest_decoded_interval_ms"])
@@ -171,7 +222,7 @@ class EvidenceTests(unittest.TestCase):
 
     def test_resets_preserve_continuity_diagnostics(self):
         with TemporaryDirectory() as temp:
-            session = load_session(recording(Path(temp), resets=True))
+            session = load_session(build_calibration_analysis_recording(Path(temp), resets=True))
             self.assertEqual(session.frames[1]["continuity_reset_reasons"],
                              ["stream_mapping_or_segment_changed"])
 
@@ -181,7 +232,7 @@ class EvidenceTests(unittest.TestCase):
             for i, base_time in enumerate((123_000_000, 123_000_000, 456_000_000)):
                 root = Path(temp) / str(i)
                 root.mkdir()
-                analysis = recording(root)
+                analysis = build_calibration_analysis_recording(root)
                 path = root / "recording" / "camera_timing_session.json"
                 saved = json.loads(path.read_text())
                 saved["epochs"][0]["pipeline_zero_monotonic_ns"] += i * 10_000
@@ -194,7 +245,7 @@ class EvidenceTests(unittest.TestCase):
 
     def test_ambiguous_frames_stay_in_denominator_and_cannot_verify_every_frame(self):
         with TemporaryDirectory() as temp:
-            session = load_session(recording(Path(temp)))
+            session = load_session(build_calibration_analysis_recording(Path(temp)))
             rows = session.frames[:2]
             rows[1]["targets"]["newest_generation"] = None
             rows[1]["evidence_assessment"] = {"status": "potentially_missing_newer_generation", "reasons": ["clipped_qr_regions"]}
@@ -210,7 +261,7 @@ class EvidenceTests(unittest.TestCase):
         from unittest.mock import Mock
         from calibration.recording_display import DisplayTimeline, RecordingAnalyzer
         with TemporaryDirectory() as temp:
-            analysis = recording(Path(temp), count=1)
+            analysis = build_calibration_analysis_recording(Path(temp), count=1)
             folder = analysis.with_name("recording")
             model = RecordingAnalyzer.__new__(RecordingAnalyzer)
             model.grid_qrs = 4
@@ -243,7 +294,7 @@ class EvidenceTests(unittest.TestCase):
 
     def test_existing_saved_decode_can_be_reanalyzed_with_older_generations(self):
         with TemporaryDirectory() as temp:
-            analysis = recording(Path(temp))
+            analysis = build_calibration_analysis_recording(Path(temp))
             path = analysis / "calibration_analysis.json"
             source = json.loads(path.read_text())
             for i, row in enumerate(source["frames"]):

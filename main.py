@@ -13,6 +13,10 @@ from queue import Empty
 import FreeSimpleGUI as sg
 
 import application_core as base
+from calibration import (
+    CALIBRATION_PIPELINE_RESTART_DELAY_SECONDS,
+    CALIBRATION_RECORDING_DELAY_SECONDS,
+)
 from calibration.qr import GRID_LAYOUTS
 from calibration.scheduler_priority import CalibrationSchedulerPriority
 from sensors.camera.camera_gstreamer import gstreamer_main
@@ -48,8 +52,11 @@ class RuntimeState:
     calibration_prepared_folder: str | None = None
     calibration_recording_folder: str | None = None
     pending_calibration_camera: dict | None = None
+    pending_calibration_display: dict | None = None
     calibration_clock_process: object | None = None
     calibration_clock_stop_event: object | None = None
+    calibration_recording_wait_event: object | None = None
+    calibration_first_qr_event: object | None = None
     calibration_clock_error_queue: object | None = None
     visualization_process: object | None = None
     process_context: object | None = None
@@ -352,9 +359,37 @@ def _maybe_open_calibration_camera(config, runtime, send_cam):
     send_cam.send(("calibration_camera", {"active": True}))
 
 
-def _start_calibration_clock(values, config, runtime):
+def _launch_calibration_clock(display_options, stop_event, error_queue,
+                              recording_wait_event, first_qr_event,
+                              config, runtime):
+    process = runtime.process_context.Process(
+        target=_run_calibration_clock_process,
+        args=(stop_event, error_queue, display_options),
+        name="calibration-clock",
+    )
+    try:
+        process.start()
+    except (OSError, RuntimeError) as error:
+        error_queue.close()
+        runtime.calibration_prepared_folder = None
+        runtime.calibration_recording_root = None
+        runtime.pending_calibration_display = None
+        config.change_calibration_clock(False)
+        config.show_calibration_error(f"Could not start QR display: {error}")
+        return False
+    runtime.calibration_clock_process = process
+    runtime.calibration_clock_stop_event = stop_event
+    runtime.calibration_recording_wait_event = recording_wait_event
+    runtime.calibration_first_qr_event = first_qr_event
+    runtime.calibration_clock_error_queue = error_queue
+    runtime.pending_calibration_display = None
+    config.change_calibration_clock(True)
+    return True
+
+
+def _start_calibration_clock(values, config, runtime, send_cam=None):
     process = runtime.calibration_clock_process
-    if process is not None and process.is_alive():
+    if (process is not None and process.is_alive()) or runtime.pending_calibration_display:
         return
 
     try:
@@ -377,7 +412,7 @@ def _start_calibration_clock(values, config, runtime):
             return
 
     # Prepare the destination before starting the display so its first marker
-    # has evidence too. JPEG capture still starts after the three-second delay.
+    # has evidence too. JPEG capture starts after the scheduled delay.
     journal_path = None
     if recording_root is not None:
         try:
@@ -403,26 +438,46 @@ def _start_calibration_clock(values, config, runtime):
         # calibration payloads, and the journal records that it is fixed.
         "qr_mask_pattern": CALIBRATION_QR_MASK_PATTERN,
     }
+    # Every display launch shows red until its first-frame countdown finishes.
+    recording_wait_event = runtime.process_context.Event()
+    recording_wait_event.set()
+    display_options["recording_wait_event"] = recording_wait_event
+    first_qr_event = runtime.process_context.Event()
+    display_options["first_qr_event"] = first_qr_event
     if display_backend == "pygame":
         refresh_hz = _calibration_screen_refresh_hz(values)
         if refresh_hz is not None:
             display_options["refresh_hz"] = refresh_hz
-    process = runtime.process_context.Process(
-        target=_run_calibration_clock_process,
-        args=(stop_event, error_queue, display_options),
-        name="calibration-clock",
+    camera_recording_will_start = (
+        config.calibration_camera and config.connected_cam
+        and not config.calibration_recording
     )
-    try:
-        process.start()
-    except (OSError, RuntimeError) as error:
-        error_queue.close()
-        runtime.calibration_prepared_folder = None
-        config.show_calibration_error(f"Could not start QR display: {error}")
+    if camera_recording_will_start:
+        assert recording_root is not None
+        runtime.calibration_recording_root = str(recording_root.resolve())
+        if send_cam is not None:
+            runtime.pending_calibration_display = {
+                "display_options": display_options,
+                "stop_event": stop_event,
+                "error_queue": error_queue,
+                "recording_wait_event": recording_wait_event,
+                "first_qr_event": first_qr_event,
+            }
+            config.change_calibration_clock(True)
+            config.window["calibration_status"].update(
+                "RESTARTING CAMERA PIPELINE — WAITING "
+                f"{CALIBRATION_PIPELINE_RESTART_DELAY_SECONDS:g} SECONDS"
+            )
+            send_cam.send(("calibration_pipeline_restart", {
+                "delay_seconds": CALIBRATION_PIPELINE_RESTART_DELAY_SECONDS,
+            }))
+            return
+
+    if not _launch_calibration_clock(
+        display_options, stop_event, error_queue,
+        recording_wait_event, first_qr_event, config, runtime,
+    ):
         return
-    runtime.calibration_clock_process = process
-    runtime.calibration_clock_stop_event = stop_event
-    runtime.calibration_clock_error_queue = error_queue
-    config.change_calibration_clock(True)
 
     if not (config.calibration_camera and config.connected_cam):
         runtime.calibration_recording_deadline = None
@@ -438,10 +493,18 @@ def _start_calibration_clock(values, config, runtime):
             "QR ACTIVE — CAMERA 4 IS ALREADY RECORDING"
         )
         return
-    assert recording_root is not None
+    if recording_root is None:
+        runtime.calibration_recording_deadline = None
+        runtime.calibration_recording_root = None
+        config.window["calibration_status"].update(
+            "QR ACTIVE — CAMERA 4 IS ALREADY RECORDING"
+        )
+        return
     runtime.calibration_recording_root = str(recording_root.resolve())
-    runtime.calibration_recording_deadline = time.monotonic() + 3.0
-    config.window["calibration_status"].update("QR ACTIVE — RECORDING IN 3 SECONDS")
+    runtime.calibration_recording_deadline = None
+    config.window["calibration_status"].update(
+        "QR ACTIVE — WAITING FOR FIRST QR FRAME"
+    )
 
 
 def _service_calibration(config, runtime, send_cam):
@@ -457,6 +520,8 @@ def _service_calibration(config, runtime, send_cam):
             runtime.calibration_clock_error_queue.close()
         runtime.calibration_clock_process = None
         runtime.calibration_clock_stop_event = None
+        runtime.calibration_recording_wait_event = None
+        runtime.calibration_first_qr_event = None
         runtime.calibration_clock_error_queue = None
         runtime.calibration_recording_deadline = None
         runtime.calibration_recording_root = None
@@ -470,11 +535,35 @@ def _service_calibration(config, runtime, send_cam):
                 or "The QR display stopped with an error; check the terminal output."
             )
 
+    first_qr_event = runtime.calibration_first_qr_event
+    if first_qr_event is not None and first_qr_event.is_set():
+        runtime.calibration_first_qr_event = None
+        runtime.calibration_recording_deadline = (
+            time.monotonic() + CALIBRATION_RECORDING_DELAY_SECONDS
+        )
+        if runtime.calibration_recording_root is not None:
+            config.window["calibration_status"].update(
+                f"QR ACTIVE — RECORDING IN {CALIBRATION_RECORDING_DELAY_SECONDS:g} SECONDS"
+            )
+        else:
+            config.window["calibration_status"].update(
+                f"QR ACTIVE — RED BAR COUNTDOWN: {CALIBRATION_RECORDING_DELAY_SECONDS:g} SECONDS"
+            )
+
     deadline = runtime.calibration_recording_deadline
     if deadline is None or time.monotonic() < deadline:
         return
     runtime.calibration_recording_deadline = None
+    if runtime.calibration_recording_root is None:
+        if runtime.calibration_recording_wait_event is not None:
+            runtime.calibration_recording_wait_event.clear()
+        config.window["calibration_status"].update(
+            "QR ACTIVE — COUNTDOWN COMPLETE"
+        )
+        return
     if not (config.calibration_camera and config.connected_cam):
+        if runtime.calibration_recording_wait_event is not None:
+            runtime.calibration_recording_wait_event.clear()
         runtime.calibration_recording_root = None
         runtime.calibration_prepared_folder = None
         config.window["calibration_status"].update(
@@ -486,6 +575,8 @@ def _service_calibration(config, runtime, send_cam):
     prepared = runtime.calibration_prepared_folder
     runtime.calibration_prepared_folder = None
     if not prepared or not Path(prepared).is_dir():
+        if runtime.calibration_recording_wait_event is not None:
+            runtime.calibration_recording_wait_event.clear()
         config.show_calibration_error("The prepared calibration recording folder is missing")
         return
     runtime.calibration_recording_folder = prepared
@@ -739,7 +830,7 @@ def _handle_gui_event(
         ))
         return
     if event == "calibration_clock_start":
-        _start_calibration_clock(values, config, runtime)
+        _start_calibration_clock(values, config, runtime, send_cam)
         return
 
     if event == "playback_toggle" and not config.playback and config.transposition:
@@ -757,6 +848,33 @@ def _apply_status_message(
     message, payload, config, runtime,
     send_radar, send_cam, send_playback, send_snapshot_playback,
 ):
+    if message == "calibration_pipeline_ready":
+        pending = runtime.pending_calibration_display
+        if pending is None:
+            return
+        if not _launch_calibration_clock(
+            pending["display_options"], pending["stop_event"],
+            pending["error_queue"], pending["recording_wait_event"],
+            pending["first_qr_event"], config, runtime,
+        ):
+            return
+        config.window["calibration_status"].update(
+            "QR ACTIVE — WAITING FOR FIRST QR FRAME"
+        )
+        return
+    if message == "calibration_pipeline_restart_error":
+        pending = runtime.pending_calibration_display
+        if pending is not None:
+            pending["error_queue"].close()
+        runtime.pending_calibration_display = None
+        runtime.calibration_recording_root = None
+        runtime.calibration_prepared_folder = None
+        config.change_calibration_clock(False)
+        config.show_calibration_error(
+            payload.get("message", "Camera pipeline could not restart for calibration")
+            if isinstance(payload, dict) else str(payload)
+        )
+        return
     if message == "snapshot_playback_state":
         config.change_snapshot_playback(payload)
         _maybe_open_calibration_camera(config, runtime, send_cam)
@@ -782,7 +900,6 @@ def _apply_status_message(
     if message == "calibration_camera_state":
         config.change_calibration_camera(payload.get("active"))
         if not payload.get("active"):
-            runtime.calibration_recording_deadline = None
             runtime.calibration_recording_root = None
             runtime.calibration_prepared_folder = None
         return
@@ -790,6 +907,8 @@ def _apply_status_message(
         state = dict(payload)
         state["folder"] = runtime.calibration_recording_folder or ""
         config.change_calibration_recording(state)
+        if runtime.calibration_recording_wait_event is not None:
+            runtime.calibration_recording_wait_event.clear()
         if not state.get("active"):
             runtime.calibration_recording_folder = None
         return
@@ -898,6 +1017,8 @@ def _stop_calibration_clock(runtime):
         runtime.calibration_clock_error_queue.close()
     runtime.calibration_clock_process = None
     runtime.calibration_clock_stop_event = None
+    runtime.calibration_recording_wait_event = None
+    runtime.calibration_first_qr_event = None
     runtime.calibration_clock_error_queue = None
 
 

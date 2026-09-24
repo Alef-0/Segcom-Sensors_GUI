@@ -1,117 +1,100 @@
+"""Read supported PCD schemas into the application's radar data classes."""
+
 from pathlib import Path
 from typing import Iterator
 
 import numpy as np
 
-from sensors.radar.connection_packages import MISSING_QUALITY, RadarObject, RadarPoint
 from processing.recording.point_cloud_recorder import (
-    CLUSTER_PCD_FIELDS,
-    LEGACY_OBJECT_PCD_FIELDS,
-    OBJECT_PCD_FIELDS,
+    CLUSTER_PCD_FIELDS, LEGACY_OBJECT_PCD_FIELDS, OBJECT_PCD_FIELDS, PointCloud,
 )
-
-try:
-    from pypcd4 import PointCloud
-except ImportError:
-    PointCloud = None
+from sensors.radar.connection_packages import MISSING_QUALITY, RadarObject, RadarPoint
 
 
-def _optional_float(value: float) -> float | None:
+def _float(value):
     return None if np.isnan(value) else float(value)
 
 
-def _optional_int(value: float) -> int | None:
+def _integer(value):
     if np.isnan(value):
         return None
-    integer = int(value)
-    return None if integer == MISSING_QUALITY else integer
+    result = int(value)
+    return None if result == MISSING_QUALITY else result
 
 
 class PointCloudReader:
-    """Read one recorded PCD frame and expose typed radar points."""
-
     def __init__(self, path: str | Path):
-        if PointCloud is None:
-            raise RuntimeError(
-                "pypcd4 is required to read point clouds; install it with "
-                "python -m pip install pypcd4"
-            )
         self.path = Path(path).expanduser()
+        if PointCloud is None:
+            raise RuntimeError("pypcd4 is required to read point clouds")
         if not self.path.is_file():
             raise FileNotFoundError(self.path)
         cloud = PointCloud.from_path(str(self.path))
-        available_fields = set(cloud.fields)
-        if set(OBJECT_PCD_FIELDS).issubset(available_fields):
+        fields = set(cloud.fields)
+        if set(OBJECT_PCD_FIELDS) <= fields:
             self.frame_type = "object"
-            self._points = self._read_objects(cloud, OBJECT_PCD_FIELDS)
-        elif set(LEGACY_OBJECT_PCD_FIELDS).issubset(available_fields):
+            self._points = self._objects(cloud, OBJECT_PCD_FIELDS)
+        elif set(LEGACY_OBJECT_PCD_FIELDS) <= fields:
             self.frame_type = "object"
-            self._points = self._read_objects(cloud, LEGACY_OBJECT_PCD_FIELDS)
-        elif set(CLUSTER_PCD_FIELDS).issubset(available_fields):
+            self._points = self._objects(cloud, LEGACY_OBJECT_PCD_FIELDS)
+        elif set(CLUSTER_PCD_FIELDS) <= fields:
             self.frame_type = "cluster"
-            self._points = self._read_clusters(cloud)
+            self._points = self._clusters(cloud)
         else:
-            raise ValueError(
-                f"Unsupported PCD schema in {self.path.name}: {tuple(cloud.fields)}"
-            )
+            raise ValueError(f"Unsupported PCD schema in {self.path.name}")
 
     @property
-    def points(self) -> tuple[RadarPoint | RadarObject, ...]:
+    def points(self):
         return self._points
 
     @property
-    def clusters(self) -> tuple[RadarPoint, ...]:
+    def clusters(self):
         return self._points if self.frame_type == "cluster" else ()
 
     @property
-    def objects(self) -> tuple[RadarObject, ...]:
+    def objects(self):
         return self._points if self.frame_type == "object" else ()
 
     def __iter__(self) -> Iterator[RadarPoint | RadarObject]:
         return iter(self._points)
 
     @staticmethod
-    def _read_clusters(cloud) -> tuple[RadarPoint, ...]:
-        values = cloud.numpy(CLUSTER_PCD_FIELDS)
-        return tuple(
-            RadarPoint(
-                cluster_id=int(row[0]), dist_long=float(row[1]), dist_latitude=float(row[2]),
-                velocity_longitude=_optional_float(row[3]), velocity_latitude=_optional_float(row[4]),
-                dynamic_property=_optional_int(row[5]), rcs=_optional_float(row[6]),
-                pdh=int(row[7]), ambiguity_state=int(row[8]), invalid_flag=int(row[9]),
-            )
-            for row in values
-        )
+    def _clusters(cloud):
+        return tuple(RadarPoint(
+            cluster_id=int(row[0]), dist_long=float(row[1]), dist_latitude=float(row[2]),
+            velocity_longitude=_float(row[3]), velocity_latitude=_float(row[4]),
+            dynamic_property=_integer(row[5]), rcs=_float(row[6]), pdh=int(row[7]),
+            ambiguity_state=int(row[8]), invalid_flag=int(row[9]),
+        ) for row in cloud.numpy(CLUSTER_PCD_FIELDS))
 
     @staticmethod
-    def _read_objects(cloud, fields) -> tuple[RadarObject, ...]:
-        rows = cloud.numpy(fields)
-        objects = []
-        for row in rows:
+    def _objects(cloud, fields):
+        result = []
+        for row in cloud.numpy(fields):
             values = dict(zip(fields, row))
-            objects.append(RadarObject(
+            result.append(RadarObject(
                 object_id=int(values["ID"]),
                 dist_long=float(values["dist_long"]),
                 dist_latitude=float(values["dist_latitude"]),
-                velocity_longitude=_optional_float(values["velocity_longitude"]),
-                velocity_latitude=_optional_float(values["velocity_latitude"]),
-                dynamic_property=_optional_int(values["dynamic_property"]),
-                rcs=_optional_float(values["rcs"]),
-                dist_long_rms=_optional_float(values["dist_long_rms"]),
-                velocity_longitude_rms=_optional_float(values["velocity_longitude_rms"]),
-                dist_latitude_rms=_optional_float(values["dist_latitude_rms"]),
-                velocity_latitude_rms=_optional_float(values["velocity_latitude_rms"]),
-                acceleration_latitude_rms=_optional_float(values["acceleration_latitude_rms"]),
-                acceleration_longitude_rms=_optional_float(values["acceleration_longitude_rms"]),
-                orientation_rms=_optional_float(values["orientation_rms"]),
-                measurement_state=_optional_int(values["measurement_state"]),
-                probability_of_existence=_optional_int(values["probability_of_existence"]),
-                acceleration_longitude=_optional_float(values["acceleration_longitude"]) if "acceleration_longitude" in values else None,
-                acceleration_latitude=_optional_float(values["acceleration_latitude"]) if "acceleration_latitude" in values else None,
-                object_class=_optional_int(values["object_class"]) if "object_class" in values else None,
-                orientation_angle=_optional_float(values["orientation_angle"]) if "orientation_angle" in values else None,
-                length=_optional_float(values["length"]) if "length" in values else None,
-                width=_optional_float(values["width"]) if "width" in values else None,
-                collision_detection_regions=_optional_int(values["collision_detection_regions"]) if "collision_detection_regions" in values else None,
+                velocity_longitude=_float(values["velocity_longitude"]),
+                velocity_latitude=_float(values["velocity_latitude"]),
+                dynamic_property=_integer(values["dynamic_property"]),
+                rcs=_float(values["rcs"]),
+                dist_long_rms=_float(values["dist_long_rms"]),
+                velocity_longitude_rms=_float(values["velocity_longitude_rms"]),
+                dist_latitude_rms=_float(values["dist_latitude_rms"]),
+                velocity_latitude_rms=_float(values["velocity_latitude_rms"]),
+                acceleration_latitude_rms=_float(values["acceleration_latitude_rms"]),
+                acceleration_longitude_rms=_float(values["acceleration_longitude_rms"]),
+                orientation_rms=_float(values["orientation_rms"]),
+                measurement_state=_integer(values["measurement_state"]),
+                probability_of_existence=_integer(values["probability_of_existence"]),
+                acceleration_longitude=_float(values["acceleration_longitude"]) if "acceleration_longitude" in values else None,
+                acceleration_latitude=_float(values["acceleration_latitude"]) if "acceleration_latitude" in values else None,
+                object_class=_integer(values["object_class"]) if "object_class" in values else None,
+                orientation_angle=_float(values["orientation_angle"]) if "orientation_angle" in values else None,
+                length=_float(values["length"]) if "length" in values else None,
+                width=_float(values["width"]) if "width" in values else None,
+                collision_detection_regions=_integer(values["collision_detection_regions"]) if "collision_detection_regions" in values else None,
             ))
-        return tuple(objects)
+        return tuple(result)

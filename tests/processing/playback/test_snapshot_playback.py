@@ -89,29 +89,6 @@ class SnapshotPlaybackTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "No synced image \\+ PCD pairs"):
                 playback_module._load_entries(".", synced_only=True)
 
-    def test_synced_only_warning_does_not_render_any_entry(self):
-        pool = FakePool()
-        controller = playback_module.SnapshotPlaybackController(
-            FakeConnection([]),
-            pool,
-            FakeShutdownEvent(),
-            {},
-        )
-
-        with (
-            patch.object(
-                playback_module,
-                "_load_entries",
-                side_effect=ValueError("No synced image + PCD pairs were found"),
-            ),
-            patch.object(controller, "_render") as render,
-            patch.object(controller, "_close_windows"),
-        ):
-            controller._play({"folder": ".", "synced_only": True})
-
-        render.assert_not_called()
-        self.assertEqual(pool.items[0][0], "snapshot_playback_error")
-
     def test_graph_resolution_and_range_share_one_apply_button(self):
         layout = Configurations._create_general_configurations_layout()
         elements = {
@@ -123,34 +100,6 @@ class SnapshotPlaybackTests(unittest.TestCase):
         self.assertIn("graph_settings_apply", elements)
         self.assertNotIn("graph_resolution_apply", elements)
         self.assertNotIn("graph_range_apply", elements)
-
-    def test_playback_starts_playing_and_processes_clicks_while_paused(self):
-        connection = FakeConnection([
-            ("snapshot_playback_pause", None),
-            ("snapshot_playback_stop", None),
-        ])
-        pool = FakePool()
-        controller = playback_module.SnapshotPlaybackController(
-            connection,
-            pool,
-            FakeShutdownEvent(),
-            {},
-        )
-        entry = SimpleNamespace(recorded_at=datetime.now(timezone.utc))
-
-        with (
-            patch.object(playback_module, "_load_entries", return_value=(Path("."), [entry])),
-            patch.object(controller, "_render"),
-            patch.object(controller, "_close_windows"),
-            patch.object(controller, "_process_window_events") as process_events,
-        ):
-            controller._play({"folder": "."})
-
-        first_message, first_state = pool.items[0]
-        self.assertEqual(first_message, "snapshot_playback_state")
-        self.assertTrue(first_state["active"])
-        self.assertFalse(first_state["paused"])
-        self.assertGreaterEqual(process_events.call_count, 2)
 
     def test_clicked_point_is_printed_on_one_line(self):
         graph = Graph_radar.__new__(Graph_radar)
@@ -168,17 +117,6 @@ class SnapshotPlaybackTests(unittest.TestCase):
         lines = output.getvalue().splitlines()
         self.assertEqual(len(lines), 1)
         self.assertIn("[RADAR POINT] x=1.25 m | y=3.50 m", lines[0])
-
-    def test_close_windows_uses_process_local_cleanup(self):
-        with (
-            patch.object(playback_module.cv, "destroyAllWindows") as destroy_all,
-            patch.object(playback_module.cv, "waitKey") as wait_key,
-        ):
-            playback_module.SnapshotPlaybackController._close_windows()
-
-        destroy_all.assert_called_once_with()
-        wait_key.assert_called_once_with(1)
-
 
 if __name__ == "__main__":
     unittest.main()

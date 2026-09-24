@@ -1,4 +1,4 @@
-"""Visualization, filtering, recording, and playback services."""
+"""Recording and visualization services used by the sensor application."""
 
 from processing.recording.camera_snapshot_recorder import CameraSnapshotRecorder
 from processing.recording.manual_snapshot import ManualSnapshotWriter

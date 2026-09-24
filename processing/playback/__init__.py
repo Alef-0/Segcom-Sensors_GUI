@@ -1,1 +1,1 @@
-"""Time-based recording playback and step-based snapshot playback."""
+"""Playback controllers for recorded sensor data."""

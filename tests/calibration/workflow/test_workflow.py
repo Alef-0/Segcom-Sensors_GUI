@@ -3,10 +3,12 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
 import main
+from calibration.display_qt import QRClockWindow
 
 
 class CalibrationWorkflowTests(unittest.TestCase):
@@ -25,10 +27,14 @@ class CalibrationWorkflowTests(unittest.TestCase):
         process.exitcode = 0
         context = Mock()
         context.Process.return_value = process
+        first_qr_event = Mock()
+        first_qr_event.is_set.return_value = False
+        context.Event.side_effect = [Mock(), Mock(), first_qr_event]
         runtime = main.RuntimeState(process_context=context)
         config = SimpleNamespace(calibration_camera=True, connected_cam=True,
                                  calibration_recording=False,
                                  show_calibration_error=Mock(), change_calibration_clock=Mock(),
+                                 change_calibration_recording=Mock(),
                                  window={"calibration_status": Mock()})
         return config, runtime, process
 
@@ -50,14 +56,43 @@ class CalibrationWorkflowTests(unittest.TestCase):
                 main.CALIBRATION_QR_MASK_PATTERN,
             )
             self.assertEqual(display_options["display_backend"], "qt")
+            wait_event = display_options["recording_wait_event"]
+            first_qr_event = display_options["first_qr_event"]
+            self.assertIs(wait_event, runtime.calibration_recording_wait_event)
+            self.assertIs(first_qr_event, runtime.calibration_first_qr_event)
+            wait_event.set.assert_called_once_with()
             self.assertNotIn("visible_frames", display_options)
+            self.assertIsNone(runtime.calibration_recording_deadline)
+            config.window["calibration_status"].update.assert_called_with(
+                "QR ACTIVE — WAITING FOR FIRST QR FRAME"
+            )
             main._service_calibration(config, runtime, camera)
             camera.send.assert_not_called()
-            with patch.object(main.time, "monotonic", return_value=103):
+            with patch.object(main.time, "monotonic", return_value=200):
+                main._service_calibration(config, runtime, camera)
+            camera.send.assert_not_called()
+            first_qr_event.is_set.return_value = True
+            with patch.object(main.time, "monotonic", return_value=200):
+                main._service_calibration(config, runtime, camera)
+            self.assertEqual(runtime.calibration_recording_deadline, 207)
+            config.window["calibration_status"].update.assert_called_with(
+                "QR ACTIVE — RECORDING IN 7 SECONDS"
+            )
+            with patch.object(main.time, "monotonic", return_value=206.9):
+                main._service_calibration(config, runtime, camera)
+            camera.send.assert_not_called()
+            wait_event.clear.assert_not_called()
+            with patch.object(main.time, "monotonic", return_value=207):
                 main._service_calibration(config, runtime, camera)
             camera.send.assert_called_once_with(("record_start", {
                 "folders": {4: str(destination)}, "calibration": True,
                 "display_journal": "display_timestamps.jsonl"}))
+            wait_event.clear.assert_not_called()
+            main._apply_status_message(
+                "calibration_recording_state", {"active": True}, config, runtime,
+                Mock(), camera, Mock(), Mock(),
+            )
+            wait_event.clear.assert_called_once_with()
             self.assertEqual(runtime.calibration_recording_folder, str(destination))
             config.calibration_recording = True
             process.is_alive.return_value = False
@@ -76,6 +111,112 @@ class CalibrationWorkflowTests(unittest.TestCase):
             self.assertIsNone(runtime.calibration_recording_deadline)
             self.assertIsNone(runtime.calibration_prepared_folder)
             self.assertTrue(destination.exists())
+
+    def test_qr_display_without_camera_shows_red_strip_without_scheduling_capture(self):
+        for calibration_camera, connected_cam in ((False, False), (True, False)):
+            with self.subTest(calibration_camera=calibration_camera, connected_cam=connected_cam):
+                config, runtime, process = self.fixture()
+                config.calibration_camera = calibration_camera
+                config.connected_cam = connected_cam
+                runtime.process_context.Event.side_effect = threading.Event
+                main._start_calibration_clock({}, config, runtime)
+                process.start.assert_called_once_with()
+                display_options = runtime.process_context.Process.call_args.kwargs["args"][2]
+                wait_event = display_options["recording_wait_event"]
+                self.assertIs(wait_event, runtime.calibration_recording_wait_event)
+                self.assertTrue(wait_event.is_set())
+                first_qr_event = display_options["first_qr_event"]
+                self.assertIsNone(display_options["journal_path"])
+                self.assertIsNone(runtime.calibration_recording_deadline)
+                camera = Mock()
+                main._service_calibration(config, runtime, camera)
+                camera.send.assert_not_called()
+                self.assertTrue(wait_event.is_set())
+                self.assertIsNone(runtime.calibration_recording_deadline)
+                first_qr_event.set()
+                with patch.object(main.time, "monotonic", return_value=100):
+                    main._service_calibration(config, runtime, camera)
+                self.assertEqual(runtime.calibration_recording_deadline, 107)
+                with patch.object(main.time, "monotonic", return_value=106.9):
+                    main._service_calibration(config, runtime, camera)
+                self.assertTrue(wait_event.is_set())
+                with patch.object(main.time, "monotonic", return_value=107):
+                    main._service_calibration(config, runtime, camera)
+                self.assertFalse(wait_event.is_set())
+                self.assertIsNone(runtime.calibration_recording_deadline)
+                camera.send.assert_not_called()
+                config.show_calibration_error.assert_not_called()
+
+    def test_qr_display_started_while_recording_still_runs_red_strip_countdown(self):
+        config, runtime, _ = self.fixture()
+        config.calibration_recording = True
+        runtime.process_context.Event.side_effect = threading.Event
+        main._start_calibration_clock({}, config, runtime)
+        self.assertTrue(runtime.calibration_recording_wait_event.is_set())
+        self.assertIsNone(runtime.calibration_recording_deadline)
+        runtime.calibration_first_qr_event.set()
+        camera = Mock()
+        with patch.object(main.time, "monotonic", return_value=100):
+            main._service_calibration(config, runtime, camera)
+        with patch.object(main.time, "monotonic", return_value=107):
+            main._service_calibration(config, runtime, camera)
+        self.assertFalse(runtime.calibration_recording_wait_event.is_set())
+        camera.send.assert_not_called()
+        config.show_calibration_error.assert_not_called()
+
+    def test_camera_closing_does_not_cancel_red_strip_countdown(self):
+        for close_before_first_frame in (True, False):
+            with self.subTest(close_before_first_frame=close_before_first_frame):
+                config, runtime, _ = self.fixture()
+                config.change_calibration_camera = Mock()
+                runtime.process_context.Event.side_effect = threading.Event
+                camera = Mock()
+                with TemporaryDirectory() as folder:
+                    main._start_calibration_clock({"record_folder": folder}, config, runtime)
+                    first_qr_event = runtime.calibration_first_qr_event
+                    if not close_before_first_frame:
+                        first_qr_event.set()
+                        with patch.object(main.time, "monotonic", return_value=100):
+                            main._service_calibration(config, runtime, camera)
+                    main._apply_status_message(
+                        "calibration_camera_state", {"active": False}, config, runtime,
+                        Mock(), camera, Mock(), Mock(),
+                    )
+                    config.calibration_camera = False
+                    if close_before_first_frame:
+                        first_qr_event.set()
+                        with patch.object(main.time, "monotonic", return_value=100):
+                            main._service_calibration(config, runtime, camera)
+                    with patch.object(main.time, "monotonic", return_value=106.9):
+                        main._service_calibration(config, runtime, camera)
+                    self.assertTrue(runtime.calibration_recording_wait_event.is_set())
+                    with patch.object(main.time, "monotonic", return_value=107):
+                        main._service_calibration(config, runtime, camera)
+                    self.assertFalse(runtime.calibration_recording_wait_event.is_set())
+                    camera.send.assert_not_called()
+                    config.show_calibration_error.assert_not_called()
+
+    def test_first_qr_swap_signals_recording_countdown(self):
+        first_qr_event = threading.Event()
+        monitor = Mock()
+        monitor.observe.return_value = {}
+        window = SimpleNamespace(
+            pending_frame={
+                "cell": 0, "display_index": 0, "marker_ns": 1,
+                "submit_ns": 2, "paint_start_ns": 1,
+                "recording_wait_active": True,
+            },
+            monitor=monitor,
+            timestamp_mode="paint-start",
+            resumed_after_pause=False,
+            journal=Mock(),
+            first_qr_event=first_qr_event,
+            next_display_index=0,
+            paused=True,
+        )
+        QRClockWindow._frame_swapped(window)
+        self.assertTrue(first_qr_event.is_set())
+        self.assertEqual(window.next_display_index, 1)
 
     def test_failed_start_does_not_schedule_recording(self):
         config, runtime, process = self.fixture()
@@ -117,6 +258,10 @@ class CalibrationWorkflowTests(unittest.TestCase):
                     if nested:
                         yield from elements(nested)
         controls = list(elements(main.Configurations._create_calibration_layout()))
+        self.assertTrue(any(
+            "fullscreen QR view records after 7 seconds" in getattr(element, "DisplayText", "")
+            for element in controls
+        ))
         self.assertFalse(any(getattr(element, "Key", None) == "calibration_visible_frames"
                              for element in controls))
         button = next(element for element in controls

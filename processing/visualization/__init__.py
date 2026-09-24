@@ -1,1 +1,1 @@
-"""Radar filtering and OpenCV visualization."""
+"""Radar visualization, filtering, and camera projection."""

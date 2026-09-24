@@ -1,22 +1,11 @@
-# Processing and persistence
+# Sensor processing
 
-This package contains the parts that consume sensor data after acquisition:
+This package groups radar/camera recording, playback, and visualization services used by `main.py` and the sensor workers.
 
-- radar point filtering and visualization;
-- PCD and JPEG recording;
-- recording metadata and camera/radar association;
-- manual paired snapshots;
-- PCD reading;
-- time-based recording playback and step-based snapshot playback.
+- `recording/` writes and reads camera images, radar PCD frames, timestamp journals, and manual snapshots.
+- `playback/` loads recordings and saved snapshots for timed or stepwise review.
+- `visualization/` applies radar filters, draws the top-down graph, projects radar points into camera coordinates, and renders live overlays.
 
-See `recording/README.md` for persistent formats and queue behavior,
-`visualization/README.md` for filtering and drawing, and `playback/README.md`
-for the two playback modes.
+The normal recording layout is `recording_<channel>_<timestamp>/point_cloud/`, `images/`, `recording.json`, and `timestamps.json`. Camera timing offsets are explicit configuration; radar association is not physical exposure validation.
 
-## Files
-
-| File | Responsibility |
-| --- | --- |
-| `visualization/` | Shared filter schema, filtering, and OpenCV radar plotting |
-| `recording/` | PCD/JPEG persistence, metadata, readers, and manual snapshots |
-| `playback/` | Time-based recording playback and step-based snapshot playback |
+See the subpackage READMEs for the module map.

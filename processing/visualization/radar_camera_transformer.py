@@ -1,4 +1,4 @@
-from __future__ import annotations
+"""Validated radar-to-camera coordinate transformation and projection."""
 
 import json
 from pathlib import Path
@@ -9,102 +9,62 @@ import numpy as np
 
 
 class RadarCameraTransformer:
-    """Project radar coordinates through calibrated camera coefficients."""
-
-    def __init__(
-        self,
-        intrinsic: Any,
-        distortion: Any,
-        extrinsic: Any,
-    ) -> None:
+    def __init__(self, intrinsic: Any, distortion: Any, extrinsic: Any):
         self.set_intrinsic(intrinsic, distortion)
         self.set_extrinsic_matrix(extrinsic)
 
     @classmethod
-    def from_json(cls, path: str | Path) -> "RadarCameraTransformer":
+    def from_json(cls, path: str | Path):
         source = Path(path)
         data = json.loads(source.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError(f"{source}: expected a JSON object")
-
-        intrinsic = cls._first(
-            data,
-            ("intrinsic", "intrinsic_matrix", "camera_matrix"),
-        )
-        distortion = cls._first(
-            data,
-            (
-                "distortion",
-                "distortion_coefficients",
-                "dist_coefficients",
-                "dist_coeffs",
-            ),
-        )
-        extrinsic = cls._first(
-            data,
-            (
-                "extrinsic",
-                "transform_radar_to_camera_4x4",
-                "radar_to_camera_matrix",
-            ),
-        )
+        intrinsic = cls._first(data, ("intrinsic", "intrinsic_matrix", "camera_matrix"))
+        distortion = cls._first(data, (
+            "distortion", "distortion_coefficients", "dist_coefficients", "dist_coeffs",
+        ))
+        extrinsic = cls._first(data, (
+            "extrinsic", "transform_radar_to_camera_4x4", "radar_to_camera_matrix",
+        ))
         if intrinsic is None or distortion is None or extrinsic is None:
-            raise KeyError(
-                f"{source}: intrinsic, distortion, and extrinsic coefficients are required"
-            )
+            raise ValueError(f"{source}: intrinsic, distortion, and extrinsic are required")
         return cls(intrinsic, distortion, extrinsic)
 
     @staticmethod
-    def _first(mapping: dict[str, Any], names: tuple[str, ...]) -> Any | None:
-        for name in names:
-            if name in mapping and mapping[name] is not None:
-                return mapping[name]
-        return None
+    def _first(data: dict, names: tuple[str, ...]):
+        return next((data[name] for name in names if data.get(name) is not None), None)
 
     @staticmethod
-    def _points(points: Any, columns: tuple[int, ...]) -> np.ndarray:
-        array = np.asarray(points, dtype=np.float64)
-        if array.ndim == 1:
-            array = array.reshape(1, -1)
-        if array.ndim != 2 or array.shape[1] not in columns:
-            expected = " or ".join(str(value) for value in columns)
-            raise ValueError(f"points must have {expected} columns, got {array.shape}")
-        if not np.isfinite(array).all():
-            raise ValueError("points must contain finite values")
-        return array
+    def _points(value, widths: tuple[int, ...]) -> np.ndarray:
+        points = np.asarray(value, dtype=np.float64)
+        if points.ndim == 1:
+            points = points.reshape(1, -1)
+        if points.ndim != 2 or points.shape[1] not in widths or not np.isfinite(points).all():
+            raise ValueError(f"points must be finite rows with {widths} columns")
+        return points
 
     def set_intrinsic(self, intrinsic: Any, distortion: Any) -> None:
         matrix = np.asarray(intrinsic, dtype=np.float64)
         coefficients = np.asarray(distortion, dtype=np.float64).reshape(-1)
-        if matrix.shape != (3, 3):
-            raise ValueError(f"intrinsic must be 3x3, got {matrix.shape}")
-        if coefficients.size < 4:
-            raise ValueError("distortion must contain at least four coefficients")
+        if matrix.shape != (3, 3) or coefficients.size < 4:
+            raise ValueError("intrinsic must be 3x3 and distortion needs at least four values")
         if not np.isfinite(matrix).all() or not np.isfinite(coefficients).all():
-            raise ValueError("intrinsic and distortion must contain finite values")
+            raise ValueError("camera coefficients must be finite")
         self.intrinsic = matrix.copy()
         self.distortion = coefficients.copy()
 
     def set_extrinsic_matrix(self, matrix: Any) -> None:
         transform = np.asarray(matrix, dtype=np.float64)
         if transform.shape == (3, 4):
-            transform = np.vstack([transform, [0.0, 0.0, 0.0, 1.0]])
-        if transform.shape != (4, 4):
-            raise ValueError(
-                f"extrinsic_matrix must be 4x4 or 3x4, got {transform.shape}"
-            )
-        if not np.isfinite(transform).all():
-            raise ValueError("extrinsic_matrix must contain finite values")
-
-        # Keep the calibrated translation while normalizing small numerical
-        # errors in the rotation block, as in the supplied reference module.
+            transform = np.vstack((transform, (0.0, 0.0, 0.0, 1.0)))
+        if transform.shape != (4, 4) or not np.isfinite(transform).all():
+            raise ValueError("extrinsic must be a finite 4x4 or 3x4 matrix")
         left, _, right = np.linalg.svd(transform[:3, :3])
         rotation = left @ right
         if np.linalg.det(rotation) < 0:
             left[:, -1] *= -1
             rotation = left @ right
-
-        self.extrinsic = np.eye(4, dtype=np.float64)
+        self.extrinsic = np.eye(4)
         self.extrinsic[:3, :3] = rotation
         self.extrinsic[:3, 3] = transform[:3, 3]
         self.rotation_matrix = rotation
@@ -113,25 +73,14 @@ class RadarCameraTransformer:
 
     def radar_to_camera(self, radar_points: Any) -> np.ndarray:
         points = self._points(radar_points, (3,))
-        homogeneous = np.column_stack([points, np.ones(len(points))])
-        return (self.extrinsic @ homogeneous.T).T[:, :3]
+        return (self.extrinsic @ np.column_stack((points, np.ones(len(points)))).T).T[:, :3]
 
-    def radar_to_image(
-        self,
-        radar_points: Any,
-        *,
-        distorted: bool = True,
-        z: float = 0.0,
-    ) -> np.ndarray:
+    def radar_to_image(self, radar_points: Any, *, distorted: bool = True, z: float = 0.0) -> np.ndarray:
         points = self._points(radar_points, (2, 3))
         if points.shape[1] == 2:
-            points = np.column_stack([points, np.full(len(points), float(z))])
-        distortion = self.distortion if distorted else None
-        result, _ = cv2.projectPoints(
-            points.reshape(-1, 1, 3),
-            self.rotation_vector,
-            self.translation_vector,
-            self.intrinsic,
-            distortion,
+            points = np.column_stack((points, np.full(len(points), float(z))))
+        pixels, _ = cv2.projectPoints(
+            points.reshape(-1, 1, 3), self.rotation_vector, self.translation_vector,
+            self.intrinsic, self.distortion if distorted else None,
         )
-        return result.reshape(-1, 2).astype(np.float64)
+        return pixels.reshape(-1, 2)

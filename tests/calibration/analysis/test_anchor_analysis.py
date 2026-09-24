@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from calibration.final_analysis import Goals, _score
+from calibration.anchor_analysis import Goals, _score
 
 
 class FinalAnalysisTests(unittest.TestCase):

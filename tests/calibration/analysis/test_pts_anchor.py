@@ -5,15 +5,16 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from analyze_pts_anchor import calibrate, evaluate, predict_timestamps, read_offset, score_predictions, write_report
-from tests.test_calibration_evidence import recording
+from analyze_pts_anchor import (calibrate, evaluate, predict_timestamps, read_offset,
+                                score_predictions, filter_test_frames, write_report)
+from tests.calibration.support import build_calibration_analysis_recording
 
 
 class PtsAnchorTests(unittest.TestCase):
-    def make_recording(self, root, name, base):
+    def make_recording(self, root, name, base, *, count=60):
         location = root / name
         location.mkdir()
-        analysis = recording(location, count=60)
+        analysis = build_calibration_analysis_recording(location, count=count)
         journal = location / "recording/camera_timestamps.jsonl"
         cameras = [json.loads(line) for line in journal.read_text().splitlines()]
         for camera in cameras:
@@ -31,7 +32,7 @@ class PtsAnchorTests(unittest.TestCase):
             root = Path(directory)
             source = self.make_recording(root, "lab", 111)
             target = self.make_recording(root, "test", 222)
-            artifact = calibrate([source])
+            artifact = calibrate([source], exclude_initial_frames=0)
             self.assertEqual(artifact["offset_ns"], 80_500_000)
             report, rows = evaluate([target], artifact)
             self.assertEqual(report["sessions"][0]["scores"]["maximum_absolute_ms"], 0)
@@ -55,29 +56,77 @@ class PtsAnchorTests(unittest.TestCase):
             write_report(changed, other, root / "report")
             self.assertTrue((root / "report/pts_anchor_predictions.csv").is_file())
 
+    def test_first_100_frames_and_training_derived_sigma_filter(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.make_recording(root, "lab", 111, count=160)
+            target = self.make_recording(root, "test", 222, count=160)
+            artifact = calibrate([source])
+            self.assertEqual(artifact["excluded_initial_frames_per_recording"], 100)
+            self.assertEqual(artifact["groups"][0]["recordings"][0]["usable_frames"], 60)
+            self.assertEqual(artifact["test_offset_filter"]["training_frames"], 60)
+            report, rows = evaluate([target], artifact)
+            result = report["sessions"][0]
+            self.assertEqual(result["scores"]["camera_frames"], 160)
+            self.assertEqual(result["filtered_scores"]["camera_frames"], 60)
+            self.assertEqual(result["filter_accounting"]["initial_frames_excluded"], 100)
+            self.assertEqual(result["filter_accounting"]["training_sigma_outliers_excluded"], 0)
+            self.assertEqual(rows[99]["filtered_score_exclusion_reason"], "initial_camera_frame")
+            self.assertTrue(rows[100]["included_in_filtered_score"])
+
+            camera_path = target.with_name("recording") / "camera_timestamps.jsonl"
+            cameras = [json.loads(line) for line in camera_path.read_text().splitlines()]
+            cameras[150]["running_time_ns"] += 30_000_000
+            camera_path.write_text("".join(json.dumps(row) + "\n" for row in cameras))
+            changed, changed_rows = evaluate([target], artifact)
+            changed_session = changed["sessions"][0]
+            self.assertEqual(
+                changed_session["filter_accounting"]["training_sigma_outliers_excluded"], 1
+            )
+            self.assertEqual(changed_session["filtered_scores"]["camera_frames"], 59)
+            self.assertEqual(changed_rows[150]["filtered_score_exclusion_reason"],
+                             "outside_training_sigma_band")
+            self.assertIsNotNone(changed_rows[150]["estimated_monotonic_ns"])
+
+            frames = [dict(media_reference_monotonic_ns=1_000_000_000,
+                           targets={"newest_generation": [75, 85]}) for _ in range(4)]
+            predictions = [dict(epoch_running_time=t) for t in
+                           (1_000_000_000, 1_000_000_000,
+                            1_000_000_000, 1_030_000_000)]
+            example = dict(artifact,
+                           excluded_initial_frames_per_recording=2,
+                           test_offset_filter=dict(artifact["test_offset_filter"],
+                                                   lower_ns=79_000_000,
+                                                   upper_ns=81_000_000))
+            reasons, counts = filter_test_frames(frames, predictions, example)
+            self.assertEqual(reasons, ["initial_camera_frame", "initial_camera_frame",
+                                       None, "outside_training_sigma_band"])
+            self.assertEqual(counts["training_sigma_outliers_excluded"], 1)
+
     def test_same_pipeline_is_rejected_even_in_a_separate_recording(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             source = self.make_recording(root, "lab", 111)
             target = self.make_recording(root, "same_stream", 111)
-            artifact = calibrate([source])
+            artifact = calibrate([source], exclude_initial_frames=0)
             with self.assertRaisesRegex(ValueError, "share a stream"):
                 evaluate([target], artifact)
             with self.assertRaisesRegex(ValueError, "Duplicate"):
-                calibrate([source, source])
+                calibrate([source, source], exclude_initial_frames=0)
 
     def test_predeclared_stream_age_cutoff_does_not_silently_expand(self):
         with TemporaryDirectory() as directory:
             source = self.make_recording(Path(directory), "lab", 111)
             with self.assertRaisesRegex(ValueError, "No usable post-cutoff"):
-                calibrate([source], 100)
+                calibrate([source], 100, exclude_initial_frames=0)
             with self.assertRaisesRegex(ValueError, "finite"):
-                calibrate([source], float("nan"))
+                calibrate([source], float("nan"), exclude_initial_frames=0)
 
     def test_offset_roundtrip_and_malformed_artifact(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            artifact = calibrate([self.make_recording(root, "lab", 111)])
+            artifact = calibrate([self.make_recording(root, "lab", 111)],
+                                 exclude_initial_frames=0)
             path = root / "offset.json"
             path.write_text(json.dumps(artifact))
             self.assertEqual(read_offset(path), artifact)
@@ -94,7 +143,7 @@ class PtsAnchorTests(unittest.TestCase):
             del metadata["epochs"][0]["pipeline_base_time_ns"]
             path.write_text(json.dumps(metadata))
             with self.assertRaisesRegex(ValueError, "pipeline-base"):
-                calibrate([source])
+                calibrate([source], exclude_initial_frames=0)
 
     def test_independent_streams_have_equal_weight(self):
         with TemporaryDirectory() as directory:
@@ -109,7 +158,7 @@ class PtsAnchorTests(unittest.TestCase):
             epoch.write_text(json.dumps(data))
             journal = high.with_name("recording") / "camera_timestamps.jsonl"
             journal.write_text("\n".join(journal.read_text().splitlines()[:10]) + "\n")
-            artifact = calibrate([low, high])
+            artifact = calibrate([low, high], exclude_initial_frames=0)
             self.assertEqual([g["offset_ns"] for g in artifact["groups"]], [80_500_000, 100_500_000])
             self.assertEqual(artifact["offset_ns"], 90_500_000)
 

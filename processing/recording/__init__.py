@@ -1,1 +1,1 @@
-"""Radar/camera recording, persistence, and point-cloud reading."""
+"""Camera and radar recording formats and writers."""

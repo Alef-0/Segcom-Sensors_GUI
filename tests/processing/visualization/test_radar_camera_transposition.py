@@ -106,7 +106,7 @@ class RadarCameraTranspositionTests(unittest.TestCase):
         self.assertIs(stale, frame)
 
     def test_repository_camera_matrix_loads(self):
-        matrix_path = Path(__file__).resolve().parents[1] / "camera_matrixes.json"
+        matrix_path = Path(__file__).resolve().parents[3] / "camera_matrixes.json"
         transformer = RadarCameraTransformer.from_json(matrix_path)
 
         self.assertEqual(transformer.intrinsic.shape, (3, 3))
