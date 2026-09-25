@@ -1,11 +1,6 @@
 # Playback
 
-This package presents previously saved radar and camera observations.
+- `playback.py` loads radar/camera recording entries and runs timed playback with transport controls, graph filters, and camera rendering.
+- `snapshot_playback.py` browses saved synchronized snapshots and can save a manual snapshot through the recording service.
 
-- `playback.py` reads recording metadata and advances through a recording by
-  its saved timestamps.
-- `snapshot_playback.py` provides paused pair inspection, previous/next
-  navigation, and copying the current pair.
-
-The file readers and persistent recording schemas live in
-`processing/recording/`.
+Both controllers use the shared readers and visualization modules under `processing/`.

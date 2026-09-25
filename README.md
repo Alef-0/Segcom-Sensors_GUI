@@ -3,8 +3,7 @@
 Segcom Sensors GUI is a desktop tool for operating a three-group Continental
 ARS40X radar setup together with cameras and the GPS exposed by a network DVR.
 It provides live monitoring, radar configuration, synchronized radar/camera
-recording, manual paired snapshots, playback, and a camera-delay calibration
-workflow.
+recording, manual paired snapshots, playback, and radar-to-camera projection (transposition).
 
 This README describes the current working tree. The hardware addresses,
 credentials, timing values, and physical group layout are deployment-specific
@@ -20,14 +19,13 @@ and should be confirmed on the real Segcom installation.
 - Display the selected radar group as a filtered top-down point plot.
 - Open the corresponding DVR camera stream over RTSP, with automatic decoder
   selection for desktop NVIDIA, Jetson, or CPU decoding.
+- Project radar detections onto live camera frames via radar-to-camera transposition.
 - Record PCD radar frames and JPEG camera frames into synchronized recording
   folders.
 - Capture a single camera/radar pair into a snapshot folder.
 - Play complete recordings at their recorded cadence, or inspect paired
   snapshots one frame at a time.
 - Poll the DVR GPS endpoint and open the last position in Google Maps.
-- Record camera channel 4 while displaying monotonic QR markers for
-  latency and clock-drift analysis.
 - Convert recorded PCD trees to CSV while preserving images and metadata.
 
 ## Deployment assumptions
@@ -37,7 +35,7 @@ The current source contains fixed addresses and credentials:
 | Device or service | Current endpoint | Used by |
 | --- | --- | --- |
 | Radar CAN gateway | `192.168.1.101:2323` over TCP | `sensors/radar/connection_communication.py` |
-| DVR RTSP cameras | `192.168.1.108:554`, channels 1-4 | `sensors/camera/camera_gstreamer.py` |
+| DVR RTSP cameras | `192.168.1.108:554`, channels 1-3 | `sensors/camera/camera_gstreamer.py` |
 | DVR GPS status | `http://192.168.1.108/cgi-bin/positionManager.cgi?action=getStatus` | `sensors/gps/gps_connection.py` |
 
 The DVR username and password are also embedded in the camera and GPS source.
@@ -46,7 +44,6 @@ those credentials should be handled.
 
 The source treats channels 1, 2, and 3 as groups A, B, and C respectively.
 The user interface labels those positions LEFT A, MIDDLE B, and RIGHT C.
-Camera channel 4 is reserved for calibration.
 
 ## Running the application
 
@@ -73,7 +70,7 @@ fallback.
 ```text
 FreeSimpleGUI process
 ├── radar worker: TCP/CAN input, decoding, plot, PCD recording
-├── camera worker: RTSP/GStreamer input, display, JPEG recording
+├── camera worker: RTSP/GStreamer input, display, JPEG recording, transposition overlay
 ├── GPS worker: DVR position polling and map link
 ├── recording playback worker
 └── snapshot playback worker
@@ -81,11 +78,10 @@ FreeSimpleGUI process
 
 The GUI sends commands to each worker through a dedicated pipe. Workers return
 state, progress, warnings, and errors through one bounded status queue. A
-shared shutdown event coordinates normal termination. The calibration display
-is started only when requested and runs in its own process.
+shared shutdown event coordinates normal termination.
 
 `application_core.py` contains the common event loop and record/playback orchestration.
-`main.py` extends that behavior with calibration and snapshot-playback modes.
+`main.py` extends that behavior with snapshot-playback modes and transposition wiring.
 Likewise, `interface_core.py` contains the common window and state logic while
 `menu_configurations.py` adds the newer controls.
 
@@ -123,16 +119,19 @@ GStreamer jitter-buffer latency. That 145 ms value controls buffering; it is
 not itself a measured end-to-end correction.
 
 Saved-frame time starts from buffer PTS mapped through the GStreamer segment
-and pipeline clock to a stable host-time anchor. Valid per-frame camera NTP
-metadata disciplines that PTS timeline gradually. Missing NTP falls back to
-PTS, large NTP steps require repeated confirmation, and invalid or non-forward
-PTS frames are rejected and counted.
+and pipeline clock to a stable host-time anchor. The capture callback records
+application arrival before pulling or converting the sample; later processing
+timestamps and capture-queue occupancy remain separate diagnostics. Camera NTP
+metadata is observational and never moves the segment-mapped media time.
+Invalid or non-forward timing is rejected from image recording but retained as
+a timing event with the information available at rejection.
 
-The separate camera latency adjustment defaults to 109 ms. It is subtracted
+The separate camera latency adjustment provisionally defaults to 87.348 ms. It is subtracted
 when associating a camera observation with radar time and is recorded in
-metadata. It does not replace or configure the RTSP jitter buffer. This value
-is a calibration result, so it should be rechecked after changes to the DVR,
-stream session, decoder, network path, or capture setup.
+metadata. It does not replace or configure the RTSP jitter buffer. Keep the
+value provisional until it passes a separately restarted camera/display
+session, and recheck it after changes to the DVR, decoder, network path, or
+capture setup.
 
 See `sensors/camera/README.md` for the pipeline and timestamp policy in more detail.
 
@@ -172,70 +171,30 @@ See `processing/recording/README.md` for file schemas and overload handling.
 
 ## Operating modes
 
-Live monitoring, normal playback, snapshot playback, and calibration camera
-mode are coordinated as mutually exclusive uses of the camera/radar displays.
-When playback or calibration needs the devices, the GUI first stops active
-recording and closes conflicting live workers before starting the requested
-mode.
+Live monitoring, normal playback, and snapshot playback are coordinated as
+mutually exclusive uses of the camera/radar displays. When playback needs the
+devices, the GUI first stops active recording and closes conflicting live
+workers before starting the requested mode.
 
 Normal playback follows recorded timestamps and supports restart and five
 second seeks. Snapshot playback can restrict the list to entries that contain
 both image and PCD data, pause, step backward or forward, and save the current
 pair into another snapshot folder.
 
-## Calibration
+## Radar-to-camera transposition
 
-The Calibration tab lets you require the desktop NVIDIA, ARM/Jetson, or CPU
-camera pipeline, select either the Qt/OpenGL or Pygame/SDL fullscreen clock,
-and choose its monitor.
-The selected pipeline is validated before the clock starts and does not silently
-fall back to another decoder. Both clock implementations accept a 4, 6, 8, 9,
-10, or 12-code grid and independently control how many of its latest QR codes
-remain visible. They present QR timestamps in a snake path through the grid,
-show the display index beside each timestamp, and underline the newest marker.
-Press **P** to pause/resume, or use **Q** or Escape to close either clock; the Qt
-clock also handles Ctrl+C directly. Paused markers are excluded from timing
-analysis.
+The Transposition tab projects radar points onto the camera stream using calibrated
+camera intrinsics and radar-to-camera extrinsics (`camera_matrixes.json`):
 
-The Visualization tab opens the single analyzer with the project's copied
-camera intrinsics, an undistorted image, and alpha 0.25 by default. QReader
-detects every QR bounding box, retries grid cells without a readable result,
-and orders detections by grid cell. The first frame is decoded when the viewer
-opens; full-folder decoding begins only after **GO — DECODE FULL FOLDER** is
-pressed, and each completed frame is shown. A frame is accepted when at least
-one readable QR matches its journal; camera-grid position disagreements remain
-visible as warnings. Unreadable and invalid detections are retained as
-diagnostics while the latest journal-matched QR supplies the offset. The PTS,
-NTP, and configured grid values are editable without automatically starting a
-scan. Finishing the full scan writes `calibration_analysis.json` and
-`calibration_frames.csv` to a sibling
-`<recording-folder-name>_analysis` directory. After the inspection window is
-closed, the root launcher reads those files and writes a quantitative verdict,
-per-frame strategy predictions, and five Matplotlib graphs as PNG files.
-The histogram figures use one strategy per panel with compact, independently
-adjusted bins and ranges.
+- **Overlay**: Real-time projection of radar targets onto the camera preview.
+- **Range gating**: Adjustable distance cutoff (0–100 m) to filter distant targets.
+- **Coordinate transformation**: 3D radar coordinates are mapped to normalized
+  camera coordinates and pixel space using pinhole camera equations with lens distortion correction.
 
-```bash
-python3 analyze_calibration_recording.py /path/to/calibration-recording
-python3 analyze_calibration_recording.py /path/to/calibration-recording \
-  --intrinsics /path/to/intrinsics.json
+## Legacy Calibration Documentation
 
-# Recreate only the verdict from existing analysis files (no window)
-python3 -m calibration.quantitative_analysis \
-  /path/to/calibration-recording_analysis
-
-# Also save SVG copies when running the quantitative analyzer directly
-python3 -m calibration.quantitative_analysis \
-  /path/to/calibration-recording_analysis --svg
-```
-
-For each decoded QR, the analyzer verifies the recorded quadrant and checks both
-its own flip timing and the following replacement. Suspect or missing replacement
-evidence stays visible but is excluded from the clean offset summary. The verdict
-compares 109 ms, calibrated fixed corrections, PTS-step groups, and a six-step
-causal PTS-history model on a chronological 70/30 split. A learned model remains
-experimental until the preselected strategy is confirmed on a later independent
-recording. Readable codes alone do not establish physical exposure time.
+Historical research, QR display clocks, sub-frame latency benchmarks, and PTS anchor
+experiments have been retired and archived into [LEGACY.md](LEGACY.md).
 
 ## CSV conversion
 
@@ -277,14 +236,13 @@ See `tests/README.md` for the test-area map.
 | `menu_configurations.py` | Current window layout and UI state extensions |
 | `interface_core.py` | Shared GUI layout and state transitions |
 | `sensors/` | Radar, RTSP camera, timestamp, and GPS integrations |
-| `processing/` | Plotting, filtering, recording, PCD reading, snapshots, and playback |
-| `calibration/` | QR display/decoding, recording viewer, quantitative verdict, and camera intrinsics |
-| `analyze_calibration_recording.py` | Runs the recording viewer, then the saved-data verdict |
+| `processing/` | Plotting, filtering, recording, PCD reading, snapshots, playback, and radar-to-camera transposition |
 | `convert_to_csv.py` | Recursive PCD-to-CSV export |
 | `content/` | ARS40X technical-documentation extracts |
 | `recordings/` | Generated recording data, kept outside source packages |
 | `snapshots/` | Generated or manually assembled snapshot data |
 | `tests/` | Automated tests, kept outside source packages |
+| `LEGACY.md` | Archived history and technical details of calibration experiments |
 
 ## Points to confirm with the project owner
 
@@ -294,9 +252,8 @@ are not independently proven by source alone:
 - LEFT/MIDDLE/RIGHT and A/B/C are the intended physical channel assignments.
 - The gateway packet timestamp is intentionally ignored in favor of host
   receipt time for radar frame recording.
-- Camera channel 4 is always the calibration camera.
-- The current 109 ms camera adjustment is the intended operational default for
-  this deployment.
+- The provisional 87.348 ms camera adjustment still needs confirmation on an
+  independent recording before it becomes the final deployment default.
 - Snapshot matching should continue to allow up to 500 ms residual error.
 - Recording camera frames into every selected radar folder is the desired data
   duplication model.

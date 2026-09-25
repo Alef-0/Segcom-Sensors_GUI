@@ -7,7 +7,7 @@ from interface_core import Configurations as BaseConfigurations
 
 
 class Configurations(BaseConfigurations):
-    def __init__(self, calibration_screens=None):
+    def __init__(self):
         self.snapshot_playback = False
         self.snapshot_playback_pending = False
         self.snapshot_playback_paused = False
@@ -18,26 +18,8 @@ class Configurations(BaseConfigurations):
         self.graph_height = 600
         self.graph_x_range = 15
         self.graph_y_range = 15
-        self.calibration_camera = False
-        self.calibration_camera_pending = False
-        self.calibration_clock = False
-        self.calibration_recording = False
         self.transposition = False
-        self.calibration_screens = list(
-            calibration_screens or ["0: Primary @ unknown Hz"]
-        )
         super().__init__()
-
-    def centralize_combos(self):
-        super().centralize_combos()
-        for key in (
-            "calibration_decoder",
-            "calibration_display",
-            "calibration_screen",
-            "calibration_grid_qrs",
-            "calibration_visible_qrs",
-        ):
-            self.window[key].Widget.configure(justify="center")
 
     def create_radar_division(self):
         columns = []
@@ -284,117 +266,12 @@ class Configurations(BaseConfigurations):
             ],
         ]
 
-    @staticmethod
-    def _create_calibration_layout(screen_choices=None):
-        screen_choices = list(screen_choices or ["0: Primary @ unknown Hz"])
-        return [
-            [
-                sg.Push(),
-                sg.Text("Camera latency"),
-                sg.Input("145", key="camera_pipeline_latency", size=(9, 1), justification="right"),
-                sg.Text("Pipeline Adjustment (ms)"),
-                sg.Input("109", key="camera_latency_adjustment", size=(9, 1), justification="right"),
-                sg.Button("APPLY LATENCIES", key="calibration_latency_apply"),
-                sg.Push(),
-            ],
-            [
-                sg.Push(),
-                sg.Text("Current latencies: 145 ms / 109 ms", key="calibration_latency_status"),
-                sg.Text("QR display"),
-                sg.Combo(
-                    ("Qt / OpenGL", "Pygame / SDL"),
-                    "Qt / OpenGL",
-                    key="calibration_display",
-                    readonly=True,
-                    size=(14, 1),
-                ),
-                sg.Text("Camera pipeline"),
-                sg.Combo(
-                    ("Usual NVIDIA", "ARM / Jetson", "CPU"),
-                    "Usual NVIDIA",
-                    key="calibration_decoder",
-                    readonly=True,
-                    size=(15, 1),
-                ),
-                sg.Push(),
-            ],
-            [
-                sg.Push(),
-                sg.Text("Display monitor"),
-                sg.Combo(
-                    screen_choices,
-                    screen_choices[0],
-                    key="calibration_screen",
-                    readonly=True,
-                    size=(24, 1),
-                ),
-                sg.Text("QR grid"),
-                sg.Combo(
-                    (4, 6, 8, 9, 10, 12),
-                    4,
-                    key="calibration_grid_qrs",
-                    readonly=True,
-                    enable_events=True,
-                    size=(5, 1),
-                ),
-                sg.Text("QR codes kept"),
-                sg.Combo(
-                    tuple(range(1, 5)),
-                    2,
-                    key="calibration_visible_qrs",
-                    readonly=True,
-                    size=(5, 1),
-                ),
-                sg.Push(),
-            ],
-            [sg.HorizontalSeparator()],
-            [
-                sg.Push(),
-                sg.Text("Selectable Qt/OpenGL or Pygame/SDL QR calibration clock"),
-                sg.Button(
-                    "OPEN CALIBRATION CAMERA 4",
-                    key="calibration_camera_toggle",
-                    button_color=("white", "green"),
-                ),
-                sg.Button(
-                    "START QR CALIBRATION",
-                    key="calibration_clock_start",
-                    button_color=("white", "green"),
-                ),
-                sg.Text("", key="calibration_status"),
-                sg.Push(),
-            ],
-            [
-                sg.Text(
-                    "The fullscreen QR view records after 3 seconds and stops recording when closed.",
-                    expand_x=True,
-                    justification="center",
-                )
-            ],
-        ]
-
-    @staticmethod
-    def _create_visualization_layout():
-        root = Path(__file__).resolve().parent
-        return [
-            [sg.Text("Calibration recording"),
-             sg.Input(str(root / "recordings"), key="visualization_folder", expand_x=True),
-             sg.FolderBrowse("SELECT", target="visualization_folder")],
-            [sg.Push(), sg.Button("OPEN CALIBRATION VISUALIZATION", key="visualization_open"), sg.Push()],
-            [sg.Text("Browse recorded frames, compare decoded timestamps, and inspect the marked source of each offset.",
-                     expand_x=True, justification="center")],
-            [sg.Text("Select a calibration folder to open the separate viewer.", key="visualization_status",
-                     expand_x=True, justification="center")],
-        ]
-
     def create_radar_control(self):
         tabs = [[
             sg.Tab("Configurations", self.options),
             sg.Tab("Record", self._create_record_layout()),
             sg.Tab("Snapshots", self._create_snapshot_layout()),
             sg.Tab("Display", self._create_general_configurations_layout()),
-            sg.Tab("Calibration", self._create_calibration_layout(self.calibration_screens)),
-            sg.Tab("Visualization", self._create_visualization_layout()),
         ]]
         self.radar_control = sg.Frame(
             "General Control",
@@ -446,8 +323,6 @@ class Configurations(BaseConfigurations):
             or self.playback_pending
             or self.snapshot_playback
             or self.snapshot_playback_pending
-            or self.calibration_camera
-            or self.calibration_camera_pending
         )
         recording_inputs_disabled = self.recording or self.recording_pending or live_blocked
         for key in ("record_folder", "record_browse", "record_radar_1", "record_radar_2", "record_radar_3"):
@@ -547,35 +422,8 @@ class Configurations(BaseConfigurations):
         for key in ("conn_radar", "conn_cam"):
             self.window[key].update(disabled=live_blocked or self.snapshot_pending)
         for channel in range(1, 4):
-            self.window[f"choose_{channel}"].update(
-                disabled=self.calibration_camera or self.calibration_camera_pending
-            )
-        self.window["calibration_camera_toggle"].update(
-            disabled=(
-                self.calibration_camera_pending
-                or (self.recording_pending and not self.calibration_camera)
-                or self.snapshot_pending
-            )
-        )
-        self.window["calibration_clock_start"].update(
-            disabled=self.calibration_clock
-        )
-        settings_disabled = self.calibration_camera or self.calibration_camera_pending
-        self.window["calibration_decoder"].update(disabled=settings_disabled)
-        self.window["calibration_display"].update(disabled=self.calibration_clock)
-        self.window["calibration_screen"].update(disabled=self.calibration_clock)
-        self.window["calibration_grid_qrs"].update(disabled=self.calibration_clock)
-        self.window["calibration_visible_qrs"].update(disabled=self.calibration_clock)
-        self.window["transposition_toggle"].update(
-            disabled=(
-                self.playback
-                or self.playback_pending
-                or self.snapshot_playback
-                or self.snapshot_playback_pending
-                or self.calibration_camera
-                or self.calibration_camera_pending
-            )
-        )
+            self.window[f"choose_{channel}"].update(disabled=False)
+        self.window["transposition_toggle"].update(disabled=live_blocked)
 
     def change_received_messages(self, message_ids):
         messages = ", ".join(f"0x{message_id:03X}" for message_id in message_ids) or "--"
@@ -690,75 +538,8 @@ class Configurations(BaseConfigurations):
             f"X ±{x_range:g} m | Y 0–{y_range:g} m"
         )
 
-    def set_calibration_camera_pending(self):
-        self.calibration_camera_pending = True
-        self.window["calibration_camera_toggle"].update("OPENING CAMERA 4...", disabled=True)
-        self.window["calibration_status"].update("CLOSING RADARS AND OPENING CAMERA 4")
-        self._refresh_mode_controls()
-
-    def change_calibration_camera(self, active):
-        self.calibration_camera = bool(active)
-        self.calibration_camera_pending = False
-        self.window["calibration_camera_toggle"].update(
-            "CLOSE CALIBRATION CAMERA 4" if active else "OPEN CALIBRATION CAMERA 4",
-            button_color=("white", "red" if active else "green"),
-        )
-        if active:
-            self.window["calibration_status"].update("CAMERA 4 OPEN")
-        elif not self.calibration_recording:
-            self.window["calibration_status"].update("")
-        self._refresh_mode_controls()
-
-    def change_calibration_clock(self, active):
-        self.calibration_clock = bool(active)
-        self.window["calibration_clock_start"].update(
-            "QR ACTIVE" if active else "START QR CALIBRATION",
-            disabled=active,
-            button_color=("white", "red" if active else "green"),
-        )
-        self._refresh_mode_controls()
-
-    def change_calibration_qr_grid(self, grid_qrs, visible_qrs):
-        grid_qrs = int(grid_qrs)
-        choices = tuple(range(1, grid_qrs + 1))
-        try:
-            selected = int(visible_qrs)
-        except (TypeError, ValueError):
-            selected = 1
-        selected = min(grid_qrs, max(1, selected))
-        self.window["calibration_visible_qrs"].update(
-            values=choices,
-            value=selected,
-        )
-
-    def change_calibration_recording(self, payload):
-        self.calibration_recording = bool(payload.get("active"))
-        if self.calibration_recording:
-            self.window["calibration_status"].update(
-                f"RECORDING CAMERA 4 — {payload.get('folder', '')}"
-            )
-        else:
-            count = payload.get("count", 0)
-            dropped = payload.get("dropped", 0)
-            self.window["calibration_status"].update(
-                (
-                    f"SAVED {count} CAMERA FRAMES — DROPPED {dropped}"
-                    if count or dropped
-                    else "CAMERA 4 OPEN"
-                )
-            )
-
     def change_camera_recording_drop(self, payload):
-        dropped = payload.get("dropped", payload.get("missing", 1))
-        if self.calibration_recording:
-            self.window["calibration_status"].update(
-                f"RECORDING CAMERA 4 — DROPPED {dropped} FRAME(S)"
-            )
-
-    def change_calibration_latencies(self, pipeline_latency_ms, adjustment_ms):
-        self.window["calibration_latency_status"].update(
-            f"Current latencies: {pipeline_latency_ms} ms / {adjustment_ms:g} ms"
-        )
+        pass
 
     def change_transposition(self, active, message=None):
         self.transposition = bool(active)
@@ -779,6 +560,3 @@ class Configurations(BaseConfigurations):
         self.window["recording_rate_status"].update(
             f"{frames_per_30} / 30 frames ({frames_per_30} FPS)"
         )
-
-    def show_calibration_error(self, message):
-        sg.popup_error(message, title="Calibration error")

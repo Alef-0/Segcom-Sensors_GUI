@@ -21,6 +21,10 @@ from sensors.camera.camera_pipeline import (
 )
 from sensors.camera.camera_reference_clock import ReferenceClockObserver
 from sensors.camera.camera_timebase import FrameTimestampPolicy
+from sensors.camera.timing_defaults import (
+    DEFAULT_CAMERA_CALIBRATION_VERSION,
+    DEFAULT_CAMERA_TIMESTAMP_CORRECTION_MS,
+)
 
 gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst
@@ -61,15 +65,17 @@ class GStreamerPipeline:
         self.display_width = DEFAULT_DISPLAY_WIDTH
         self.display_height = DEFAULT_DISPLAY_HEIGHT
         self.pipeline_latency_ms = CAMERA_PIPELINE_LATENCY_MS
-        self.latency_adjustment_ms = 109.0
+        self.latency_adjustment_ms = DEFAULT_CAMERA_TIMESTAMP_CORRECTION_MS
         self.recording_frames_per_30 = CAMERA_FRAME_RATE
-        self.calibration_mode = False
-        self.calibration_recording = False
         self.snapshot_recorder = CameraSnapshotRecorder(
             self._report_snapshot,
             self._report_recording_drop,
         )
-        self.timestamp_policy = FrameTimestampPolicy()
+        self.snapshot_recorder.prepare()
+        self.timestamp_policy = FrameTimestampPolicy(
+            capture_correction_ms=self.latency_adjustment_ms,
+            capture_calibration_version=DEFAULT_CAMERA_CALIBRATION_VERSION,
+        )
         self.reference_clock = ReferenceClockObserver()
         self.stream_epoch = 0
         self.decoder_preference = "auto"
@@ -170,41 +176,54 @@ class GStreamerPipeline:
         self._last_pts_gap_warning = now
 
     def _start_snapshot_recording(self, value):
-        calibration = bool(value.get("calibration"))
+        """Enable the waiting writer on the running stream, preserving decoder history."""
+        if self.snapshot_recorder.active:
+            self._put_status("camera_recording_error", "Camera recording is already active")
+            return
+        if not self.connected:
+            self._put_status("camera_recording_error", "Connect the camera before starting camera recording")
+            self._put_status("camera_recording_state", {"active": False})
+            return
         try:
             self._last_writer_drop_warning = 0.0
             self._last_pts_gap_warning = 0.0
             self._pending_pts_gap_candidates = 0
             self.snapshot_recorder.start(
                 value.get("folders", {}),
-                calibration=calibration,
                 latency_adjustment_ms=self.latency_adjustment_ms,
                 timing_session={
                     "camera_channel": self.channel,
                     "decoder_backend": self.current_decoder_backend.name,
                     "pipeline_latency_ms": self.pipeline_latency_ms,
                     "stream_epoch_at_start": self.stream_epoch,
-                    "display_journal": value.get("display_journal"),
+                    "pipeline_restarted_for_recording": False,
+                    "timing_contract": {
+                        "media_reference": (
+                            "pipeline clock anchor plus segment-mapped buffer running time"
+                        ),
+                        "application_arrival_boundary": (
+                            "capture appsink new-sample callback entry"
+                        ),
+                        "correction_sign": (
+                            "positive correction is subtracted from media reference"
+                        ),
+                        "capture_reference": (
+                            "provisional corrected camera timestamp; physical exposure "
+                            "start/midpoint is not established"
+                        ),
+                        "arrival_delay": (
+                            "application arrival monotonic time minus estimated capture time"
+                        ),
+                        "units": "integer nanoseconds unless a field name says otherwise",
+                    },
                 },
             )
-            self.calibration_recording = calibration
-            message = (
-                "calibration_recording_state"
-                if calibration
-                else "camera_recording_state"
-            )
-            self._put_status(message, {"active": True})
+            self._put_status("camera_recording_state", {"active": True})
         except Exception as error:
             self._put_status("camera_recording_error", str(error))
-            message = (
-                "calibration_recording_state"
-                if calibration
-                else "camera_recording_state"
-            )
-            self._put_status(message, {"active": False})
+            self._put_status("camera_recording_state", {"active": False})
 
     def _stop_snapshot_recording(self):
-        was_calibration = self.calibration_recording
         try:
             self.snapshot_recorder.record_timing_events(self.reference_clock.poll())
             self.snapshot_recorder.update_transport_stats(
@@ -212,15 +231,12 @@ class GStreamerPipeline:
                 stream_epoch=self.stream_epoch,
             )
             count = self.snapshot_recorder.stop()
-            self.calibration_recording = False
             confirmed_not_saved = (
                 self.snapshot_recorder.frames_dropped
                 + self.snapshot_recorder.frames_rejected_invalid_timing
             )
             self._put_status(
-                "calibration_recording_state"
-                if was_calibration
-                else "camera_recording_state",
+                "camera_recording_state",
                 {
                     "active": False,
                     "count": count,
@@ -235,14 +251,8 @@ class GStreamerPipeline:
                 },
             )
         except Exception as error:
-            self.calibration_recording = False
             self._put_status("camera_recording_error", str(error))
-            self._put_status(
-                "calibration_recording_state"
-                if was_calibration
-                else "camera_recording_state",
-                {"active": False},
-            )
+            self._put_status("camera_recording_state", {"active": False})
 
     def _connect_camera(self):
         try:
@@ -252,35 +262,6 @@ class GStreamerPipeline:
             self.connected = False
         self._put_status("change_cam", self.connected)
         return self.connected
-
-    def _set_calibration_camera(self, active):
-        active = bool(active)
-        if active:
-            self.calibration_mode = True
-            self.channel = 4
-            self.channel_changed = True
-            if not self.connected:
-                self._connect_camera()
-            if not self.connected:
-                self.calibration_mode = False
-                self.channel = self.normal_channel
-            if self.connected:
-                self.exit_reason = _RESULT_RESTART
-            self._put_status(
-                "calibration_camera_state",
-                {"active": self.connected, "channel": 4},
-            )
-            return self.connected
-
-        self.calibration_mode = False
-        self.channel = self.normal_channel
-        self.channel_changed = True
-        self.connected = False
-        self.exit_reason = _RESULT_CLOSED
-        self._fail_manual_snapshot("Calibration camera closed before taking the snapshot")
-        self._put_status("change_cam", False)
-        self._put_status("calibration_camera_state", {"active": False, "channel": 4})
-        return True
 
     def _set_latency_settings(self, value):
         try:
@@ -301,6 +282,7 @@ class GStreamerPipeline:
         restart = pipeline_latency_ms != self.pipeline_latency_ms and self.connected
         self.pipeline_latency_ms = pipeline_latency_ms
         self.latency_adjustment_ms = adjustment_ms
+        self.timestamp_policy.set_capture_correction_ms(adjustment_ms)
         self.snapshot_recorder.set_latency_adjustment_ms(adjustment_ms)
         self._put_status(
             "camera_latency_state",
@@ -566,12 +548,66 @@ class GStreamerPipeline:
             self.frames.put_nowait(frame)
         return Gst.FlowReturn.OK
 
+    def _capture_queue_levels(self):
+        pipeline = getattr(self, "pipeline", None)
+        queue_element = (
+            pipeline.get_by_name("capture_queue")
+            if pipeline is not None and hasattr(pipeline, "get_by_name")
+            else None
+        )
+        if queue_element is None:
+            return {}
+        output = {}
+        for property_name, field_name in (
+            ("current-level-buffers", "capture_queue_level_buffers"),
+            ("current-level-bytes", "capture_queue_level_bytes"),
+            ("current-level-time", "capture_queue_level_time_ns"),
+        ):
+            try:
+                output[field_name] = int(queue_element.get_property(property_name))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        return output
+
+    def _retain_capture_failure(self, reason, timing):
+        note_invalid_frame = getattr(
+            self.snapshot_recorder, "note_invalid_timing_frame", None
+        )
+        if note_invalid_frame is not None:
+            note_invalid_frame(reason=reason, timing=timing)
+
     def on_new_capture_sample(self, sink):
+        application_arrival_monotonic_ns = time.monotonic_ns()
+        application_arrival_unix_ns = time.time_ns()
         sample = sink.emit("pull-sample")
+        sample_pulled_monotonic_ns = time.monotonic_ns()
+        sample_pulled_unix_ns = time.time_ns()
         if sample is None:
+            self._retain_capture_failure(
+                "capture appsink returned no sample",
+                {
+                    "application_arrival_monotonic_ns": application_arrival_monotonic_ns,
+                    "application_arrival_unix_ns": application_arrival_unix_ns,
+                    "sample_pulled_monotonic_ns": sample_pulled_monotonic_ns,
+                    "sample_pulled_unix_ns": sample_pulled_unix_ns,
+                },
+            )
             return Gst.FlowReturn.ERROR
         frame = self._sample_to_frame(sample)
+        frame_converted_monotonic_ns = time.monotonic_ns()
+        frame_converted_unix_ns = time.time_ns()
         if frame is None:
+            self._retain_capture_failure(
+                "capture sample could not be converted to an image",
+                {
+                    "application_arrival_monotonic_ns": application_arrival_monotonic_ns,
+                    "application_arrival_unix_ns": application_arrival_unix_ns,
+                    "sample_pulled_monotonic_ns": sample_pulled_monotonic_ns,
+                    "sample_pulled_unix_ns": sample_pulled_unix_ns,
+                    "frame_converted_monotonic_ns": frame_converted_monotonic_ns,
+                    "frame_converted_unix_ns": frame_converted_unix_ns,
+                },
+            )
             return Gst.FlowReturn.ERROR
         shape = getattr(frame, "shape", ())
         if len(shape) >= 2:
@@ -584,9 +620,21 @@ class GStreamerPipeline:
                 f"{self.current_decoder_backend.name} decoder"
             )
 
-        timestamp = self.timestamp_policy.timestamp_for_sample(sample)
+        timestamp = self.timestamp_policy.timestamp_for_sample(
+            sample,
+            application_arrival_monotonic_ns=application_arrival_monotonic_ns,
+            application_arrival_unix_ns=application_arrival_unix_ns,
+            sample_pulled_monotonic_ns=sample_pulled_monotonic_ns,
+            sample_pulled_unix_ns=sample_pulled_unix_ns,
+            frame_converted_monotonic_ns=frame_converted_monotonic_ns,
+            frame_converted_unix_ns=frame_converted_unix_ns,
+            capture_queue_levels=self._capture_queue_levels(),
+        )
         if not timestamp.valid:
-            self._reject_synchronized_frame(timestamp.reason or "unknown timestamp error")
+            self._reject_synchronized_frame(
+                timestamp.reason or "unknown timestamp error",
+                timing=timestamp.timing,
+            )
             return Gst.FlowReturn.OK
 
         self._observe_camera_ntp(
@@ -609,14 +657,14 @@ class GStreamerPipeline:
         self._emit_manual_snapshot(frame, timestamp.captured_at)
         return Gst.FlowReturn.OK
 
-    def _reject_synchronized_frame(self, reason):
+    def _reject_synchronized_frame(self, reason, *, timing=None):
         note_invalid_frame = getattr(
             self.snapshot_recorder,
             "note_invalid_timing_frame",
             None,
         )
         if note_invalid_frame is not None:
-            note_invalid_frame()
+            note_invalid_frame(reason=reason, timing=timing)
         now = time.monotonic()
         if now - self._last_timestamp_warning >= TIMESTAMP_WARNING_INTERVAL_SECONDS:
             print(f"[DEBUG][CAMERA] Skipping unsynchronized camera frame: {reason}")
@@ -665,7 +713,7 @@ class GStreamerPipeline:
                     restart = True
                 elif event == "choose":
                     self.normal_channel = value
-                    if self.calibration_mode or value == self.channel:
+                    if value == self.channel:
                         continue
                     self.channel = value
                     self.channel_changed = True
@@ -676,8 +724,6 @@ class GStreamerPipeline:
                         self.exit_reason = _RESULT_RESTART
                         restart = True
                 elif event == "conn_cam":
-                    if self.calibration_mode:
-                        continue
                     if self.connected:
                         self.connected = False
                         self.exit_reason = _RESULT_CLOSED
@@ -686,8 +732,6 @@ class GStreamerPipeline:
                         restart = True
                     else:
                         self._connect_camera()
-                elif event == "calibration_camera":
-                    restart = self._set_calibration_camera(value.get("active")) or restart
                 elif event == "camera_decoder_backend":
                     restart = self._set_decoder_backend(value) or restart
                 elif event == "camera_latency_settings":
@@ -725,7 +769,6 @@ class GStreamerPipeline:
             return GLib.SOURCE_CONTINUE
         if (
             self.transposition_active
-            and not self.calibration_mode
             and self.channel == RADAR_GROUP_B
             and self.transposition_overlay is not None
             and self.capture_size is not None
@@ -745,7 +788,7 @@ class GStreamerPipeline:
                 self.transposition_payload = None
                 clear_latest(self.transposition_channel)
                 self._put_status("transposition_error", str(error))
-        cv.imshow("CALIBRATION CAMERA 4" if self.calibration_mode else "CAMERA", frame)
+        cv.imshow("CAMERA", frame)
         cv.waitKey(1)
         return GLib.SOURCE_CONTINUE
 
@@ -819,12 +862,11 @@ class GStreamerPipeline:
 
     @staticmethod
     def _destroy_window():
-        for window_name in ("CAMERA", "CALIBRATION CAMERA 4"):
-            try:
-                cv.destroyWindow(window_name)
-                cv.waitKey(1)
-            except cv.error:
-                pass
+        try:
+            cv.destroyWindow("CAMERA")
+            cv.waitKey(1)
+        except cv.error:
+            pass
 
     def run(self):
         pipeline_str = build_camera_pipeline(
@@ -927,7 +969,10 @@ def gstreamer_main(connection, pool, shutdown_event, transposition_channel=None)
                 continue
 
             result, received_frame = pipeline.run()
-            if result in (_RESULT_RESTART, _RESULT_CLOSED):
+            if result == _RESULT_RESTART:
+                failed_attempts = 0
+                continue
+            if result == _RESULT_CLOSED:
                 failed_attempts = 0
                 continue
             if shutdown_event.is_set() or not pipeline.connected:
@@ -958,19 +1003,13 @@ def gstreamer_main(connection, pool, shutdown_event, transposition_channel=None)
                 if pipeline.snapshot_recorder.active:
                     pipeline._stop_snapshot_recording()
                 pipeline._put_status("change_cam", False)
-                if pipeline.calibration_mode:
-                    pipeline.calibration_mode = False
-                    pipeline.channel = pipeline.normal_channel
-                    pipeline._put_status(
-                        "calibration_camera_state",
-                        {"active": False, "channel": 4},
-                    )
                 failed_attempts = 0
                 continue
 
             shutdown_event.wait(PIPELINE_RETRY_DELAY_SECONDS)
     finally:
         pipeline._stop_snapshot_recording()
+        pipeline.snapshot_recorder.close()
         pipeline._fail_manual_snapshot("Camera process stopped before taking the snapshot")
         pipeline._remove_sources()
         if pipeline.pipeline:

@@ -144,7 +144,7 @@ class ManualSnapshotTests(unittest.TestCase):
 
         self.assertEqual(records[0]["camera_frame"], "images/camera_000001.jpg")
         self.assertIsNone(records[1]["camera_frame"])
-        self.assertEqual(records[0]["camera_delay_ms"], 109)
+        self.assertEqual(records[0]["camera_delay_ms"], 87.348)
         self.assertEqual(records[0]["synchronization_error_ms"], 0.0)
 
 
