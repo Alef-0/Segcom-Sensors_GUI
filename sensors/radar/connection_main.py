@@ -7,22 +7,18 @@ import signal
 import cv2 as cv
 
 from sensors.radar.connection_communication import Can_Connection
-from sensors.radar.cluster_messages import (
-    Clusters_messages,
-    read_701_cluster_list as r701,
-    read_702_quality_info as r702,
-)
 from sensors.radar.connection_packages import (
-    create_200_radar_configuration as c200,
-    read_201_radar_state_extended as r201,
-)
-from sensors.radar.object_messages import (
+    Clusters_messages,
     Objects_messages,
-    read_60a_object_status as r60a,
-    read_60b_object_general as r60b,
-    read_60c_object_quality as r60c,
-    read_60d_object_extended as r60d,
-    read_60e_object_warning as r60e,
+    create_200_radar_configuration,
+    read_201_radar_state_extended,
+    read_60a_object_status,
+    read_60b_object_general,
+    read_60c_object_quality,
+    read_60d_object_extended,
+    read_60e_object_warning,
+    read_701_cluster_list,
+    read_702_quality_info,
 )
 from processing.visualization.graph_draw import Graph_radar
 from processing.visualization.graph_filter import Filter_graph
@@ -48,7 +44,8 @@ class RadarFrame:
     points: tuple
 
 
-def _put_status(pool, message, payload, *, critical=False):
+def put_status(pool, message, payload, *, critical=False):
+    """Enqueue worker status message with optional priority timeout."""
     try:
         if critical:
             pool.put((message, payload), timeout=0.5)
@@ -58,7 +55,8 @@ def _put_status(pool, message, payload, *, critical=False):
         pass
 
 
-def _configuration_label(options, index):
+def configuration_label(options, index):
+    """Return human readable label for configuration option index."""
     try:
         return options[index]
     except (IndexError, TypeError):
@@ -66,6 +64,7 @@ def _configuration_label(options, index):
 
 
 def treat_201_message(channel, payload, pool):
+    """Decode 0x201 radar state message and notify GUI."""
     (
         distance,
         radar_power,
@@ -75,27 +74,28 @@ def treat_201_message(channel, payload, pool):
         send_ext_info,
         ctrl_relay,
         _,
-    ) = r201(payload)
+    ) = read_201_radar_state_extended(payload)
     values = {
         f"DISTANCE_{channel}": distance * 2,
-        f"RPW_{channel}": _configuration_label(
+        f"RPW_{channel}": configuration_label(
             ("STANDARD", "-3db TX", "-6db TX", "-9db TX"), radar_power
         ),
-        f"OUT_{channel}": _configuration_label(
+        f"OUT_{channel}": configuration_label(
             ("None", "Objects", "Clusters"), output_type
         ),
-        f"RCS_{channel}": _configuration_label(
+        f"RCS_{channel}": configuration_label(
             ("Standard", "High Sensitivity"), rcs_threshold
         ),
         f"QUALITY_{channel}": ["Inactive", "Active"][send_quality],
         f"EXT_{channel}": ["Inactive", "Active"][send_ext_info],
         f"RELAY_{channel}": ["Inactive", "Active"][ctrl_relay],
     }
-    _put_status(pool, "message_201", values)
+    put_status(pool, "message_201", values)
 
 
 def send_configuration_message(values, connection, save_nvm):
-    data = c200(
+    """Build and send 0x200 configuration frame to selected radar channels."""
+    data = create_200_radar_configuration(
         values["CHECK_DISTANCE"], int(values["DISTANCE"] / 2),
         values["CHECK_RPW"], ["STANDARD", "-3dB Tx gain", "-6dB Tx gain", "-9dB Tx gain"].index(values["RPW"]),
         values["CHECK_OUT"], ["NONE", "OBJECT", "CLUSTERS"].index(values["OUT"]),
@@ -111,21 +111,22 @@ def send_configuration_message(values, connection, save_nvm):
             connection.send_message(message)
 
 
-def _stop_recording(recording, pool, recording_ready):
+def stop_recording(recording, pool, recording_ready):
+    """Stop active PCD recording and broadcast final state."""
     recording_ready.clear()
     if not recording.active:
         return
     try:
         counts = recording.stop()
-        _put_status(
+        put_status(
             pool,
             "recording_state",
             {"active": False, "counts": counts},
             critical=True,
         )
     except Exception as error:
-        _put_status(pool, "recording_error", str(error), critical=True)
-        _put_status(
+        put_status(pool, "recording_error", str(error), critical=True)
+        put_status(
             pool,
             "recording_state",
             {"active": False, "counts": {}},
@@ -177,13 +178,13 @@ def create_connection_communication(
     filters = Filter_graph(initial_values)
 
     def report_progress(channel, count):
-        _put_status(pool, "recording_progress", {"channel": channel, "count": count})
+        put_status(pool, "recording_progress", {"channel": channel, "count": count})
 
     def report_received_message(can_id):
         if can_id in received_message_ids:
             return
         received_message_ids.add(can_id)
-        _put_status(pool, "received_messages", tuple(sorted(received_message_ids)))
+        put_status(pool, "received_messages", tuple(sorted(received_message_ids)))
 
     recording = RadarRecordingSession(report_progress, camera_delay_seconds)
 
@@ -294,9 +295,9 @@ def create_connection_communication(
                 camera_recorded_at,
             )
             result["request_id"] = request_id
-            _put_status(pool, "snapshot_saved", result, critical=True)
+            put_status(pool, "snapshot_saved", result, critical=True)
         except Exception as error:
-            _put_status(
+            put_status(
                 pool,
                 "snapshot_error",
                 {"request_id": request_id, "message": str(error)},
@@ -313,11 +314,11 @@ def create_connection_communication(
                     elif event == "conn_radar":
                         connection.change_connection()
                         received_message_ids.clear()
-                        _put_status(pool, "received_messages", ())
-                        _put_status(pool, "change_radar", connection.connected, critical=True)
+                        put_status(pool, "received_messages", ())
+                        put_status(pool, "change_radar", connection.connected, critical=True)
                         cv.destroyAllWindows()
                         if not connection.connected:
-                            _stop_recording(recording, pool, recording_ready)
+                            stop_recording(recording, pool, recording_ready)
                     elif event == "Send" and connection.connected:
                         send_configuration_message(values, connection, False)
                     elif event == "save_nvm" and connection.connected:
@@ -333,14 +334,14 @@ def create_connection_communication(
                             folders = recording.start(values["folder"], values["channels"])
                             recording_ready.clear()
                             recording_ready.update({channel: False for channel in recording.channels})
-                            _put_status(
+                            put_status(
                                 pool,
                                 "recording_state",
                                 {"active": True, "folders": folders, "counts": {}},
                                 critical=True,
                             )
                         except Exception as error:
-                            _put_status(pool, "recording_error", str(error), critical=True)
+                            put_status(pool, "recording_error", str(error), critical=True)
                     elif event == "record_camera":
                         captured_at = values.get("captured_at", "")
                         for channel, filename in values.get("files", {}).items():
@@ -350,7 +351,7 @@ def create_connection_communication(
                                 captured_at,
                             )
                     elif event == "record_stop":
-                        _stop_recording(recording, pool, recording_ready)
+                        stop_recording(recording, pool, recording_ready)
                     elif event == "snapshot_capture":
                         save_manual_snapshot(values)
                     elif event == "point_cutoff":
@@ -371,7 +372,7 @@ def create_connection_communication(
                             ) / 1000.0
                             recording.set_camera_delay_seconds(camera_delay_seconds)
                         except (AttributeError, TypeError, ValueError):
-                            _put_status(
+                            put_status(
                                 pool,
                                 "camera_latency_error",
                                 "Program-wide pipeline latency adjustment must be numeric",
@@ -383,7 +384,7 @@ def create_connection_communication(
 
             recording_error = recording.poll_error()
             if recording_error is not None:
-                _stop_recording(recording, pool, recording_ready)
+                stop_recording(recording, pool, recording_ready)
 
             if not connection.connected:
                 shutdown_event.wait(0.01)
@@ -402,7 +403,7 @@ def create_connection_communication(
 
                 frame_type = STATUS_FRAME_TYPES.get(message.canId)
                 if frame_type is not None:
-                    status = r60a(message.canData) if frame_type == "object" else None
+                    status = read_60a_object_status(message.canData) if frame_type == "object" else None
                     begin_frame(
                         channel,
                         frame_type,
@@ -411,21 +412,21 @@ def create_connection_communication(
                     )
                 elif frame_types.get(channel) == "cluster":
                     if message.canId == 0x701:
-                        cluster_messages[channel].fill_701(r701(message.canData))
+                        cluster_messages[channel].fill_701(read_701_cluster_list(message.canData))
                     elif message.canId == 0x702:
-                        cluster_messages[channel].fill_702(r702(message.canData))
+                        cluster_messages[channel].fill_702(read_702_quality_info(message.canData))
                 elif frame_types.get(channel) == "object":
                     if message.canId == 0x60B:
-                        object_messages[channel].fill_60b(r60b(message.canData))
+                        object_messages[channel].fill_60b(read_60b_object_general(message.canData))
                     elif message.canId == 0x60C:
-                        object_messages[channel].fill_60c(r60c(message.canData))
+                        object_messages[channel].fill_60c(read_60c_object_quality(message.canData))
                     elif message.canId == 0x60D:
-                        object_messages[channel].fill_60d(r60d(message.canData))
+                        object_messages[channel].fill_60d(read_60d_object_extended(message.canData))
                     elif message.canId == 0x60E:
-                        object_messages[channel].fill_60e(r60e(message.canData))
+                        object_messages[channel].fill_60e(read_60e_object_warning(message.canData))
     finally:
         clear_latest(transposition_channel)
-        _stop_recording(recording, pool, recording_ready)
+        stop_recording(recording, pool, recording_ready)
         if connection.sock:
             connection.sock.close()
         cv.destroyAllWindows()

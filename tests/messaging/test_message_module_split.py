@@ -1,23 +1,20 @@
 import unittest
 
-from sensors.radar import connection_packages
-from sensors.radar.cluster_messages import read_701_cluster_list
-from sensors.radar.object_messages import (
+from sensors.radar.connection_packages import (
     OBJECT_CLASSES,
     Objects_messages,
     RadarObject,
     read_60d_object_extended,
+    read_701_cluster_list,
 )
 
 
-class MessageModuleSplitTests(unittest.TestCase):
-    def test_cluster_decoder_is_defined_in_cluster_module(self):
-        self.assertEqual(read_701_cluster_list.__module__, "sensors.radar.cluster_messages")
-        self.assertIs(connection_packages.read_701_cluster_list, read_701_cluster_list)
+class UnifiedMessageModuleTests(unittest.TestCase):
+    def test_cluster_decoder_is_defined_in_connection_packages(self):
+        self.assertEqual(read_701_cluster_list.__module__, "sensors.radar.connection_packages")
 
-    def test_object_decoder_is_defined_in_object_module(self):
-        self.assertEqual(read_60d_object_extended.__module__, "sensors.radar.object_messages")
-        self.assertIs(connection_packages.read_60d_object_extended, read_60d_object_extended)
+    def test_object_decoder_is_defined_in_connection_packages(self):
+        self.assertEqual(read_60d_object_extended.__module__, "sensors.radar.connection_packages")
 
     def test_object_class_dictionary_matches_60d_values(self):
         self.assertEqual(OBJECT_CLASSES, {
@@ -30,7 +27,6 @@ class MessageModuleSplitTests(unittest.TestCase):
             6: "WIDE",
             7: "RESERVED_02",
         })
-        self.assertIs(connection_packages.OBJECT_CLASSES, OBJECT_CLASSES)
 
     def test_object_class_name_is_available_on_decoded_objects(self):
         messages = Objects_messages()
@@ -46,3 +42,4 @@ class MessageModuleSplitTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

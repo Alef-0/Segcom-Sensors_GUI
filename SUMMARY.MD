@@ -49,3 +49,8 @@ Shell script synchronizing remote sensor host date/time over SSH.
 
 ### [requirements.txt](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/requirements.txt)
 Python runtime dependencies for the project.
+
+## Subdirectories
+
+### [sensors/](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors)
+Sensor drivers and background worker integrations for Camera, GPS, and Radar. See [sensors/SUMMARY.MD](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/SUMMARY.MD).

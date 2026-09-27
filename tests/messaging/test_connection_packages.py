@@ -166,5 +166,33 @@ class RadarPackageTests(unittest.TestCase):
         self.assertEqual((payload[4] >> 5) & 0x07, 3)
 
 
+class GpsCoordinateTests(unittest.TestCase):
+    def test_dms_to_dd_and_dd_to_dms(self):
+        from sensors.gps.gps_connection import dd_to_dms, dms_to_dd
+        dd = dms_to_dd(23, 30, 0.0)
+        self.assertAlmostEqual(dd, 23.5)
+        deg, mins, secs = dd_to_dms(23.5)
+        self.assertEqual((deg, mins), (23, 30))
+        self.assertAlmostEqual(secs, 0.0)
+
+    def test_parse_coordinate_south_and_west(self):
+        from sensors.gps.gps_connection import parse_coordinate
+        val, text = parse_coordinate("Latitude=(66,30,0.0)", 90.0, "S", "N")
+        self.assertAlmostEqual(val, -23.5)
+        self.assertIn("S", text)
+        self.assertIn("23° 30'", text)
+
+    def test_transform_into_coordinates(self):
+        from sensors.gps.gps_connection import transform_into_coordinates
+        dvr_response = "status.Latitude=(113,30,0.0)\nstatus.Longitude=(226,45,0.0)"
+        text, url = transform_into_coordinates(dvr_response)
+        self.assertIn("23° 30'", text)
+        self.assertIn("N", text)
+        self.assertIn("46° 45'", text)
+        self.assertIn("E", text)
+        self.assertIn("query=23.5,46.75", url)
+
+
 if __name__ == "__main__":
     unittest.main()
+
