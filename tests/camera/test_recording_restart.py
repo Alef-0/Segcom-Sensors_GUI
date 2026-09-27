@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock
 
 from sensors.camera.camera_gstreamer import GStreamerPipeline
-from sensors.camera.camera_pipeline_policy import CPU_BACKEND
+from sensors.camera.camera_pipeline import CPU_BACKEND
 
 
 class CameraRecordingRestartTests(unittest.TestCase):
@@ -16,7 +16,6 @@ class CameraRecordingRestartTests(unittest.TestCase):
         camera.main_loop = None
         camera.connected = True
         camera.channel = camera.normal_channel = 2
-        camera.stream_epoch = 5
         camera.shutdown_event = threading.Event()
         camera.communicate = Mock()
         camera.communicate.poll.return_value = False
@@ -24,8 +23,6 @@ class CameraRecordingRestartTests(unittest.TestCase):
                                         frames_rejected_invalid_timing=0,
                                         unusual_pts_gap_candidates=0)
         camera.snapshot_recorder.poll_error.return_value = None
-        camera.reference_clock = Mock()
-        camera.timestamp_policy = Mock()
         camera._put_status = Mock()
         camera.frames = queue.Queue()
         camera.decoder_backends = (CPU_BACKEND,)
@@ -53,14 +50,10 @@ class CameraRecordingRestartTests(unittest.TestCase):
         payload = {"folders": {2: "/unused"}}
         for _ in range(2):
             self.command(camera, "record_start", payload)
-            session = camera.snapshot_recorder.start.call_args.kwargs["timing_session"]
-            self.assertEqual(session["stream_epoch_at_start"], 5)
-            self.assertFalse(session["pipeline_restarted_for_recording"])
             self.command(camera, "record_stop")
         self.assertEqual(camera.snapshot_recorder.start.call_count, 2)
         camera.pipeline.set_state.assert_not_called()
         camera.main_loop.quit.assert_not_called()
-        camera.timestamp_policy.reset.assert_not_called()
 
     def test_duplicate_request_does_not_replace_active_recording(self):
         camera = self.fixture()

@@ -5,7 +5,7 @@ import re
 import uuid
 import FreeSimpleGUI as sg
 
-from processing.recording.point_cloud_recorder import RECORDING_METADATA_NAME, TIMESTAMPS_METADATA_NAME
+from sensors.auxiliary import RECORDING_METADATA_NAME, TIMESTAMPS_METADATA_NAME
 from processing.visualization.filter_schema import RCS_KEY
 
 
@@ -245,9 +245,9 @@ def set_transposition(active, controls, pipes, message=None):
 def handle_gui_event(event, values, controls, runtime, pipes, shutdown_event):
     """Dispatch GUI events to appropriate hardware pipes and state handlers."""
     if   event in (sg.WINDOW_CLOSED, None):             shutdown_event.set()
-    elif event in ("playback_width", "playback_height", "graph_width", "graph_height"):
+    elif event in ("playback_width", "playback_height", "graph_width", "graph_height", "camera_pipeline_latency"):
         controls.sanitize_numeric_input(event, values, allow_float=False)
-    elif event in ("point_cutoff", "graph_x_range", "graph_y_range"):
+    elif event in ("point_cutoff", "graph_x_range", "graph_y_range", "camera_latency_adjustment"):
         controls.sanitize_numeric_input(event, values, allow_float=True)
     elif event == "transposition_toggle":               set_transposition(not controls.transposition, controls, pipes)
     elif isinstance(event, str) and event.startswith("choose_") and event != "choose_2" and controls.transposition:
@@ -305,6 +305,13 @@ def handle_gui_event(event, values, controls, runtime, pipes, shutdown_event):
             pipes.cam.send(("camera_recording_rate", {"frames_per_30": fps}))
         except ValueError as err:
             controls.show_error(str(err), "Recording rate error")
+    elif event == "camera_latency_apply":
+        try:
+            jitter, offset = controls.validate_camera_latency(values)
+            pipes.cam.send(("camera_latency_settings", {"pipeline_latency_ms": jitter, "latency_adjustment_ms": offset}))
+            controls.update_camera_latency(jitter, offset)
+        except ValueError as err:
+            controls.show_error(str(err), "Camera latency error")
     elif event == "playback_toggle":
         if not controls.playback and controls.transposition:
             set_transposition(False, controls, pipes)
@@ -358,6 +365,8 @@ def apply_status_message(message, payload, controls, runtime, pipes):
         controls.update_transposition(False, f"ERROR · {payload}")
     elif message == "camera_recording_rate_state":      controls.update_recording_rate(payload["frames_per_30"])
     elif message == "camera_recording_rate_error":      controls.show_error(payload, "Recording rate error")
+    elif message == "camera_latency_state":             controls.update_camera_latency(payload.get("pipeline_latency_ms"), payload.get("latency_adjustment_ms"))
+    elif message == "camera_latency_error":             controls.show_error(payload, "Camera latency error")
     elif message == "camera_recording_drop":            pass
     elif message == "camera_ntp_time":                  controls.update_camera_ntp(payload)
     elif message == "message_201":                      controls.update_radar_telemetry(payload)

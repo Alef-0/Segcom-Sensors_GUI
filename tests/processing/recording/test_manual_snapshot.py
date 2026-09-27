@@ -5,8 +5,8 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from sensors.radar.connection_packages import RadarPoint
-from processing.recording.manual_snapshot import ManualSnapshotWriter
-import processing.recording.point_cloud_recorder as recorder_module
+from sensors.snapshot import SnapshotWriter as ManualSnapshotWriter
+import sensors.recording as recorder_module
 
 
 class FakePointCloud:

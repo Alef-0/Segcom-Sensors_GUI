@@ -1,4 +1,4 @@
-"""Save one manually selected radar frame and camera image as a normal recording."""
+"""Unified manual snapshot writer for radar point clouds and camera images."""
 
 from datetime import datetime, timedelta
 import json
@@ -6,9 +6,16 @@ from pathlib import Path
 import re
 from typing import Iterable
 
-from processing.recording.paths import image_path, image_reference, point_cloud_path, point_cloud_reference
-from processing.recording.point_cloud_recorder import (
-    CAMERA_DELAY_SECONDS, RECORDING_METADATA_NAME, TIMESTAMPS_METADATA_NAME,
+from sensors.auxiliary import (
+    CAMERA_DELAY_SECONDS,
+    IMAGE_DIRECTORY_NAME,
+    POINT_CLOUD_DIRECTORY_NAME,
+    RECORDING_METADATA_NAME,
+    TIMESTAMPS_METADATA_NAME,
+    image_path,
+    image_reference,
+    point_cloud_path,
+    point_cloud_reference,
     save_point_cloud,
 )
 from sensors.radar.connection_packages import RadarObject, RadarPoint
@@ -22,7 +29,9 @@ def _replace_json(path: Path, value) -> None:
     temp.replace(path)
 
 
-class ManualSnapshotWriter:
+class SnapshotWriter:
+    """Saves one paired radar frame (.pcd) and camera image (.jpg) to disk."""
+
     def __init__(self, folder: str | Path, camera_delay_seconds: float = CAMERA_DELAY_SECONDS):
         self.folder = Path(folder).expanduser()
         self.camera_delay_seconds = float(camera_delay_seconds)
@@ -56,34 +65,51 @@ class ManualSnapshotWriter:
              frame_type: str, image_bytes: bytes, camera_recorded_at: datetime) -> dict:
         records, timestamps = self._metadata()
         index = self._next_index(records)
-        pcd_ref = point_cloud_reference(f"frame_{index:06d}.pcd")
-        image_ref = image_reference(f"camera_{index:06d}.jpg")
-        pcd_file, image_file = point_cloud_path(self.folder, pcd_ref), image_path(self.folder, image_ref)
+        pcd_filename = f"frame_{index:06d}.pcd"
+        image_filename = f"camera_{index:06d}.jpg"
+        pcd_ref = point_cloud_reference(pcd_filename)
+        image_ref = image_reference(image_filename)
+
         target = camera_recorded_at - timedelta(seconds=self.camera_delay_seconds)
-        error_ms = (radar_recorded_at - target).total_seconds() * 1000
+        sync_error_ms = round((radar_recorded_at - target).total_seconds() * 1000, 3)
         created = []
         try:
-            pcd_file.parent.mkdir(exist_ok=True)
-            image_file.parent.mkdir(exist_ok=True)
-            save_point_cloud(pcd_file, tuple(points), frame_type)
-            created.append(pcd_file)
-            image_file.write_bytes(image_bytes)
-            created.append(image_file)
-            radar_text = radar_recorded_at.isoformat(timespec="microseconds")
-            camera_text = camera_recorded_at.isoformat(timespec="microseconds")
-            timestamps[pcd_ref] = radar_text
+            (self.folder / POINT_CLOUD_DIRECTORY_NAME).mkdir(parents=True, exist_ok=True)
+            (self.folder / IMAGE_DIRECTORY_NAME).mkdir(parents=True, exist_ok=True)
+            full_pcd_path = point_cloud_path(self.folder, pcd_filename)
+            full_image_path = image_path(self.folder, image_filename)
+            save_point_cloud(full_pcd_path, tuple(points), frame_type)
+            created.append(full_pcd_path)
+            full_image_path.write_bytes(image_bytes)
+            created.append(full_image_path)
+
+            radar_iso = radar_recorded_at.isoformat(timespec="microseconds")
+            camera_iso = camera_recorded_at.isoformat(timespec="microseconds")
+
+            timestamps[pcd_ref] = radar_iso
             records.append({
-                "point_cloud": pcd_ref, "recorded_at": radar_text,
-                "frame_type": frame_type, "camera_frame": image_ref,
-                "camera_recorded_at": camera_text,
-                "camera_delay_ms": round(self.camera_delay_seconds * 1000, 3),
-                "synchronization_error_ms": round(error_ms, 3),
+                "point_cloud": pcd_ref,
+                "recorded_at": radar_iso,
+                "frame_type": frame_type,
+                "camera_frame": image_ref,
+                "camera_recorded_at": camera_iso,
+                "camera_delay_ms": round(self.camera_delay_seconds * 1000.0, 3),
+                "synchronization_error_ms": sync_error_ms,
             })
+
             _replace_json(self.timestamps_path, timestamps)
             _replace_json(self.metadata_path, records)
         except Exception:
             for path in created:
                 path.unlink(missing_ok=True)
             raise
-        return {"folder": str(self.folder.resolve()), "point_cloud": pcd_ref,
-                "camera_frame": image_ref, "synchronization_error_ms": round(error_ms, 3)}
+
+        return {
+            "folder": str(self.folder.resolve()),
+            "point_cloud": pcd_ref,
+            "camera_frame": image_ref,
+            "synchronization_error_ms": sync_error_ms,
+        }
+
+
+ManualSnapshotWriter = SnapshotWriter  # Backward-compatibility alias

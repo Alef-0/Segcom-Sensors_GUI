@@ -11,9 +11,8 @@ from processing.playback.playback import (
     DEFAULT_PLAYBACK_HEIGHT, DEFAULT_PLAYBACK_WIDTH, _close_windows, _send,
     load_recording_entries,
 )
-from processing.recording.manual_snapshot import ManualSnapshotWriter
-from processing.recording.point_cloud_reader import PointCloudReader
-from processing.recording.point_cloud_recorder import CAMERA_DELAY_SECONDS
+from sensors.snapshot import SnapshotWriter as ManualSnapshotWriter
+from sensors.auxiliary import CAMERA_DELAY_SECONDS, PointCloudReader
 from processing.visualization.graph_draw import Graph_radar
 from processing.visualization.graph_filter import Filter_graph
 

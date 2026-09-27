@@ -103,8 +103,8 @@ def build_snapshot_tab():
     ]
 
 
-def build_display_tab():
-    """Construct display, graph resolution, and FPS adjustment tab."""
+def build_video_tab():
+    """Construct camera resolution, FPS, jitter, and offset calibration tab."""
     col_res = sg.Column([[
         sg.Text("Camera Resolution"),
         sg.Input("1280", key="playback_width", size=(8, 1), justification="right", enable_events=True),
@@ -117,6 +117,30 @@ def build_display_tab():
         sg.Combo(tuple(range(1, 31)), 30, key="camera_recording_rate", size=(5, 1), readonly=True),
         sg.Button("APPLY", key="recording_rate_apply"),
     ]])
+    col_latency = sg.Column([[
+        sg.Text("Jitter (ms)"),
+        sg.Input("145", key="camera_pipeline_latency", size=(6, 1), justification="right", enable_events=True),
+        sg.Text("Offset (ms)"),
+        sg.Input("87.3", key="camera_latency_adjustment", size=(6, 1), justification="right", enable_events=True),
+        sg.Button("APPLY", key="camera_latency_apply"),
+    ]], expand_x=True)
+    status_row1 = [
+        sg.Push(),
+        sg.Text("1280 × 720", key="playback_resolution_status"),
+        sg.VSep(),
+        sg.Text("30 / 30 frames (30 FPS)", key="recording_rate_status"),
+        sg.Push(),
+    ]
+    status_row2 = [
+        sg.Push(),
+        sg.Text("Jitter: 145 ms | Offset: 87.3 ms", key="camera_latency_status"),
+        sg.Push(),
+    ]
+    return [[col_res, sg.VSep(), col_fps], status_row1, [sg.HorizontalSeparator()], [col_latency], status_row2]
+
+
+def build_graph_tab():
+    """Construct radar point cutoff and graph range/resolution tab."""
     col_cutoff = sg.Column([[
         sg.Text("Point cutoff (m)"),
         sg.Input("15", key="point_cutoff", size=(6, 1), justification="right", enable_events=True),
@@ -126,9 +150,21 @@ def build_display_tab():
         [sg.Text("Graph Resolution"), sg.Input("800", key="graph_width", size=(6, 1), justification="right", enable_events=True), sg.Text("×"), sg.Input("600", key="graph_height", size=(6, 1), justification="right", enable_events=True)],
         [sg.Text("Graph Range (m)"), sg.Text("X ±"), sg.Input("15", key="graph_x_range", size=(5, 1), justification="right", enable_events=True), sg.Text("Y 0–"), sg.Input("15", key="graph_y_range", size=(5, 1), justification="right", enable_events=True), sg.Button("APPLY", key="graph_settings_apply")],
     ])
-    status_row1 = [sg.Push(), sg.Text("1280 × 720", key="playback_resolution_status"), sg.VSep(), sg.Text("30 / 30 frames (30 FPS)", key="recording_rate_status"), sg.Push()]
-    status_row2 = [sg.Push(), sg.Text("Cutoff 15.0 m", key="point_cutoff_status"), sg.VSep(), sg.Text("800 × 600", key="graph_resolution_status"), sg.VSep(), sg.Text("X ±15 m | Y 0–15 m", key="graph_range_status"), sg.Push()]
-    return [[col_res, sg.VSep(), col_fps], status_row1, [sg.HorizontalSeparator()], [col_cutoff, sg.VSep(), col_graph], status_row2]
+    status_row = [
+        sg.Push(),
+        sg.Text("Cutoff 15.0 m", key="point_cutoff_status"),
+        sg.VSep(),
+        sg.Text("800 × 600", key="graph_resolution_status"),
+        sg.VSep(),
+        sg.Text("X ±15 m | Y 0–15 m", key="graph_range_status"),
+        sg.Push(),
+    ]
+    return [[col_cutoff, sg.VSep(), col_graph], status_row]
+
+
+def build_display_tab():
+    """Compatibility alias for graph tab layout."""
+    return build_graph_tab()
 
 
 def build_filter_tab():
@@ -177,8 +213,10 @@ def build_main_layout():
         sg.Tab("Configurations", build_radar_options()),
         sg.Tab("Record", build_record_tab()),
         sg.Tab("Snapshots", build_snapshot_tab()),
-        sg.Tab("Display", build_display_tab()),
+        sg.Tab("Graph", build_graph_tab()),
+        sg.Tab("Video", build_video_tab()),
     ]
+
     filter_tabs = [
         sg.Tab("Basic", build_filter_tab()),
         sg.Tab("Cluster Options", build_cluster_filter_tab()),

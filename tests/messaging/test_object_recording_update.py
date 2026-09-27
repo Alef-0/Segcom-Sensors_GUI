@@ -5,8 +5,8 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from sensors.radar.connection_packages import MISSING_QUALITY, RadarObject
-import processing.recording.point_cloud_reader as reader_module
-import processing.recording.point_cloud_recorder as recorder_module
+import sensors.auxiliary as reader_module
+import sensors.recording as recorder_module
 
 
 class FakePointCloud:

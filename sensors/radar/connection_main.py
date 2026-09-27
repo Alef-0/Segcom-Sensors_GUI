@@ -28,8 +28,9 @@ from processing.visualization.transposition import (
     put_latest,
     transposition_payload,
 )
-from processing import ManualSnapshotWriter, RadarRecordingSession
-from processing.recording.point_cloud_recorder import CAMERA_DELAY_SECONDS
+from sensors.snapshot import SnapshotWriter as ManualSnapshotWriter
+from sensors.recording import RadarRecorder as RadarRecordingSession
+from sensors.auxiliary import CAMERA_DELAY_SECONDS
 
 RADAR_CHANNELS = (1, 2, 3)
 STATUS_FRAME_TYPES = {0x600: "cluster", 0x60A: "object"}

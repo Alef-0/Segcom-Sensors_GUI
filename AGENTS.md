@@ -37,3 +37,6 @@ Recent commits generally use short imperative subjects, for example `Improve cal
 ## Configuration & Data Safety
 
 Device addresses and DVR credentials are currently embedded in source. Do not add real credentials to examples or publish deployment-specific values. Avoid committing generated recordings, snapshots, or analysis output unless they are explicitly needed as test fixtures.
+
+# Additional things
+- Any README file consolidate inside of the SUMMARY.MD

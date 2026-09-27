@@ -34,6 +34,8 @@ class MenuControls:
         self.graph_x_range = 15.0
         self.graph_y_range = 15.0
         self.transposition = False
+        self.camera_pipeline_latency = 145
+        self.camera_latency_adjustment = 87.3
 
         self.window = sg.Window("Configurations Menu", build_main_layout(), finalize=True)
         for element in self.window.element_list():
@@ -97,6 +99,14 @@ class MenuControls:
         if not 1 <= fps <= 30:
             raise ValueError("Recorded camera frames must be between 1 and 30")
         return fps
+
+    def validate_camera_latency(self, values):
+        """Validate camera pipeline latency (jitter) and latency adjustment (offset)."""
+        jitter = int(str(values.get("camera_pipeline_latency", "145")).strip())
+        offset = float(str(values.get("camera_latency_adjustment", "87.3")).strip())
+        if jitter < 0:
+            raise ValueError("Camera latency (jitter) must be a non-negative integer")
+        return jitter, offset
 
     def refresh_mode_controls(self):
         """Enable or disable widgets depending on current operating state."""
@@ -324,6 +334,14 @@ class MenuControls:
 
     def update_recording_rate(self, fps):
         self.window["recording_rate_status"].update(f"{fps} / 30 frames ({fps} FPS)")
+
+    def update_camera_latency(self, pipeline_latency_ms, adjustment_ms):
+        """Update camera latency status label."""
+        self.camera_pipeline_latency = pipeline_latency_ms
+        self.camera_latency_adjustment = adjustment_ms
+        self.window["camera_latency_status"].update(
+            f"Jitter: {pipeline_latency_ms} ms | Offset: {adjustment_ms:g} ms"
+        )
 
     def update_radar_telemetry(self, values_dict):
         for k, v in values_dict.items():

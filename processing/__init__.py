@@ -1,13 +1,15 @@
-"""Recording and visualization services used by the sensor application."""
+"""Processing package exposing recording, playback, and visualization services."""
 
-from processing.recording.camera_snapshot_recorder import CameraSnapshotRecorder
-from processing.recording.manual_snapshot import ManualSnapshotWriter
-from processing.recording.point_cloud_reader import PointCloudReader
-from processing.recording.point_cloud_recorder import RadarRecordingSession
+from sensors.auxiliary import PointCloudReader
+from sensors.recording import CameraRecorder, CameraSnapshotRecorder, RadarRecorder, RadarRecordingSession
+from sensors.snapshot import ManualSnapshotWriter, SnapshotWriter
 
 __all__ = [
+    "CameraRecorder",
     "CameraSnapshotRecorder",
     "ManualSnapshotWriter",
     "PointCloudReader",
+    "RadarRecorder",
     "RadarRecordingSession",
+    "SnapshotWriter",
 ]

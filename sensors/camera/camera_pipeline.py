@@ -135,8 +135,19 @@ def build_camera_pipeline(
     display_width: int,
     display_height: int,
     latency_ms: int,
+    include_display_sink: bool = True,
 ) -> str:
     """Build the low-latency display and full-resolution capture pipeline."""
+    if not include_display_sink:
+        return (
+            f"rtspsrc name=source latency={latency_ms} protocols=tcp+udp "
+            "buffer-mode=1 do-retransmission=true ! "
+            f"rtph264depay ! h264parse ! {backend.decoder_chain} ! "
+            "queue name=capture_queue max-size-buffers=30 "
+            "max-size-bytes=0 max-size-time=0 ! "
+            "video/x-raw,format=BGR ! "
+            "appsink name=capture_sink emit-signals=true sync=false"
+        )
 
     return (
         f"rtspsrc name=source latency={latency_ms} protocols=tcp+udp "
@@ -150,3 +161,4 @@ def build_camera_pipeline(
         "video/x-raw,format=BGR ! "
         "appsink name=capture_sink emit-signals=true sync=false"
     )
+

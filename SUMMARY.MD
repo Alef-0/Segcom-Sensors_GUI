@@ -14,9 +14,11 @@ Pure declarative layout generation using `FreeSimpleGUI`. Defines tabs, frames, 
 - `build_radar_columns()`: Builds telemetry columns for radar channels A, B, and C.
 - `build_telemetry_frame()`: Builds top telemetry display with received CAN IDs and camera NTP time.
 - `build_radar_options()`, `build_record_tab()`, `build_snapshot_tab()`: Builds configuration tabs.
-- `build_display_tab()`: Builds camera resolution, recorded FPS, cutoff distance, and graph range tab.
+- `build_graph_tab()`: Builds point cutoff distance, graph resolution, and graph range tab.
+- `build_video_tab()`: Builds camera resolution, recorded FPS, jitter latency, and offset correction tab.
 - `build_filter_tab()`, `build_cluster_filter_tab()`, `build_transposition_tab()`: Builds filter tabs.
 - `build_main_layout()`: Assembles the root window layout.
+
 
 ### [menu_controls.py](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/menu_controls.py)
 Window and widget state controller. Owns the GUI window instance, handles input validation and real-time character filtering, and updates UI labels and button states.
@@ -53,4 +55,7 @@ Python runtime dependencies for the project.
 ## Subdirectories
 
 ### [sensors/](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors)
-Sensor drivers and background worker integrations for Camera, GPS, and Radar. See [sensors/SUMMARY.MD](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/SUMMARY.MD).
+Sensor drivers, background worker integrations for Camera, GPS, and Radar, along with unified recording, snapshot, and auxiliary processing utilities. See [sensors/SUMMARY.MD](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/SUMMARY.MD).
+
+### [processing/](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/processing)
+Dataset playback, snapshot navigation, top-down Cartesian radar plotting, radar point filtering, and radar-camera image transposition. See [processing/SUMMARY.MD](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/processing/SUMMARY.MD).

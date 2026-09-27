@@ -9,10 +9,9 @@ from unittest.mock import patch
 import numpy as np
 
 from sensors.radar.connection_packages import MISSING_QUALITY, RadarPoint
-import processing.recording.camera_snapshot_recorder as camera_module
-import processing.recording.camera_telemetry as camera_telemetry_module
-import processing.recording.point_cloud_reader as reader_module
-import processing.recording.point_cloud_recorder as recorder_module
+import sensors.recording as camera_module
+import sensors.auxiliary as reader_module
+import sensors.recording as recorder_module
 from processing.playback.playback import load_recording_entries
 from processing.playback.playback import PlaybackController
 from processing.visualization.graph_draw import Graph_radar
@@ -204,112 +203,42 @@ class RecordingChangesTests(unittest.TestCase):
         camera_module.cv.imwrite = fake_imwrite
         try:
             with TemporaryDirectory() as folder:
-                recorder = camera_module.CameraSnapshotRecorder()
-                recorder.start(
-                    {4: folder},
-                    calibration=True,
-                    latency_adjustment_ms=250,
-                    timing_session={
-                        "camera_channel": 4,
-                        "decoder_backend": "rtx",
-                        "pipeline_latency_ms": 145,
-                    },
-                )
+                recorder = camera_module.CameraRecorder()
+                recorder.start({4: folder}, latency_adjustment_ms=250)
                 captured_at = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
-                captured_ns = 1_787_745_600_000_000_000
                 recorder.submit(
                     np.zeros((2, 2, 3), dtype=np.uint8),
                     captured_at=captured_at,
                     timing={
-                        "stream_epoch": 3,
                         "pts_ns": 1_000_000_000,
-                        "running_time_ns": 1_000_000_000,
-                        "pipeline_zero_unix_ns": captured_ns - 1_000_000_000,
-                        "pipeline_zero_monotonic_ns": 99_000_000_000,
-                        "pipeline_clock_type": "GstSystemClock",
-                        "media_time_ns": captured_ns,
                         "camera_ntp_ns": 1_787_745_628_000_000_000,
-                        "reference_timestamp_raw_ns": 1_787_745_628_000_000_000,
-                        "reference_clock": "timestamp/x-unix",
-                        "host_realtime_received_ns": captured_ns + 145_000_000,
-                        "host_monotonic_received_ns": 100_145_000_000,
-                        "large_pts_gap_candidate": True,
-                        "flags": ["unusual_pts_gap"],
+                        "application_arrival_monotonic_ns": 100_145_000_000,
                     },
                 )
-                recorder.update_transport_stats(
-                    {"num_lost": 2, "num_late": 1},
-                    stream_epoch=3,
-                )
-                recorder.update_transport_stats(
-                    {"num_lost": 2, "num_late": 2},
-                    stream_epoch=3,
-                )
-                recorder.update_transport_stats(
-                    {"num_lost": 1, "num_late": 0},
-                    stream_epoch=4,
-                )
                 recorder.stop()
-                journal_records = [
-                    json.loads(line)
-                    for line in (
-                        Path(folder) / camera_telemetry_module.CAMERA_TIMESTAMPS_JOURNAL_NAME
-                    ).read_text().splitlines()
-                ]
-                session = json.loads(
-                    (Path(folder) / camera_telemetry_module.CAMERA_TIMING_SESSION_NAME).read_text()
-                )
-                summary = json.loads(
-                    (Path(folder) / camera_telemetry_module.CAMERA_RECORDING_SUMMARY_NAME).read_text()
-                )
-                redundant_manifest_exists = (
-                    Path(folder) / "camera_timestamps.json"
-                ).exists()
+                csv_records = (
+                    Path(folder) / "camera_timestamps.csv"
+                ).read_text().splitlines()
         finally:
             camera_module.cv.imwrite = original_imwrite
 
-        self.assertFalse(redundant_manifest_exists)
-        self.assertEqual(len(journal_records), 1)
-        metadata = journal_records[0]
-        self.assertEqual(metadata["frame"], "images/camera_000001.jpg")
-        self.assertEqual(metadata["stream_epoch"], 3)
-        self.assertEqual(metadata["media_unix_ns"], captured_ns)
-        self.assertEqual(
-            metadata["estimated_exposure_unix_ns"],
-            captured_ns - 250_000_000,
-        )
-        self.assertEqual(metadata["reference_ntp_ns"], 1_787_745_628_000_000_000)
-        self.assertEqual(metadata["pts_ns"], 1_000_000_000)
-        self.assertEqual(
-            metadata["received_unix_ns"],
-            captured_ns + 145_000_000,
-        )
-        self.assertTrue({
-            "timestamp_schema_version", "frame", "stream_epoch", "pts_ns",
-            "running_time_ns", "media_monotonic_ns",
-            "application_arrival_monotonic_ns", "arrival_boundary",
-            "sample_pulled_monotonic_ns", "frame_converted_monotonic_ns",
-            "received_monotonic_ns", "received_unix_ns",
-            "reference_timestamp_raw_ns", "reference_clock",
-            "reference_ntp_ns", "media_unix_ns",
-            "estimated_exposure_unix_ns", "estimated_capture_monotonic_ns",
-            "estimated_arrival_delay_ns", "saved_unix_ns", "flags",
-        }.issubset(metadata))
-        self.assertEqual(session["schema_version"], 3)
-        self.assertEqual(session["camera_channel"], 4)
-        self.assertEqual(session["image_adjustment_ns"], 250_000_000)
-        self.assertEqual(session["epochs"][0]["stream_epoch"], 3)
-        self.assertEqual(summary["frames_saved"], 1)
-        self.assertEqual(summary["schema_version"], 3)
-        self.assertEqual(summary["frames_dropped_writer_queue"], 0)
-        self.assertEqual(summary["unusual_pts_gap_candidates"], 1)
-        self.assertEqual(summary["confirmed_frames_not_saved"], 0)
-        self.assertEqual(summary["num_lost"], 3)
-        self.assertEqual(summary["num_late"], 2)
-        self.assertEqual(
-            [row["stream_epoch"] for row in summary["transport_stats_by_epoch"]],
-            [3, 4],
-        )
+        self.assertEqual(csv_records[0], "index,pts,ntp,monotonic")
+        self.assertEqual(csv_records[1], "1,1000000000,1787745628000000000,100145000000")
+
+    def test_camera_recording_invalid_pts_writes_negative_one_in_csv(self):
+        with TemporaryDirectory() as folder:
+            recorder = camera_module.CameraRecorder()
+            recorder.start({2: folder})
+            recorder.note_invalid_timing_frame(
+                reason="frame has invalid PTS",
+                timing={"application_arrival_monotonic_ns": 123456789},
+            )
+            recorder.stop()
+            csv_lines = (
+                Path(folder) / "camera_timestamps.csv"
+            ).read_text().splitlines()
+            self.assertEqual(csv_lines[0], "index,pts,ntp,monotonic")
+            self.assertEqual(csv_lines[1], "-1,-1,-1,123456789")
 
     def test_camera_recording_rate_is_limited_to_one_through_thirty(self):
         recorder = camera_module.CameraSnapshotRecorder()
@@ -368,44 +297,6 @@ class RecordingChangesTests(unittest.TestCase):
 
         self.assertFalse(writer.is_alive())
 
-    def test_invalid_timing_frame_is_retained_as_calibration_event(self):
-        with TemporaryDirectory() as folder:
-            recorder = camera_module.CameraSnapshotRecorder()
-            recorder.start({4: folder}, calibration=True)
-            recorder.note_invalid_timing_frame(
-                reason="frame PTS cannot be mapped to running time",
-                timing={"pts_ns": 123, "application_arrival_monotonic_ns": 456},
-            )
-            recorder.stop()
-            events = [
-                json.loads(line)
-                for line in (
-                    Path(folder) / camera_telemetry_module.CAMERA_TIMING_EVENTS_NAME
-                ).read_text().splitlines()
-            ]
-
-        self.assertEqual(events[0]["event"], "frame_rejected_invalid_timing")
-        self.assertEqual(events[0]["reason"], "frame PTS cannot be mapped to running time")
-        self.assertEqual(events[0]["timing"]["pts_ns"], 123)
-
-    def test_invalid_timing_frame_is_retained_for_regular_camera_recording(self):
-        with TemporaryDirectory() as folder:
-            recorder = camera_module.CameraSnapshotRecorder()
-            recorder.start({1: folder}, calibration=False)
-            recorder.note_invalid_timing_frame(
-                reason="frame PTS cannot be mapped to running time",
-                timing={"pts_ns": 123},
-            )
-            recorder.stop()
-            events = [
-                json.loads(line)
-                for line in (
-                    Path(folder) / camera_telemetry_module.CAMERA_TIMING_EVENTS_NAME
-                ).read_text().splitlines()
-            ]
-
-        self.assertEqual(events[0]["event"], "frame_rejected_invalid_timing")
-        self.assertEqual(events[0]["timing"]["pts_ns"], 123)
 
     def test_playback_loader_supports_new_and_legacy_metadata(self):
         timestamp = "2026-07-29T12:00:00+00:00"

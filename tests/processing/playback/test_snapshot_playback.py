@@ -10,7 +10,7 @@ import cv2 as cv
 
 import processing.playback.snapshot_playback as playback_module
 from processing.visualization.graph_draw import Graph_radar
-from menu_layout import build_snapshot_tab, build_display_tab
+from menu_layout import build_snapshot_tab, build_display_tab, build_graph_tab, build_video_tab
 
 
 class FakeConnection:
@@ -90,7 +90,7 @@ class SnapshotPlaybackTests(unittest.TestCase):
                 playback_module._load_entries(".", synced_only=True)
 
     def test_graph_resolution_and_range_share_one_apply_button(self):
-        layout = build_display_tab()
+        layout = build_graph_tab()
         elements = {
             element.Key: element
             for element in self._elements(layout)
@@ -98,8 +98,23 @@ class SnapshotPlaybackTests(unittest.TestCase):
         }
 
         self.assertIn("graph_settings_apply", elements)
+        self.assertIn("point_cutoff_apply", elements)
         self.assertNotIn("graph_resolution_apply", elements)
         self.assertNotIn("graph_range_apply", elements)
+
+    def test_video_tab_contains_resolution_rate_and_latency_controls(self):
+        layout = build_video_tab()
+        elements = {
+            element.Key: element
+            for element in self._elements(layout)
+            if getattr(element, "Key", None)
+        }
+        self.assertIn("playback_resolution_apply", elements)
+        self.assertIn("recording_rate_apply", elements)
+        self.assertIn("camera_latency_apply", elements)
+        self.assertIn("camera_pipeline_latency", elements)
+        self.assertIn("camera_latency_adjustment", elements)
+        self.assertIn("camera_latency_status", elements)
 
     def test_clicked_point_is_printed_on_one_line(self):
         graph = Graph_radar.__new__(Graph_radar)

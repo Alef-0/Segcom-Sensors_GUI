@@ -10,11 +10,10 @@ import time
 
 import cv2 as cv
 
-from processing.recording.paths import (
+from sensors.auxiliary import (
     IMAGE_DIRECTORY_NAME, POINT_CLOUD_DIRECTORY_NAME, resolve_recording_file,
+    PointCloudReader, RECORDING_METADATA_NAME, TIMESTAMPS_METADATA_NAME,
 )
-from processing.recording.point_cloud_reader import PointCloudReader
-from processing.recording.point_cloud_recorder import RECORDING_METADATA_NAME, TIMESTAMPS_METADATA_NAME
 from processing.visualization.graph_draw import Graph_radar
 from processing.visualization.graph_filter import Filter_graph
 
