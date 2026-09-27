@@ -16,8 +16,8 @@ import processing.recording.point_cloud_recorder as recorder_module
 from processing.playback.playback import load_recording_entries
 from processing.playback.playback import PlaybackController
 from processing.visualization.graph_draw import Graph_radar
-import application_core
-from interface_core import Configurations
+import menu_functions
+from menu_layout import build_record_tab
 
 
 class FakeWriterCloud:
@@ -474,7 +474,7 @@ class RecordingChangesTests(unittest.TestCase):
             (root / "point_cloud" / "frame_000001.pcd").write_bytes(b"pcd")
             (root / recorder_module.TIMESTAMPS_METADATA_NAME).write_text("{}")
 
-            self.assertTrue(application_core._is_recording_folder(root))
+            self.assertTrue(menu_functions.is_recording_folder(root))
 
 
 class RequestedControlChangesTests(unittest.TestCase):
@@ -516,7 +516,7 @@ class RequestedControlChangesTests(unittest.TestCase):
             self.alive = False
 
     def test_record_groups_default_to_unchecked_and_transport_controls_exist(self):
-        layout = Configurations._create_record_layout()
+        layout = build_record_tab()
         elements = {
             element.Key: element
             for row in layout
@@ -537,13 +537,13 @@ class RequestedControlChangesTests(unittest.TestCase):
         pipe = self.FakePipe()
         with TemporaryDirectory() as folder:
             values = {"record_folder": folder, "record_radar_1": True}
-            with patch.object(application_core.sg, "popup_ok_cancel", return_value="Cancel"):
-                application_core._start_recording(values, config, pipe)
+            with patch.object(menu_functions.sg, "popup_ok_cancel", return_value="Cancel"):
+                menu_functions.start_recording(values, config, pipe)
             self.assertFalse(config.pending)
             self.assertEqual(pipe.sent, [])
 
-            with patch.object(application_core.sg, "popup_ok_cancel", return_value="OK"):
-                application_core._start_recording(values, config, pipe)
+            with patch.object(menu_functions.sg, "popup_ok_cancel", return_value="OK"):
+                menu_functions.start_recording(values, config, pipe)
 
         self.assertTrue(config.pending)
         self.assertEqual(pipe.sent[0][0], "record_start")
@@ -562,7 +562,7 @@ class RequestedControlChangesTests(unittest.TestCase):
     def test_shutdown_kills_a_child_that_ignores_terminate(self):
         process = self.StuckProcess()
 
-        application_core._join_processes([process], timeout=0.01, terminate_timeout=0.02)
+        menu_functions.join_processes([process], timeout=0.01, terminate_timeout=0.02)
 
         self.assertEqual(process.terminate_calls, 1)
         self.assertEqual(process.kill_calls, 1)

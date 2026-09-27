@@ -10,7 +10,7 @@ import cv2 as cv
 
 import processing.playback.snapshot_playback as playback_module
 from processing.visualization.graph_draw import Graph_radar
-from menu_configurations import Configurations
+from menu_layout import build_snapshot_tab, build_display_tab
 
 
 class FakeConnection:
@@ -56,7 +56,7 @@ class SnapshotPlaybackTests(unittest.TestCase):
     def test_synced_only_checkbox_defaults_to_checked(self):
         elements = {
             element.Key: element
-            for element in self._elements(Configurations._create_snapshot_layout())
+            for element in self._elements(build_snapshot_tab())
             if getattr(element, "Key", None)
         }
 
@@ -90,7 +90,7 @@ class SnapshotPlaybackTests(unittest.TestCase):
                 playback_module._load_entries(".", synced_only=True)
 
     def test_graph_resolution_and_range_share_one_apply_button(self):
-        layout = Configurations._create_general_configurations_layout()
+        layout = build_display_tab()
         elements = {
             element.Key: element
             for element in self._elements(layout)

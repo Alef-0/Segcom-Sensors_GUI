@@ -2,7 +2,13 @@
 
 ## Project Structure & Module Organization
 
-This is a Python desktop application. `main.py` starts the GUI; shared event and interface logic lives in `application_core.py` and `interface_core.py`. Sensor integrations are grouped under `sensors/` (`camera/`, `radar/`, and `gps/`). Recording, playback, and visualization code lives in `processing/`; QR camera calibration lives in `calibration/`. Automated tests are in `tests/`, while `content/` contains reference documents. Runtime recordings and snapshots are data outputs, not source code.
+This is a Python desktop application. The GUI at the root is structured into three dedicated layers plus an entry point:
+- `main.py` — starts the application, parses CLI arguments via `argparse`, and initializes background multiprocessing workers.
+- `menu_layout.py` — declarative layout generation (FreeSimpleGUI frames, tabs, buttons, and inputs). Pure layout without event logic.
+- `menu_controls.py` — window and widget controller (`MenuControls`). Manages UI state transitions, enables/disables controls, updates labels, and validates/filters inputs.
+- `menu_functions.py` — application event dispatcher and IPC bridge. Bundles worker pipes (`WorkerPipes`), dispatches GUI events, drains status queues, and handles worker process lifecycle and shutdown.
+
+Sensor integrations are grouped under `sensors/` (`camera/`, `radar/`, and `gps/`). Recording, playback, and visualization code lives in `processing/`; QR camera calibration lives in `calibration/`. Automated tests are in `tests/`, while `content/` contains reference documents. Runtime recordings and snapshots are data outputs, not source code.
 
 ## Build, Test, and Development Commands
 
@@ -14,7 +20,11 @@ There is no separate build step or declared formatter/linter configuration. Depe
 
 ## Coding Style & Naming Conventions
 
-Follow the surrounding Python style: four spaces for indentation, descriptive `snake_case` module/function/variable names, and `PascalCase` classes. Keep hardware, recording, and calibration behavior in their existing modules. Prefer small changes that preserve established recording schemas and worker communication contracts.
+- Follow standard Python style: four spaces for indentation, descriptive `snake_case` function/variable names, and `PascalCase` classes.
+- Avoid abusive vertical space: do not split method arguments, simple tuples, or small UI rows onto single-item lines if they fit comfortably within standard line width (88-100 characters). Keep layouts and calls compact and readable.
+- Descriptive naming without unnecessary pseudo-private prefixes: use clear public function and method names (`run_event_loop`, `handle_gui_event`, `start_recording`) rather than prefixing standard internal functions with leading underscores (`_`), unless strictly implementing private class encapsulation.
+- Bundle repetitive parameters: group worker IPC channels into dedicated data structures (such as `WorkerPipes`) rather than threading 5+ separate pipe arguments across multiple function signatures.
+- Keep docstrings concise (max 4 lines) with tight whitespace. Place variable explanations inline beside variables in the function scope when needed.
 
 ## Testing Guidelines
 

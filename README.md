@@ -80,10 +80,10 @@ The GUI sends commands to each worker through a dedicated pipe. Workers return
 state, progress, warnings, and errors through one bounded status queue. A
 shared shutdown event coordinates normal termination.
 
-`application_core.py` contains the common event loop and record/playback orchestration.
-`main.py` extends that behavior with snapshot-playback modes and transposition wiring.
-Likewise, `interface_core.py` contains the common window and state logic while
-`menu_configurations.py` adds the newer controls.
+`main.py` starts the GUI, parses CLI arguments, and initializes background workers.
+`menu_layout.py` defines the declarative FreeSimpleGUI layout.
+`menu_controls.py` manages UI state transitions, widget updates, and input filtering.
+`menu_functions.py` handles the event loop, worker IPC pipes, and graceful shutdown.
 
 ## Live radar flow
 
@@ -231,10 +231,10 @@ See `tests/README.md` for the test-area map.
 
 | Path | Responsibility |
 | --- | --- |
-| `main.py` | Current application entry point and mode orchestration |
-| `application_core.py` | Shared GUI event, recording, playback, and shutdown behavior |
-| `menu_configurations.py` | Current window layout and UI state extensions |
-| `interface_core.py` | Shared GUI layout and state transitions |
+| `main.py` | Application entry point, CLI arguments, and worker lifecycle |
+| `menu_layout.py` | Declarative GUI window layout, tabs, and element definitions |
+| `menu_controls.py` | Window controller, input sanitization, and UI state management |
+| `menu_functions.py` | GUI event loop, IPC bridge, and worker message dispatching |
 | `sensors/` | Radar, RTSP camera, timestamp, and GPS integrations |
 | `processing/` | Plotting, filtering, recording, PCD reading, snapshots, playback, and radar-to-camera transposition |
 | `convert_to_csv.py` | Recursive PCD-to-CSV export |
