@@ -12,8 +12,7 @@ from sensors.radar.connection_packages import MISSING_QUALITY, RadarPoint
 import sensors.recording as camera_module
 import sensors.auxiliary as reader_module
 import sensors.recording as recorder_module
-from processing.playback.playback import load_recording_entries
-from processing.playback.playback import PlaybackController
+from sensors.playback import load_recording_entries, PlaybackController
 from processing.visualization.graph_draw import Graph_radar
 import menu_functions
 from menu_layout import build_record_tab
@@ -417,11 +416,12 @@ class RequestedControlChangesTests(unittest.TestCase):
 
         for channel in range(1, 4):
             self.assertFalse(elements[f"record_radar_{channel}"].InitialState)
-        self.assertEqual(elements["playback_toggle"].ButtonText, "START")
-        self.assertEqual(elements["playback_stop"].ButtonText, "STOP")
-        self.assertEqual(elements["playback_restart"].ButtonText, "RESTART")
-        self.assertEqual(elements["playback_previous_5s"].ButtonText, "-5 s")
-        self.assertEqual(elements["playback_next_5s"].ButtonText, "+5 s")
+        self.assertEqual(elements["snapshot_capture"].ButtonText, "SNAPSHOT")
+        self.assertEqual(elements["playback_toggle"].ButtonText, "START PLAYBACK")
+        self.assertEqual(elements["playback_previous"].ButtonText, "PREVIOUS")
+        self.assertEqual(elements["playback_pause"].ButtonText, "PAUSE")
+        self.assertEqual(elements["playback_next"].ButtonText, "NEXT")
+        self.assertEqual(elements["playback_snapshot"].ButtonText, "SNAPSHOT CURRENT")
 
     def test_partial_recording_requires_confirmation(self):
         config = self.FakeConfig()

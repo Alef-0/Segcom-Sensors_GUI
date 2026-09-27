@@ -16,19 +16,26 @@ class WorkerPipes:
     cam: object
     gps: object
     playback: object
-    snapshot: object
+    snapshot: object | None = None
 
     def all_pipes(self):
-        return (self.radar, self.cam, self.gps, self.playback, self.snapshot)
+        return tuple(p for p in (self.radar, self.cam, self.gps, self.playback, self.snapshot) if p is not None)
 
 
 @dataclass
 class RuntimeState:
     """Tracks asynchronous operation state across GUI ticks."""
-    pending_playback_folder: str | None = None
-    pending_snapshot_playback: dict | None = None
+    pending_playback_folder: dict | str | None = None
     recording_stop_pending: bool = False
     process_context: object | None = None
+
+    @property
+    def pending_snapshot_playback(self):
+        return self.pending_playback_folder
+
+    @pending_snapshot_playback.setter
+    def pending_snapshot_playback(self, val):
+        self.pending_playback_folder = val
 
 
 def check_popup():
@@ -96,6 +103,11 @@ def start_recording(values, controls, pipes):
     folder = Path(values.get("record_folder", "")).expanduser()
     channels = [ch for ch in range(1, 4) if values.get(f"record_radar_{ch}")]
     radar_pipe = pipes.radar if isinstance(pipes, WorkerPipes) else pipes
+    if not folder.exists():
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
     if not folder.is_dir():
         sg.popup_error("Select an existing destination folder", title="Recording error")
         return
@@ -112,28 +124,39 @@ def start_recording(values, controls, pipes):
 
 
 def request_recording_stop(controls, runtime, pipes):
-    """Request camera worker to halt recording."""
+    """Request camera and radar workers to halt recording."""
     if runtime.recording_stop_pending:
         return
     runtime.recording_stop_pending = True
     controls.set_recording_pending(False)
-    cam_pipe = pipes.cam if isinstance(pipes, WorkerPipes) else pipes
-    cam_pipe.send(("record_stop", None))
+    if controls.connected_cam:
+        cam_pipe = pipes.cam if isinstance(pipes, WorkerPipes) else pipes
+        cam_pipe.send(("record_stop", None))
+    else:
+        runtime.recording_stop_pending = False
+        radar_pipe = pipes.radar if isinstance(pipes, WorkerPipes) else pipes
+        radar_pipe.send(("record_stop", None))
 
 
 def start_snapshot(values, controls, pipes):
     """Capture single synchronized frame from active camera and radar."""
-    folder = Path(values.get("snapshot_folder", "")).expanduser()
+    folder = Path(values.get("record_folder", values.get("snapshot_folder", ""))).expanduser()
+    if not folder.exists():
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
     if not folder.is_dir():
-        controls.show_snapshot_error("Select an existing snapshot destination folder")
+        controls.show_snapshot_error("Select an existing destination folder")
         return
     if not controls.connected_radar or not controls.connected_cam:
         controls.show_snapshot_error("Connect both the radar and camera before taking a snapshot")
         return
-    channel = next((ch for ch in range(1, 4) if values.get(f"snapshot_group_{ch}")), None)
+    channel = next((ch for ch in range(1, 4) if values.get(f"record_radar_{ch}")), None)
     if channel is None:
-        controls.show_snapshot_error("Select a radar and camera group")
-        return
+        channel = next((ch for ch in range(1, 4) if values.get(f"snapshot_group_{ch}")), None)
+    if channel is None:
+        channel = next((ch for ch in range(1, 4) if values.get(f"choose_{ch}")), 2)
     req_id = uuid.uuid4().hex  # unique request identifier
     controls.set_snapshot_pending(req_id, channel)
     cam_pipe = pipes.cam if isinstance(pipes, WorkerPipes) else pipes
@@ -148,10 +171,12 @@ def maybe_start_playback(controls, runtime, pipes):
         and not controls.connected_radar and not controls.connected_cam
         and not controls.playback
     ):
-        folder = runtime.pending_playback_folder
+        payload = runtime.pending_playback_folder
         runtime.pending_playback_folder = None
+        if isinstance(payload, str):
+            payload = {"folder": payload}
         pb_pipe = pipes.playback if isinstance(pipes, WorkerPipes) else pipes
-        pb_pipe.send(("playback_start", {"folder": folder}))
+        pb_pipe.send(("playback_start", payload))
 
 
 def disconnect_live_for_playback(controls, runtime, pipes):
@@ -164,15 +189,27 @@ def disconnect_live_for_playback(controls, runtime, pipes):
 
 
 def request_playback(values, controls, runtime, pipes):
-    """Initiate or stop standard recording playback."""
+    """Initiate or stop playback using snapshot stepping/pause logic."""
     if controls.playback:
         pipes.playback.send(("playback_stop", None))
         return
-    folder = Path(values.get("playback_folder", "")).expanduser()
-    if not is_recording_folder(folder):
-        sg.popup_error("Select a recording folder containing PCD files and recording metadata", title="Playback error")
+    folder = Path(values.get("playback_folder", values.get("snapshot_playback_folder", ""))).expanduser()
+    if not folder.is_dir():
+        controls.show_playback_error("Select an existing playback folder")
         return
-    runtime.pending_playback_folder = str(folder.resolve())
+    try:
+        w, h = controls.validate_playback_resolution(values)
+    except ValueError as err:
+        controls.show_playback_error(str(err))
+        return
+    dest_folder = str(Path(values.get("record_folder", folder)).expanduser().resolve())
+    synced_only = bool(values.get("playback_synced_only", values.get("snapshot_playback_synced_only", True)))
+    runtime.pending_playback_folder = {
+        "folder": str(folder.resolve()),
+        "snapshot_folder": dest_folder,
+        "width": w, "height": h,
+        "synced_only": synced_only,
+    }
     controls.set_playback_pending()
     if controls.recording or controls.recording_pending:
         request_recording_stop(controls, runtime, pipes)
@@ -180,53 +217,9 @@ def request_playback(values, controls, runtime, pipes):
         disconnect_live_for_playback(controls, runtime, pipes)
 
 
-def maybe_start_snapshot_playback(controls, runtime, pipes):
-    """Start snapshot playback worker if live devices are disconnected."""
-    if (
-        runtime.pending_snapshot_playback
-        and not controls.recording and not controls.recording_pending
-        and not controls.connected_radar and not controls.connected_cam
-        and not controls.snapshot_playback
-    ):
-        payload = runtime.pending_snapshot_playback
-        runtime.pending_snapshot_playback = None
-        pipes.snapshot.send(("snapshot_playback_start", payload))
-
-
-def disconnect_live_for_snapshot_playback(controls, runtime, pipes):
-    """Disconnect live sensors before starting snapshot playback."""
-    if controls.connected_cam:
-        pipes.cam.send(("conn_cam", None))
-    if controls.connected_radar:
-        pipes.radar.send(("conn_radar", None))
-    maybe_start_snapshot_playback(controls, runtime, pipes)
-
-
-def request_snapshot_playback(values, controls, runtime, pipes):
-    """Initiate or stop snapshot sequence playback."""
-    if controls.snapshot_playback:
-        pipes.snapshot.send(("snapshot_playback_stop", None))
-        return
-    folder = Path(values.get("snapshot_playback_folder", "")).expanduser()
-    if not folder.is_dir():
-        controls.show_snapshot_playback_error("Select an existing snapshot playback folder")
-        return
-    try:
-        w, h = controls.validate_playback_resolution(values)
-    except ValueError as err:
-        controls.show_snapshot_playback_error(str(err))
-        return
-    runtime.pending_snapshot_playback = {
-        "folder": str(folder.resolve()),
-        "snapshot_folder": str(Path(values.get("snapshot_folder", "")).expanduser().resolve()),
-        "width": w, "height": h,
-        "synced_only": bool(values.get("snapshot_playback_synced_only", True)),
-    }
-    controls.set_snapshot_playback_pending()
-    if controls.recording or controls.recording_pending:
-        request_recording_stop(controls, runtime, pipes)
-    else:
-        disconnect_live_for_snapshot_playback(controls, runtime, pipes)
+request_snapshot_playback = request_playback
+maybe_start_snapshot_playback = maybe_start_playback
+disconnect_live_for_snapshot_playback = disconnect_live_for_playback
 
 
 def set_transposition(active, controls, pipes, message=None):
@@ -256,25 +249,32 @@ def handle_gui_event(event, values, controls, runtime, pipes, shutdown_event):
         choice = int(event.rsplit("_", 1)[1])
         pipes.radar.send(("choose", choice))
         pipes.cam.send(("choose", choice))
-    elif event == "snapshot_playback_toggle":
-        if not controls.snapshot_playback and controls.transposition:
+    elif event in ("playback_toggle", "snapshot_playback_toggle"):
+        if not controls.playback and controls.transposition:
             set_transposition(False, controls, pipes)
-        request_snapshot_playback(values, controls, runtime, pipes)
-    elif event in ("snapshot_playback_pause", "snapshot_playback_previous", "snapshot_playback_next"):
-        pipes.snapshot.send((event, None))
-    elif event == "snapshot_playback_snapshot":
-        dest = Path(values.get("snapshot_folder", "")).expanduser()
+        request_playback(values, controls, runtime, pipes)
+    elif event in ("playback_stop", "snapshot_playback_stop") and controls.playback:
+        pipes.playback.send(("playback_stop", None))
+    elif event in ("playback_pause", "snapshot_playback_pause"):
+        pipes.playback.send(("playback_pause", None))
+    elif event in ("playback_previous", "snapshot_playback_previous"):
+        pipes.playback.send(("playback_previous", None))
+    elif event in ("playback_next", "snapshot_playback_next"):
+        pipes.playback.send(("playback_next", None))
+    elif event in ("playback_snapshot", "snapshot_playback_snapshot"):
+        dest = Path(values.get("record_folder", values.get("playback_folder", ""))).expanduser()
         if not dest.is_dir():
-            controls.show_error("Select an existing snapshot destination folder", "Snapshot error")
+            controls.show_error("Select an existing destination folder", "Snapshot error")
         else:
-            pipes.snapshot.send(("snapshot_playback_snapshot", {"folder": str(dest.resolve())}))
+            pipes.playback.send(("playback_snapshot", {"folder": str(dest.resolve())}))
     elif event == "playback_resolution_apply":
         try:
             w, h = controls.validate_playback_resolution(values)
             payload = {"width": w, "height": h}
             pipes.cam.send(("playback_resolution", payload))
             pipes.playback.send(("playback_resolution", payload))
-            pipes.snapshot.send(("playback_resolution", payload))
+            if getattr(pipes, "snapshot", None):
+                pipes.snapshot.send(("playback_resolution", payload))
             controls.update_playback_resolution(w, h)
         except ValueError as err:
             controls.show_error(str(err), "Playback resolution error")
@@ -284,7 +284,8 @@ def handle_gui_event(event, values, controls, runtime, pipes, shutdown_event):
             payload = {"distance": cutoff}
             pipes.radar.send(("point_cutoff", payload))
             pipes.playback.send(("point_cutoff", payload))
-            pipes.snapshot.send(("point_cutoff", payload))
+            if getattr(pipes, "snapshot", None):
+                pipes.snapshot.send(("point_cutoff", payload))
             controls.update_point_cutoff(cutoff)
         except ValueError as err:
             controls.show_error(str(err), "Point cutoff error")
@@ -292,9 +293,12 @@ def handle_gui_event(event, values, controls, runtime, pipes, shutdown_event):
         try:
             w, h, x, y = controls.validate_graph_settings(values)
             res_payload, rng_payload = {"width": w, "height": h}, {"x_range": x, "y_range": y}
-            for p in (pipes.radar, pipes.playback, pipes.snapshot):
+            for p in (pipes.radar, pipes.playback):
                 p.send(("graph_resolution", res_payload))
                 p.send(("graph_range", rng_payload))
+            if getattr(pipes, "snapshot", None):
+                pipes.snapshot.send(("graph_resolution", res_payload))
+                pipes.snapshot.send(("graph_range", rng_payload))
             controls.update_graph_resolution(w, h)
             controls.update_graph_range(x, y)
         except ValueError as err:
@@ -312,14 +316,6 @@ def handle_gui_event(event, values, controls, runtime, pipes, shutdown_event):
             controls.update_camera_latency(jitter, offset)
         except ValueError as err:
             controls.show_error(str(err), "Camera latency error")
-    elif event == "playback_toggle":
-        if not controls.playback and controls.transposition:
-            set_transposition(False, controls, pipes)
-        request_playback(values, controls, runtime, pipes)
-    elif event == "playback_stop" and controls.playback:        pipes.playback.send(("playback_stop", None))
-    elif event == "playback_restart" and controls.playback:     pipes.playback.send(("playback_restart", None))
-    elif event == "playback_previous_5s" and controls.playback: pipes.playback.send(("playback_seek", {"seconds": -5.0}))
-    elif event == "playback_next_5s" and controls.playback:     pipes.playback.send(("playback_seek", {"seconds": 5.0}))
     elif event == "Send":
         if controls.connected_radar:                            pipes.radar.send((event, values))
         controls.window["save_nvm"].update(button_color=("black", "white"))
@@ -335,7 +331,8 @@ def handle_gui_event(event, values, controls, runtime, pipes, shutdown_event):
         if event == RCS_KEY:                                    controls.window["RCS_FILTER_VALUE"].update(f"{values[RCS_KEY]:.1f}")
         pipes.radar.send((event, values))
         pipes.playback.send((event, values))
-        pipes.snapshot.send((event, values))
+        if getattr(pipes, "snapshot", None):
+            pipes.snapshot.send((event, values))
     elif isinstance(event, str) and event.startswith("conn_"):
         if not (controls.playback or controls.playback_pending):
             target = {"conn_radar": pipes.radar, "conn_cam": pipes.cam, "conn_gps": pipes.gps}.get(event)
@@ -346,17 +343,18 @@ def handle_gui_event(event, values, controls, runtime, pipes, shutdown_event):
 
 def apply_status_message(message, payload, controls, runtime, pipes):
     """Process status notification from workers and update GUI state."""
-    if   message == "snapshot_playback_state":          controls.update_snapshot_playback(payload)
-    elif message == "snapshot_playback_progress":       controls.update_snapshot_playback_progress(payload)
-    elif message == "snapshot_playback_error":
-        runtime.pending_snapshot_playback = None
-        controls.show_snapshot_playback_error(payload)
-    elif message == "snapshot_playback_snapshot_saved": controls.show_snapshot_playback_snapshot_saved(payload)
-    elif message == "snapshot_playback_snapshot_error": controls.show_snapshot_playback_snapshot_error(payload)
-    elif message == "playback_error":
+    if   message in ("snapshot_playback_state", "playback_state"):
+        controls.update_playback_state(payload)
+    elif message in ("snapshot_playback_progress", "playback_progress"):
+        controls.update_playback_progress(payload)
+    elif message in ("snapshot_playback_error", "playback_error"):
         runtime.pending_playback_folder = None
         err = payload.get("message", "Playback failed") if isinstance(payload, dict) else payload
         controls.show_playback_error(err)
+    elif message in ("snapshot_playback_snapshot_saved", "playback_snapshot_saved"):
+        controls.show_playback_snapshot_saved(payload)
+    elif message in ("snapshot_playback_snapshot_error", "playback_snapshot_error"):
+        controls.show_playback_snapshot_error(payload)
     elif message in ("graph_resolution_error", "graph_range_error", "camera_pipeline_error"):
         controls.show_error(payload, "Display error")
     elif message == "transposition_state":              controls.update_transposition(payload.get("active"), payload.get("message"))
@@ -374,13 +372,11 @@ def apply_status_message(message, payload, controls, runtime, pipes):
     elif message == "change_radar":
         controls.update_radar_connection(payload)
         maybe_start_playback(controls, runtime, pipes)
-        maybe_start_snapshot_playback(controls, runtime, pipes)
     elif message == "change_cam":
         controls.update_cam_connection(payload)
         if not payload:
             controls.update_camera_ntp({"available": False})
         maybe_start_playback(controls, runtime, pipes)
-        maybe_start_snapshot_playback(controls, runtime, pipes)
     elif message == "gps_text":                         controls.window[message].update(payload)
     elif message == "conn_gps":                         controls.update_gps_connection(payload)
     elif message == "recording_state":
@@ -391,8 +387,6 @@ def apply_status_message(message, payload, controls, runtime, pipes):
             pipes.cam.send(("record_stop", None))
             if runtime.pending_playback_folder:
                 disconnect_live_for_playback(controls, runtime, pipes)
-            if getattr(runtime, "pending_snapshot_playback", None):
-                disconnect_live_for_snapshot_playback(controls, runtime, pipes)
     elif message == "recording_progress":               controls.update_recording_progress(payload)
     elif message == "recording_error":
         runtime.recording_stop_pending = False
@@ -408,8 +402,6 @@ def apply_status_message(message, payload, controls, runtime, pipes):
             runtime.recording_stop_pending = False
             pipes.radar.send(("record_stop", None))
     elif message == "camera_recording_error":           controls.show_camera_recording_error(payload)
-    elif message == "playback_state":                   controls.update_playback_state(payload)
-    elif message == "playback_progress":                controls.update_playback_progress(payload)
 
 
 def drain_status_queue(all_queue, controls, runtime, pipes):

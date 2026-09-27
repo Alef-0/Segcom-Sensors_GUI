@@ -73,34 +73,23 @@ def build_radar_options():
 
 
 def build_record_tab():
-    """Construct recording and standard playback controls tab."""
+    """Construct recording and playback controls tab."""
     rec_root = Path.cwd() / "recordings"
     rec_root.mkdir(exist_ok=True)
     radar_choices = [sg.Text("Group:")] + [sg.Checkbox(letter, key=f"record_radar_{ch}", default=False) for ch, letter in ((1, "A"), (2, "B"), (3, "C"))]
     return [
         [sg.Text("Destination folder"), sg.Input(str(rec_root), key="record_folder", expand_x=True), sg.FolderBrowse("SELECT", key="record_browse", target="record_folder")],
-        [*radar_choices, sg.Push(), sg.Text("IDLE", key="record_status", justification="center"), sg.Text("RADAR CLOSED | CAMERA CLOSED", key="record_devices", justification="center"), sg.Push(), sg.Button("START RECORDING", key="record_toggle", button_color=("white", "green"), disabled=True)],
+        [*radar_choices, sg.Push(), sg.Text("IDLE", key="record_status", justification="center"), sg.Text("RADAR CLOSED | CAMERA CLOSED", key="record_devices", justification="center"), sg.Push(),
+         sg.Button("START RECORDING", key="record_toggle", button_color=("white", "green"), disabled=True), sg.Button("SNAPSHOT", key="snapshot_capture", button_color=("white", "green"), disabled=True)],
         [sg.HorizontalSeparator()],
-        [sg.Text("Playback folder"), sg.Input(str(Path.cwd()), key="playback_folder", expand_x=True), sg.FolderBrowse("SELECT", key="playback_browse", target="playback_folder")],
-        [sg.Push(), sg.Text("IDLE", key="playback_status", justification="center"), sg.Text("RADAR CLOSED | CAMERA CLOSED", key="playback_devices", justification="center"), sg.Push(),
-         sg.Button("START", key="playback_toggle", button_color=("white", "green")), sg.Button("STOP", key="playback_stop", disabled=True), sg.Button("RESTART", key="playback_restart", disabled=True), sg.Button("-5 s", key="playback_previous_5s", disabled=True), sg.Button("+5 s", key="playback_next_5s", disabled=True)],
+        [sg.Text("Playback folder"), sg.Input(str(Path.cwd()), key="playback_folder", expand_x=True), sg.FolderBrowse("SELECT", key="playback_browse", target="playback_folder"), sg.Checkbox("Image + PCD", key="playback_synced_only", default=True)],
+        [sg.Push(), sg.Button("START PLAYBACK", key="playback_toggle", button_color=("white", "green")), sg.VSep(),
+         sg.Button("PREVIOUS", key="playback_previous", disabled=True), sg.Button("PAUSE", key="playback_pause", disabled=True), sg.Button("NEXT", key="playback_next", disabled=True), sg.Button("SNAPSHOT CURRENT", key="playback_snapshot", disabled=True), sg.Push()],
+        [sg.Text("", key="playback_status", expand_x=True, justification="center", pad=(0, 0))],
     ]
 
 
-def build_snapshot_tab():
-    """Construct manual snapshot capture and snapshot playback tab."""
-    snap_root = Path.cwd() / "snapshots"
-    snap_root.mkdir(exist_ok=True)
-    group_ctrls = [sg.Text("Group:")] + [sg.Radio(letter, "snapshot_group", key=f"snapshot_group_{ch}", default=ch == 2) for ch, letter in ((1, "A"), (2, "B"), (3, "C"))]
-    return [
-        [sg.Text("Destination folder"), sg.Input(str(snap_root), key="snapshot_folder", expand_x=True), sg.FolderBrowse("SELECT", key="snapshot_browse", target="snapshot_folder")],
-        [*group_ctrls, sg.Push(), sg.Text("IDLE", key="snapshot_status", justification="center"), sg.Push(), sg.Button("CAPTURE SNAPSHOT", key="snapshot_capture", button_color=("white", "green"), disabled=True)],
-        [sg.HorizontalSeparator()],
-        [sg.Text("Playback folder"), sg.Input(str(Path.cwd()), key="snapshot_playback_folder", expand_x=True), sg.FolderBrowse("SELECT", key="snapshot_playback_browse", target="snapshot_playback_folder"), sg.Checkbox("Image + PCD", key="snapshot_playback_synced_only", default=True)],
-        [sg.Push(), sg.Button("START PLAYBACK", key="snapshot_playback_toggle", button_color=("white", "green")), sg.VSep(),
-         sg.Button("PREVIOUS", key="snapshot_playback_previous", disabled=True), sg.Button("PAUSE", key="snapshot_playback_pause", disabled=True), sg.Button("NEXT", key="snapshot_playback_next", disabled=True), sg.Button("SNAPSHOT CURRENT", key="snapshot_playback_snapshot", disabled=True), sg.Push()],
-        [sg.Text("", key="snapshot_playback_status", expand_x=True, justification="center", pad=(0, 0))],
-    ]
+build_snapshot_tab = build_record_tab
 
 
 def build_video_tab():
@@ -212,7 +201,6 @@ def build_main_layout():
     control_tabs = [
         sg.Tab("Configurations", build_radar_options()),
         sg.Tab("Record", build_record_tab()),
-        sg.Tab("Snapshots", build_snapshot_tab()),
         sg.Tab("Graph", build_graph_tab()),
         sg.Tab("Video", build_video_tab()),
     ]

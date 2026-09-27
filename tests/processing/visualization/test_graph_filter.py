@@ -82,6 +82,28 @@ class GraphFilterTests(unittest.TestCase):
 
         self.assertEqual(graph_filter.rcs_min, 12.5)
 
+    def test_filter_radar_points_vectorized_all_options(self):
+        from sensors.auxiliary import filter_radar_points, filter_point_cutoff, filter_rcs
+        p1 = SimpleNamespace(dist_long=5.0, dist_latitude=2.0, rcs=-5.0, dynamic_property=0, pdh=2, ambiguity_state=3, invalid_flag=0)
+        p2 = SimpleNamespace(dist_long=25.0, dist_latitude=2.0, rcs=-5.0, dynamic_property=0, pdh=2, ambiguity_state=3, invalid_flag=0)
+        p3 = SimpleNamespace(dist_long=5.0, dist_latitude=2.0, rcs=-25.0, dynamic_property=0, pdh=2, ambiguity_state=3, invalid_flag=0)
+        p4 = SimpleNamespace(dist_long=float("nan"), dist_latitude=2.0, rcs=-5.0, dynamic_property=0)
+
+        # Cutoff filter
+        self.assertEqual(len(filter_point_cutoff((p1, p2), 10.0)), 1)
+        # RCS filter
+        self.assertEqual(len(filter_rcs((p1, p3), -10.0)), 1)
+
+        # Full vectorized filter
+        x, y, colors, selected = filter_radar_points(
+            (p1, p2, p3, p4), cluster=True, rcs_min=-10.0, max_distance=10.0,
+            allowed_dynamic={0}, allowed_ambiguity={3}, allowed_invalid={0},
+        )
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0], p1)
+        self.assertEqual((x, y), ([2.0], [5.0]))
+        self.assertEqual(colors, [(0, 0, 255)])
+
 
 if __name__ == "__main__":
     unittest.main()

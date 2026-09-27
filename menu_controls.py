@@ -23,9 +23,7 @@ class MenuControls:
         self.snapshot_request_id = None
         self.playback = False
         self.playback_pending = False
-        self.snapshot_playback = False
-        self.snapshot_playback_pending = False
-        self.snapshot_playback_paused = False
+        self.playback_paused = False
         self.playback_width = 1280
         self.playback_height = 720
         self.point_cutoff = 15.0
@@ -108,44 +106,74 @@ class MenuControls:
             raise ValueError("Camera latency (jitter) must be a non-negative integer")
         return jitter, offset
 
+    @property
+    def snapshot_playback(self):
+        return self.playback
+
+    @snapshot_playback.setter
+    def snapshot_playback(self, val):
+        self.playback = val
+
+    @property
+    def snapshot_playback_pending(self):
+        return self.playback_pending
+
+    @snapshot_playback_pending.setter
+    def snapshot_playback_pending(self, val):
+        self.playback_pending = val
+
+    @property
+    def snapshot_playback_paused(self):
+        return self.playback_paused
+
+    @snapshot_playback_paused.setter
+    def snapshot_playback_paused(self, val):
+        self.playback_paused = val
+
     def refresh_mode_controls(self):
         """Enable or disable widgets depending on current operating state."""
-        live_blocked = (self.playback or self.playback_pending or self.snapshot_playback or self.snapshot_playback_pending)
+        live_blocked = (self.playback or self.playback_pending)
         rec_inputs_disabled = self.recording or self.recording_pending or live_blocked
         for key in ("record_folder", "record_browse", "record_radar_1", "record_radar_2", "record_radar_3"):
-            self.window[key].update(disabled=rec_inputs_disabled)
+            if key in self.window.key_dict:
+                self.window[key].update(disabled=rec_inputs_disabled)
 
-        self.window["record_toggle"].update(disabled=(self.recording_pending or self.snapshot_pending or live_blocked))
+        if "record_toggle" in self.window.key_dict:
+            self.window["record_toggle"].update(disabled=(self.recording_pending or self.snapshot_pending or live_blocked))
 
-        snap_inputs_disabled = self.snapshot_pending or self.recording or self.recording_pending or live_blocked
-        for key in ("snapshot_folder", "snapshot_browse", "snapshot_group_1", "snapshot_group_2", "snapshot_group_3"):
-            self.window[key].update(disabled=snap_inputs_disabled)
-        self.window["snapshot_capture"].update(disabled=(snap_inputs_disabled or not self.connected_radar or not self.connected_cam))
+        if "snapshot_capture" in self.window.key_dict:
+            self.window["snapshot_capture"].update(disabled=(
+                self.snapshot_pending or self.recording or self.recording_pending or live_blocked
+                or not self.connected_radar or not self.connected_cam
+            ))
 
-        pb_inputs_disabled = self.recording or self.recording_pending or self.snapshot_pending or self.playback or self.playback_pending or self.snapshot_playback or self.snapshot_playback_pending
-        for key in ("playback_folder", "playback_browse"):
-            self.window[key].update(disabled=pb_inputs_disabled)
-        self.window["playback_toggle"].update(disabled=pb_inputs_disabled)
-        for key in ("playback_stop", "playback_restart", "playback_previous_5s", "playback_next_5s"):
-            self.window[key].update(disabled=not self.playback)
+        pb_inputs_disabled = self.recording or self.recording_pending or self.snapshot_pending or self.playback_pending
+        for key in ("playback_folder", "playback_browse", "playback_synced_only"):
+            if key in self.window.key_dict:
+                self.window[key].update(disabled=(pb_inputs_disabled or self.playback))
 
-        for key in ("snapshot_playback_folder", "snapshot_playback_browse", "snapshot_playback_synced_only"):
-            self.window[key].update(disabled=pb_inputs_disabled)
-        self.window["snapshot_playback_toggle"].update(disabled=(self.recording or self.recording_pending or self.snapshot_pending or self.playback or self.playback_pending or self.snapshot_playback_pending))
-        for key in ("snapshot_playback_previous", "snapshot_playback_pause", "snapshot_playback_next", "snapshot_playback_snapshot"):
-            self.window[key].update(disabled=not self.snapshot_playback)
+        if "playback_toggle" in self.window.key_dict:
+            self.window["playback_toggle"].update(disabled=pb_inputs_disabled)
+        for key in ("playback_previous", "playback_pause", "playback_next", "playback_snapshot"):
+            if key in self.window.key_dict:
+                self.window[key].update(disabled=not self.playback)
 
         for key in ("conn_radar", "conn_cam"):
-            self.window[key].update(disabled=live_blocked or self.snapshot_pending)
+            if key in self.window.key_dict:
+                self.window[key].update(disabled=live_blocked or self.snapshot_pending)
         for ch in range(1, 4):
-            self.window[f"choose_{ch}"].update(disabled=False)
-        self.window["transposition_toggle"].update(disabled=live_blocked)
+            if f"choose_{ch}" in self.window.key_dict:
+                self.window[f"choose_{ch}"].update(disabled=False)
+        if "transposition_toggle" in self.window.key_dict:
+            self.window["transposition_toggle"].update(disabled=live_blocked)
 
     def update_record_device_status(self):
         """Update connection indicator texts."""
         status = f"RADAR {'OPEN' if self.connected_radar else 'CLOSED'} | CAMERA {'OPEN' if self.connected_cam else 'CLOSED'}"
-        self.window["record_devices"].update(status)
-        self.window["playback_devices"].update(status)
+        if "record_devices" in self.window.key_dict:
+            self.window["record_devices"].update(status)
+        if "playback_devices" in self.window.key_dict:
+            self.window["playback_devices"].update(status)
 
     def update_radar_connection(self, connection):
         """Update radar connection state and indicators."""
@@ -226,8 +254,13 @@ class MenuControls:
         """Mark snapshot capture as pending."""
         self.snapshot_pending = True
         self.snapshot_request_id = request_id
-        self.window["snapshot_status"].update(f"CAPTURING GROUP {self.RADAR_LETTERS[channel]}...")
-        self.window["snapshot_capture"].update("CAPTURING...", disabled=True)
+        msg = f"CAPTURING GROUP {self.RADAR_LETTERS[channel]}..."
+        if "snapshot_status" in self.window.key_dict:
+            self.window["snapshot_status"].update(msg)
+        if "record_status" in self.window.key_dict:
+            self.window["record_status"].update(msg)
+        if "snapshot_capture" in self.window.key_dict:
+            self.window["snapshot_capture"].update("CAPTURING...", disabled=True)
         self.refresh_mode_controls()
 
     def update_snapshot_saved(self, payload):
@@ -236,76 +269,85 @@ class MenuControls:
             return
         self.snapshot_pending = False
         self.snapshot_request_id = None
-        self.window["snapshot_capture"].update("CAPTURE SNAPSHOT", button_color=("white", "green"))
-        self.window["snapshot_status"].update(f"SAVED: {payload['point_cloud']} + {payload['camera_frame']}")
+        if "snapshot_capture" in self.window.key_dict:
+            self.window["snapshot_capture"].update("SNAPSHOT", button_color=("white", "green"))
+        msg = f"SAVED: {payload.get('point_cloud', '')} + {payload.get('camera_frame', '')}"
+        if "snapshot_status" in self.window.key_dict:
+            self.window["snapshot_status"].update(msg)
+        if "record_status" in self.window.key_dict:
+            self.window["record_status"].update(msg)
         self.refresh_mode_controls()
 
     def show_snapshot_error(self, message):
         """Show snapshot capture error dialog."""
         self.snapshot_pending = False
         self.snapshot_request_id = None
-        self.window["snapshot_capture"].update("CAPTURE SNAPSHOT", button_color=("white", "green"))
-        self.window["snapshot_status"].update("FAILED")
+        if "snapshot_capture" in self.window.key_dict:
+            self.window["snapshot_capture"].update("SNAPSHOT", button_color=("white", "green"))
+        if "snapshot_status" in self.window.key_dict:
+            self.window["snapshot_status"].update("FAILED")
+        if "record_status" in self.window.key_dict:
+            self.window["record_status"].update("SNAPSHOT FAILED")
         self.refresh_mode_controls()
         sg.popup_error(message, title="Snapshot error")
 
     def set_playback_pending(self):
-        """Mark standard playback as preparing."""
+        """Mark playback as preparing."""
         self.playback_pending = True
-        self.window["playback_toggle"].update("PREPARING...", disabled=True)
-        self.window["playback_status"].update("STOPPING LIVE MONITORING")
+        if "playback_toggle" in self.window.key_dict:
+            self.window["playback_toggle"].update("PREPARING...", disabled=True)
+        if "playback_status" in self.window.key_dict:
+            self.window["playback_status"].update("STOPPING LIVE MONITORING")
         self.refresh_mode_controls()
 
     def update_playback_state(self, payload):
         """Update playback transport controls and indicators."""
         self.playback = bool(payload.get("active"))
         self.playback_pending = False
-        self.window["playback_toggle"].update("START", button_color=("white", "green"))
-        if self.playback:
-            self.window["playback_status"].update(f"PLAYING 0 / {payload.get('total', 0)}")
-        elif payload.get("completed"):
-            self.window["playback_status"].update("COMPLETED")
-        else:
-            self.window["playback_status"].update("IDLE")
+        self.playback_paused = bool(payload.get("paused", False))
+        if "playback_toggle" in self.window.key_dict:
+            self.window["playback_toggle"].update(
+                "STOP PLAYBACK" if self.playback else "START PLAYBACK",
+                button_color=("white", "red" if self.playback else "green"),
+            )
+        if "playback_pause" in self.window.key_dict:
+            self.window["playback_pause"].update("PLAY" if self.playback_paused else "PAUSE")
+        if "playback_status" in self.window.key_dict:
+            if self.playback:
+                state = "PAUSED" if self.playback_paused else "PLAYING"
+                self.window["playback_status"].update(f"{state} {payload.get('current', 1)} / {payload.get('total', 0)}")
+            elif payload.get("completed"):
+                self.window["playback_status"].update("COMPLETED")
+            else:
+                self.window["playback_status"].update("IDLE")
         self.refresh_mode_controls()
 
     def update_playback_progress(self, payload):
         """Update active playback frame progress."""
-        self.window["playback_status"].update(f"PLAYING {payload['current']} / {payload['total']} — {payload['file']}")
+        state = "PAUSED" if self.playback_paused else "PLAYING"
+        file_desc = payload.get("file") or f"{payload.get('point_cloud', '')} + {payload.get('image', '')}"
+        if "playback_status" in self.window.key_dict:
+            self.window["playback_status"].update(f"{state} {payload['current']} / {payload['total']} — {file_desc}")
 
-    def set_snapshot_playback_pending(self):
-        """Mark snapshot playback as preparing."""
-        self.snapshot_playback_pending = True
-        self.window["snapshot_playback_toggle"].update("PREPARING...", disabled=True)
-        self.window["snapshot_playback_status"].update("STOPPING LIVE MONITORING")
-        self.refresh_mode_controls()
-
-    def update_snapshot_playback(self, payload):
-        """Update snapshot playback controls and status."""
-        self.snapshot_playback = bool(payload.get("active"))
-        self.snapshot_playback_pending = False
-        self.snapshot_playback_paused = bool(payload.get("paused", False))
-        self.window["snapshot_playback_toggle"].update("STOP PLAYBACK" if self.snapshot_playback else "START PLAYBACK", button_color=("white", "red" if self.snapshot_playback else "green"))
-        self.window["snapshot_playback_pause"].update("PLAY" if self.snapshot_playback_paused else "PAUSE")
-        if self.snapshot_playback:
-            state = "PAUSED" if self.snapshot_playback_paused else "PLAYING"
-            self.window["snapshot_playback_status"].update(f"{state} {payload.get('current', 1)} / {payload.get('total', 0)}")
-        elif payload.get("completed"):
-            self.window["snapshot_playback_status"].update("COMPLETED")
-        else:
-            self.window["snapshot_playback_status"].update("")
-        self.refresh_mode_controls()
-
-    def update_snapshot_playback_progress(self, payload):
-        """Update snapshot playback frame info."""
-        state = "PAUSED" if self.snapshot_playback_paused else "PLAYING"
-        self.window["snapshot_playback_status"].update(f"{state} {payload['current']} / {payload['total']} — {payload['file']} + {payload['image']}")
-
-    def update_snapshot_playback_pause(self, payload):
+    def update_playback_pause(self, payload):
         """Update pause/play toggle button."""
-        self.snapshot_playback_paused = bool(payload.get("paused"))
-        self.window["snapshot_playback_pause"].update("PLAY" if self.snapshot_playback_paused else "PAUSE")
+        self.playback_paused = bool(payload.get("paused"))
+        if "playback_pause" in self.window.key_dict:
+            self.window["playback_pause"].update("PLAY" if self.playback_paused else "PAUSE")
         self.refresh_mode_controls()
+
+    def show_playback_snapshot_saved(self, payload):
+        """Show confirmation of saved playback snapshot."""
+        if "playback_status" in self.window.key_dict:
+            self.window["playback_status"].update(f"SAVED: {payload.get('point_cloud', '')} + {payload.get('camera_frame', '')}")
+
+    def show_playback_snapshot_error(self, message):
+        """Show error message when playback snapshot fails."""
+        self.show_error(message, "Playback snapshot error")
+
+    def show_playback_error(self, message):
+        self.update_playback_state({"active": False})
+        self.show_error(message, "Playback error")
 
     def update_transposition(self, active, message=None):
         """Toggle transposition state and update button/label."""
@@ -362,12 +404,10 @@ class MenuControls:
     def show_camera_recording_error(self, message):
         self.show_error(message, "Camera snapshot error")
 
-    def show_snapshot_playback_error(self, message):
-        self.update_snapshot_playback({"active": False})
-        self.show_error(message, "Snapshot playback error")
-
-    def show_snapshot_playback_snapshot_saved(self, payload):
-        self.window["snapshot_playback_status"].update(f"SAVED: {payload['point_cloud']} + {payload['camera_frame']}")
-
-    def show_snapshot_playback_snapshot_error(self, message):
-        self.show_error(message, "Playback snapshot error")
+    set_snapshot_playback_pending = set_playback_pending
+    update_snapshot_playback = update_playback_state
+    update_snapshot_playback_progress = update_playback_progress
+    update_snapshot_playback_pause = update_playback_pause
+    show_snapshot_playback_error = show_playback_error
+    show_snapshot_playback_snapshot_saved = show_playback_snapshot_saved
+    show_snapshot_playback_snapshot_error = show_playback_snapshot_error

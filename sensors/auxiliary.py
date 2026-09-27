@@ -101,12 +101,81 @@ def decode_jpeg(data: bytes) -> np.ndarray:
     return frame
 
 
+DYNAMIC_COLORS_BGR = (
+    (0, 0, 255),    # 0: Moving (#FF0000)
+    (0, 123, 255),  # 1: Stationary (#FF7B00)
+    (0, 230, 255),  # 2: Oncoming (#FFE600)
+    (0, 255, 0),    # 3: Stationary Candidate (#00FF00)
+    (255, 0, 0),    # 4: Unknown (#0000FF)
+    (255, 255, 0),  # 5: Crossing Stationary (#00FFFF)
+    (255, 0, 132),  # 6: Crossing Moving (#8400FF)
+    (0, 0, 0),      # 7: Stopped (#000000)
+)
+UNKNOWN_DYNAMIC_COLOR_BGR = (128, 128, 128)
+
+
+def filter_radar_points(
+    points: Iterable[RadarPoint | RadarObject],
+    *,
+    cluster: bool = True,
+    rcs_min: float | None = None,
+    pdh_max: int | None = None,
+    allowed_dynamic: Iterable[int] | None = None,
+    allowed_ambiguity: Iterable[int] | None = None,
+    allowed_invalid: Iterable[int] | None = None,
+    max_distance: float | None = None,
+    distance_cutoff: float | None = None,
+) -> tuple[list[float], list[float], list[tuple[int, int, int]], tuple]:
+    """Simple NumPy vectorized filter and color mapper for radar points."""
+    pts = tuple(points)
+    if not pts:
+        return [], [], [], ()
+
+    x = np.array([getattr(p, "dist_latitude", np.nan) for p in pts], dtype=float)
+    y = np.array([getattr(p, "dist_long", np.nan) for p in pts], dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+
+    if max_distance is not None:
+        mask &= (y <= float(max_distance))
+    if distance_cutoff is not None:
+        mask &= (np.hypot(x, y) <= float(distance_cutoff))
+    if rcs_min is not None:
+        rcs = np.array([getattr(p, "rcs", np.nan) for p in pts], dtype=float)
+        mask &= np.isnan(rcs) | (rcs == MISSING_QUALITY) | (rcs >= float(rcs_min))
+
+    dyn = np.array([v if (v := getattr(p, "dynamic_property", -1)) is not None else -1 for p in pts], dtype=int)
+    if allowed_dynamic:
+        mask &= (dyn < 0) | (dyn == MISSING_QUALITY) | np.isin(dyn, list(allowed_dynamic))
+
+    if cluster:
+        if pdh_max is not None:
+            pdh = np.array([v if (v := getattr(p, "pdh", -1)) is not None else -1 for p in pts], dtype=int)
+            mask &= (pdh <= 0) | (pdh == MISSING_QUALITY) | (pdh <= int(pdh_max))
+        if allowed_ambiguity:
+            amb = np.array([v if (v := getattr(p, "ambiguity_state", -1)) is not None else -1 for p in pts], dtype=int)
+            mask &= (amb < 0) | (amb == MISSING_QUALITY) | np.isin(amb, list(allowed_ambiguity))
+        if allowed_invalid:
+            inv = np.array([v if (v := getattr(p, "invalid_flag", -1)) is not None else -1 for p in pts], dtype=int)
+            mask &= (inv < 0) | (inv == MISSING_QUALITY) | np.isin(inv, list(allowed_invalid))
+
+    indices = np.flatnonzero(mask)
+    colors = [
+        DYNAMIC_COLORS_BGR[d] if 0 <= d < len(DYNAMIC_COLORS_BGR) else UNKNOWN_DYNAMIC_COLOR_BGR
+        for d in dyn[indices]
+    ]
+    return x[indices].tolist(), y[indices].tolist(), colors, tuple(pts[i] for i in indices)
+
+
 def filter_point_cutoff(points: Iterable[RadarPoint | RadarObject], max_distance: float):
-    return [p for p in points if getattr(p, "dist_long", 0.0) <= max_distance]
+    """Backward-compatible point cutoff filter using vectorized evaluation."""
+    _, _, _, selected = filter_radar_points(points, max_distance=max_distance)
+    return list(selected)
 
 
 def filter_rcs(points: Iterable[RadarPoint | RadarObject], min_rcs: float):
-    return [p for p in points if getattr(p, "rcs", 0.0) >= min_rcs]
+    """Backward-compatible RCS filter using vectorized evaluation."""
+    _, _, _, selected = filter_radar_points(points, rcs_min=min_rcs)
+    return list(selected)
 
 
 def _float(value):

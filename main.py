@@ -5,8 +5,7 @@ import FreeSimpleGUI as sg
 
 from menu_controls import MenuControls
 from menu_functions import WorkerPipes, RuntimeState, run_event_loop, shutdown_workers
-from processing.playback.playback import playback_main
-from processing.playback.snapshot_playback import snapshot_playback_main
+from sensors.playback import playback_main, snapshot_playback_main
 from sensors.camera.camera_gstreamer import gstreamer_main
 from sensors.gps.gps_connection import main as gps_main
 from sensors.radar.connection_main import create_connection_communication
@@ -35,8 +34,7 @@ def main(args=None):
     rx_cam, tx_cam = ctx.Pipe()
     rx_gps, tx_gps = ctx.Pipe()
     rx_pb, tx_pb = ctx.Pipe()
-    rx_snp, tx_snp = ctx.Pipe()
-    pipes = WorkerPipes(radar=tx_radar, cam=tx_cam, gps=tx_gps, playback=tx_pb, snapshot=tx_snp)
+    pipes = WorkerPipes(radar=tx_radar, cam=tx_cam, gps=tx_gps, playback=tx_pb)
 
     controls = MenuControls(font=(args.font_family, args.font_size))
     _, values = controls.read()
@@ -47,7 +45,6 @@ def main(args=None):
         ctx.Process(target=gstreamer_main, args=(rx_cam, all_queue, shutdown_event, trans_channel)),
         ctx.Process(target=gps_main, args=(rx_gps, all_queue, shutdown_event)),
         ctx.Process(target=playback_main, args=(rx_pb, all_queue, shutdown_event, values)),
-        ctx.Process(target=snapshot_playback_main, args=(rx_snp, all_queue, shutdown_event, values)),
     ]
     for proc in processes:
         proc.start()

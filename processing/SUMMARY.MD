@@ -5,16 +5,13 @@ This package groups radar and camera playback and visualization services used by
 ## Package Root
 
 ### [__init__.py](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/processing/__init__.py)
-Exposes backward-compatibility aliases and re-exports for recording and snapshot services:
+Exposes backward-compatibility aliases and re-exports for recording, snapshot, and playback services:
 - `CameraRecorder`, `CameraSnapshotRecorder`, `RadarRecorder`, `RadarRecordingSession` from [sensors.recording](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/recording.py).
 - `SnapshotWriter`, `ManualSnapshotWriter` from [sensors.snapshot](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/snapshot.py).
+- `PlaybackController`, `SnapshotPlaybackController`, `PlaybackEntry`, `load_recording_entries`, `load_snapshot_entries` from [sensors.playback](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/playback.py).
 - `PointCloudReader` from [sensors.auxiliary](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py).
 
 ## Subdirectories
-
-### [playback/](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/processing/playback)
-Loads multi-sensor recordings and saved snapshot pairs for review.
-- See detailed documentation in [processing/playback/SUMMARY.MD](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/processing/playback/SUMMARY.MD).
 
 ### [visualization/](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/processing/visualization)
 Top-down Cartesian radar plotting, radar point filtering, radar-camera projection, and transposition overlays.

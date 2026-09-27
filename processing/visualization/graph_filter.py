@@ -6,6 +6,7 @@ from typing import Iterable
 from processing.visualization.filter_schema import (
     DYNAMIC_COLORS_BGR, PDH_KEY, RCS_KEY, parse_filter_key,
 )
+from sensors.auxiliary import filter_radar_points
 from sensors.radar.connection_packages import (
     Clusters_messages, MISSING_QUALITY, Objects_messages, RadarObject, RadarPoint,
 )
@@ -85,13 +86,17 @@ class Filter_graph:
             return UNKNOWN_DYNAMIC_COLOR_BGR
 
     def _filter(self, points: Iterable, *, cluster: bool):
-        selected = tuple(point for point in points if self._allowed(point, cluster=cluster))
-        self.last_points = selected
-        return (
-            [point.dist_latitude for point in selected],
-            [point.dist_long for point in selected],
-            [self._color(getattr(point, "dynamic_property", None)) for point in selected],
+        x, y, colors, selected = filter_radar_points(
+            points,
+            cluster=cluster,
+            rcs_min=self.rcs_min,
+            pdh_max=self.pdh_max,
+            allowed_dynamic=self.enabled_values["dynamic_property"],
+            allowed_ambiguity=self.enabled_values["ambiguity_state"],
+            allowed_invalid=self.enabled_values["invalid_state"],
         )
+        self.last_points = selected
+        return x, y, colors
 
     def filter_point_sequence(self, points: Iterable[RadarPoint]):
         return self._filter(points, cluster=True)

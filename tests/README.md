@@ -22,7 +22,7 @@ plugins from affecting this project.
 | `processing/recording/test_point_cloud_recorder.py` | Cluster/object PCD schemas, writer behavior, and recording sessions |
 | `processing/recording/test_changes.py` | Camera/radar pairing, metadata, frame-rate selection, and playback loading |
 | `processing/recording/test_manual_snapshot.py` | Snapshot folder validation, indexes, metadata, and cleanup after failure |
-| `processing/playback/test_snapshot_playback.py` | Paired-entry filtering, stepping, rendering controls, and copy-current-pair behavior |
+| `sensors/test_playback.py` | Paired-entry filtering, stepping, rendering controls, and copy-current-pair behavior |
 | `camera/test_pipeline_policy.py` | Decoder choice, pipeline structure, host-anchored PTS, reference clocks, transport counters, and capture callbacks |
 | `camera/test_recording_restart.py` | Recording restart behavior and pipeline/decoder state reuse |
 | `processing/visualization/test_radar_camera_transposition.py` | Radar-to-camera projection and transposition behavior |
@@ -30,7 +30,8 @@ plugins from affecting this project.
 ## Category folders
 
 - `camera/` — camera pipeline and recording restart behavior
-- `processing/` — recording, playback, and visualization behavior
+- `sensors/` — unified sensor playback, recording, and driver behavior
+- `processing/` — recording and visualization behavior
 - `messaging/` — packet decoding, message compatibility, and object updates
 
 ## What the suite does not prove
