@@ -23,10 +23,10 @@ Unified session and snapshot playback engine for recorded radar and camera datas
 
 ### [sensors/auxiliary.py](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py)
 Core utilities for PCD schemas, file path resolution, image encoding/decoding, and vectorized point cloud filtering.
-- [filter_radar_points](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L117): Unified vectorized multi-attribute filter using NumPy arrays for coordinates, RCS, PDH, dynamic properties, ambiguity states, invalid flags, distance cutoff, and BGR color mapping.
-- [filter_point_cutoff](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L225), [filter_rcs](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L231): Backward-compatible threshold filter aliases delegating to `filter_radar_points`.
-- [save_point_cloud](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L277): Encodes `RadarPoint` or `RadarObject` sequences to PCD files using cluster or extended object schemas.
-- [PointCloudReader](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L298): Parses saved PCD files back into `RadarPoint` and `RadarObject` collections, detecting schema variations automatically.
+- [filter_radar_points](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L104): Re-exported vectorized filter from [sensors.filter](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/filter).
+- [filter_point_cutoff](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L104), [filter_rcs](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L104): Backward-compatible threshold filter aliases delegating to `filter_radar_points`.
+- [save_point_cloud](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L209): Encodes `RadarPoint` or `RadarObject` sequences to PCD files using cluster or extended object schemas.
+- [PointCloudReader](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L230): Parses saved PCD files back into `RadarPoint` and `RadarObject` collections, detecting schema variations automatically.
 - [image_path](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L52), [point_cloud_path](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L56), [resolve_recording_file](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L68): Safe relative/absolute path generators and legacy layout resolvers.
 - [encode_jpeg](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L90), [decode_jpeg](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/auxiliary.py#L97): Lightweight image format conversion helpers.
 
@@ -35,6 +35,10 @@ Core utilities for PCD schemas, file path resolution, image encoding/decoding, a
 ### [camera/](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/camera)
 RTSP camera integration, dynamic GStreamer pipeline construction, clock synchronization, NTP extraction, and radar-to-camera transposition.
 - See detailed documentation in [sensors/camera/SUMMARY.MD](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/camera/SUMMARY.MD).
+
+### [filter/](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/filter)
+Unified radar filtering, 2D top-down Cartesian radar plotting canvas, 3D radar-camera coordinate transformation, and real-time image transposition overlays.
+- See detailed documentation in [sensors/filter/SUMMARY.MD](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/filter/SUMMARY.MD).
 
 ### [gps/](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/gps)
 Dahua DVR HTTP digest GPS integration. Polls device position status, parses DMS coordinates into decimal degrees with hemisphere detection, and emits formatted UI coordinates and Google Maps search links.

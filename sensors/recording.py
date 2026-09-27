@@ -349,6 +349,7 @@ class PointCloudRecorder:
                         self._records.append({
                             "point_cloud": reference, "recorded_at": timestamp,
                             "frame_type": frame_type, "camera_frame": None,
+                            "Camera": RADAR_LETTERS.get(self.channel, "B"),
                         })
                         self._dirty = True
                         self._match_cameras_locked()

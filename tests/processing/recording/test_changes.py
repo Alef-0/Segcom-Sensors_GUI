@@ -13,7 +13,7 @@ import sensors.recording as camera_module
 import sensors.auxiliary as reader_module
 import sensors.recording as recorder_module
 from sensors.playback import load_recording_entries, PlaybackController
-from processing.visualization.graph_draw import Graph_radar
+from sensors.filter import Graph_radar
 import menu_functions
 from menu_layout import build_record_tab
 

@@ -10,8 +10,12 @@ import time
 
 import cv2 as cv
 
-from processing.visualization.graph_draw import Graph_radar
-from processing.visualization.graph_filter import Filter_graph
+from sensors.filter import (
+    Filter_graph,
+    Graph_radar,
+    RadarCameraOverlay,
+    transposition_payload,
+)
 from sensors.auxiliary import (
     CAMERA_DELAY_SECONDS,
     IMAGE_DIRECTORY_NAME,
@@ -35,6 +39,7 @@ class PlaybackEntry:
     recorded_at: datetime
     camera_frame: Path | None = None
     camera_recorded_at: datetime | None = None
+    camera: str = "B"
 
 
 def _time(value, fallback: Path) -> datetime:
@@ -46,6 +51,8 @@ def _time(value, fallback: Path) -> datetime:
 def load_recording_entries(folder: str | Path) -> tuple[PlaybackEntry, ...]:
     """Loads and sorts point cloud and camera entries from recording metadata or disk."""
     root = Path(folder).expanduser().resolve()
+    if root.is_file():
+        root = root.parent
     if not root.is_dir():
         raise ValueError("The playback source must be an existing recording folder")
 
@@ -80,9 +87,13 @@ def load_recording_entries(folder: str | Path) -> tuple[PlaybackEntry, ...]:
             stamp_file = pcd or image
             stamp = row.get("recorded_at") or row.get("camera_recorded_at")
             camera_stamp = row.get("camera_recorded_at")
+            cam = str(row.get("Camera") or row.get("camera") or "B").strip().upper()
+            if cam not in ("A", "B", "C"):
+                cam = "B"
             entries.append(PlaybackEntry(
                 pcd, _time(stamp, stamp_file), image,
                 _time(camera_stamp, image) if image else None,
+                camera=cam,
             ))
 
         for reference, stamp in timestamps.items():
@@ -121,7 +132,9 @@ def detect_playback_structure(folder: str | Path, entries: tuple[PlaybackEntry, 
 
 def load_snapshot_entries(folder: str | Path, synced_only: bool = True, loader=None) -> tuple[Path, list[PlaybackEntry]]:
     """Loads recording entries filtered to synchronized snapshot pairs if requested."""
-    root = Path(folder).expanduser()
+    root = Path(folder).expanduser().resolve()
+    if root.is_file():
+        root = root.parent
     read_entries = loader or load_recording_entries
     entries = list(read_entries(root))
     if not synced_only:
@@ -168,6 +181,12 @@ class PlaybackController:
         self.camera_delay_seconds = float(initial_values.get(
             "camera_latency_adjustment", CAMERA_DELAY_SECONDS * 1000,
         )) / 1000
+        self.transposition_active = bool(initial_values.get("transposition", False))
+        self.transposition_overlay = None
+        try:
+            self.transposition_overlay = RadarCameraOverlay.from_json()
+        except Exception:
+            pass
         self.active = False
         self.paused = False
         self.stop_requested = False
@@ -212,6 +231,8 @@ class PlaybackController:
             if isinstance(value, dict):
                 self._set_resolution(value)
                 self.snapshot_folder = value.get("snapshot_folder")
+                if "transposition" in value:
+                    self.transposition_active = bool(value["transposition"])
             self.active, self.paused, self.stop_requested, self.index = True, False, False, 0
             self._state(folder=str(root))
             self._render()
@@ -248,6 +269,8 @@ class PlaybackController:
             return
         entry = self.entries[self.index]
         self.current_reader = None
+        filtered_points = ()
+        colors = ()
         if entry.point_cloud:
             try:
                 self.current_reader = PointCloudReader(entry.point_cloud)
@@ -255,11 +278,27 @@ class PlaybackController:
                 points = reader.clusters if reader.frame_type == "cluster" else reader.objects
                 coords = self.filters.filter_point_sequence(points) if reader.frame_type == "cluster" else self.filters.filter_object_sequence(points)
                 self.graph.show_points(*coords, self.filters.last_points)
+                filtered_points = self.filters.last_points
+                colors = coords[2] if len(coords) > 2 else ()
             except Exception:
                 pass
         if entry.camera_frame:
             image = cv.imread(str(entry.camera_frame))
             if image is not None:
+                cam_field = getattr(entry, "camera", "B") or "B"
+                if self.transposition_active and cam_field == "B" and filtered_points and self.transposition_overlay:
+                    payload = transposition_payload(
+                        filtered_points,
+                        colors,
+                        frame_type=self.current_reader.frame_type if self.current_reader else "cluster",
+                        recorded_at=entry.recorded_at,
+                        distance_cutoff=self.graph.distance_cutoff,
+                    )
+                    image = self.transposition_overlay.draw(
+                        image, payload,
+                        source_size=(image.shape[1], image.shape[0]),
+                        now_monotonic=payload["published_monotonic"],
+                    )
                 cv.imshow(
                     "CAMERA PLAYBACK",
                     cv.resize(image, (self.width, self.height), interpolation=cv.INTER_AREA),
@@ -327,6 +366,10 @@ class PlaybackController:
             self.graph.set_range(value.get("x_range", 15.0), value.get("y_range", 15.0))
         elif event == "camera_latency_adjustment":
             self.camera_delay_seconds = float(value.get("latency_adjustment_ms")) / 1000
+        elif event == "transposition":
+            self.transposition_active = bool(value.get("active", False) if isinstance(value, dict) else value)
+            if self.active and self.entries:
+                self._render()
         elif isinstance(event, str) and event.startswith("filter"):
             self.filters.update_values(event, value)
             if self.active and self.entries:
@@ -345,9 +388,11 @@ class PlaybackController:
             entry.camera_recorded_at
             or entry.recorded_at + timedelta(seconds=self.camera_delay_seconds)
         )
+        cam_field = getattr(entry, "camera", "B") or "B"
         result = SnapshotWriter(destination, self.camera_delay_seconds).save(
             self.current_reader.points, entry.recorded_at, self.current_reader.frame_type,
             entry.camera_frame.read_bytes(), camera_time,
+            camera=cam_field,
         )
         _send(self.pool, "playback_snapshot_saved", result)
         _send(self.pool, "snapshot_playback_snapshot_saved", result)

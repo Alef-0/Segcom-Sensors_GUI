@@ -6,7 +6,7 @@ import uuid
 import FreeSimpleGUI as sg
 
 from sensors.auxiliary import RECORDING_METADATA_NAME, TIMESTAMPS_METADATA_NAME
-from processing.visualization.filter_schema import RCS_KEY
+from sensors.filter import RCS_KEY
 
 
 @dataclass
@@ -89,6 +89,25 @@ def shutdown_workers(processes, pipes, controls, shutdown_event):
     controls.close()
 
 
+def format_relative_path(path_str):
+    """Normalize paths within current working directory to relative ./ paths."""
+    if not path_str:
+        return ""
+    try:
+        raw = Path(path_str).expanduser()
+        if not raw.is_absolute():
+            s = str(path_str)
+            return s if s.startswith(("./", "../")) or s == "." else f"./{s}"
+        cwd = Path.cwd().resolve()
+        resolved = raw.resolve()
+        rel = resolved.relative_to(cwd)
+        if str(rel) in (".", ""):
+            return "./"
+        return f"./{rel}"
+    except (ValueError, RuntimeError):
+        return str(path_str)
+
+
 def is_recording_folder(folder: Path) -> bool:
     """Check if directory contains point cloud files and metadata."""
     return (
@@ -100,7 +119,8 @@ def is_recording_folder(folder: Path) -> bool:
 
 def start_recording(values, controls, pipes):
     """Validate destination and trigger multi-channel radar/camera recording."""
-    folder = Path(values.get("record_folder", "")).expanduser()
+    raw_folder = values.get("record_folder", "")
+    folder = Path(raw_folder).expanduser()
     channels = [ch for ch in range(1, 4) if values.get(f"record_radar_{ch}")]
     radar_pipe = pipes.radar if isinstance(pipes, WorkerPipes) else pipes
     if not folder.exists():
@@ -111,6 +131,10 @@ def start_recording(values, controls, pipes):
     if not folder.is_dir():
         sg.popup_error("Select an existing destination folder", title="Recording error")
         return
+    rel_folder = format_relative_path(raw_folder)
+    if hasattr(controls, "window") and hasattr(controls.window, "key_dict") and "record_folder" in controls.window.key_dict and rel_folder != raw_folder:
+        controls.window["record_folder"].update(rel_folder)
+        values["record_folder"] = rel_folder
     if not channels:
         sg.popup_error("Select at least one group to record", title="Recording error")
         return
@@ -175,7 +199,7 @@ def maybe_start_playback(controls, runtime, pipes):
         runtime.pending_playback_folder = None
         if isinstance(payload, str):
             payload = {"folder": payload}
-        pb_pipe = pipes.playback if isinstance(pipes, WorkerPipes) else pipes
+        pb_pipe = getattr(pipes, "playback", pipes)
         pb_pipe.send(("playback_start", payload))
 
 
@@ -193,10 +217,17 @@ def request_playback(values, controls, runtime, pipes):
     if controls.playback:
         pipes.playback.send(("playback_stop", None))
         return
-    folder = Path(values.get("playback_folder", values.get("snapshot_playback_folder", ""))).expanduser()
+    raw_folder = values.get("playback_folder", values.get("snapshot_playback_folder", ""))
+    folder = Path(raw_folder).expanduser()
+    if folder.is_file():
+        folder = folder.parent
     if not folder.is_dir():
         controls.show_playback_error("Select an existing playback folder")
         return
+    rel_folder = format_relative_path(raw_folder)
+    if hasattr(controls, "window") and hasattr(controls.window, "key_dict") and "playback_folder" in controls.window.key_dict and rel_folder != raw_folder:
+        controls.window["playback_folder"].update(rel_folder)
+        values["playback_folder"] = rel_folder
     try:
         w, h = controls.validate_playback_resolution(values)
     except ValueError as err:
@@ -209,6 +240,7 @@ def request_playback(values, controls, runtime, pipes):
         "snapshot_folder": dest_folder,
         "width": w, "height": h,
         "synced_only": synced_only,
+        "transposition": controls.transposition,
     }
     controls.set_playback_pending()
     if controls.recording or controls.recording_pending:
@@ -232,6 +264,11 @@ def set_transposition(active, controls, pipes, message=None):
     payload = {"active": active}
     pipes.radar.send(("transposition", payload))
     pipes.cam.send(("transposition", payload))
+    if hasattr(pipes, "playback") and pipes.playback:
+        try:
+            pipes.playback.send(("transposition", payload))
+        except Exception:
+            pass
     controls.update_transposition(active, message)
 
 
@@ -248,10 +285,13 @@ def handle_gui_event(event, values, controls, runtime, pipes, shutdown_event):
     elif isinstance(event, str) and re.match(r"^choose_", event):
         choice = int(event.rsplit("_", 1)[1])
         pipes.radar.send(("choose", choice))
-        pipes.cam.send(("choose", choice))
+    elif event in ("playback_folder", "record_folder"):
+        raw_val = values.get(event, "")
+        rel_val = format_relative_path(raw_val)
+        if rel_val != raw_val and hasattr(controls, "window") and hasattr(controls.window, "key_dict") and event in controls.window.key_dict:
+            controls.window[event].update(rel_val)
+            values[event] = rel_val
     elif event in ("playback_toggle", "snapshot_playback_toggle"):
-        if not controls.playback and controls.transposition:
-            set_transposition(False, controls, pipes)
         request_playback(values, controls, runtime, pipes)
     elif event in ("playback_stop", "snapshot_playback_stop") and controls.playback:
         pipes.playback.send(("playback_stop", None))

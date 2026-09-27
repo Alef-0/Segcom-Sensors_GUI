@@ -62,7 +62,8 @@ class SnapshotWriter:
         return max(numbers, default=0) + 1
 
     def save(self, points: Iterable[RadarPoint | RadarObject], radar_recorded_at: datetime,
-             frame_type: str, image_bytes: bytes, camera_recorded_at: datetime) -> dict:
+             frame_type: str, image_bytes: bytes, camera_recorded_at: datetime,
+             camera: str = "B") -> dict:
         records, timestamps = self._metadata()
         index = self._next_index(records)
         pcd_filename = f"frame_{index:06d}.pcd"
@@ -93,6 +94,7 @@ class SnapshotWriter:
                 "frame_type": frame_type,
                 "camera_frame": image_ref,
                 "camera_recorded_at": camera_iso,
+                "Camera": str(camera or "B").upper(),
                 "camera_delay_ms": round(self.camera_delay_seconds * 1000.0, 3),
                 "synchronization_error_ms": sync_error_ms,
             })

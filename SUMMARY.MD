@@ -28,9 +28,10 @@ Window and widget state controller. Owns the GUI window instance, handles input 
 - `update_radar_connection()`, `update_cam_connection()`, `update_recording_state()`, `update_playback_state()`, `update_playback_progress()`: UI state updaters.
 
 ### [menu_functions.py](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/menu_functions.py)
-Application event dispatcher and IPC bridge. Bundles worker communication pipes, manages process lifecycle, and coordinates background worker messages.
+Application event dispatcher and IPC bridge. Bundles worker communication pipes, manages process lifecycle, coordinates background worker messages, and handles relative path normalization.
 - `WorkerPipes`: Dataclass bundling worker communication channels (radar, camera, GPS, playback).
 - `RuntimeState`: Dataclass tracking pending playback and recording states.
+- `format_relative_path()`: Normalizes paths within the current workspace to relative `./` paths.
 - `handle_gui_event()`: Dispatches window events to appropriate worker pipes and controls.
 - `apply_status_message()`: Drains and applies worker status notifications to the GUI.
 - `run_event_loop()`: Event polling and worker queue drain loop.
@@ -54,7 +55,6 @@ Python runtime dependencies for the project.
 ## Subdirectories
 
 ### [sensors/](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors)
-Sensor drivers, background worker integrations for Camera, GPS, and Radar, along with unified recording, playback, snapshot, and auxiliary processing utilities. See [sensors/SUMMARY.MD](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/SUMMARY.MD).
+Sensor drivers, background worker integrations for Camera, GPS, and Radar, unified filtering (`sensors/filter`), recording, playback, snapshot, and auxiliary processing utilities. See [sensors/SUMMARY.MD](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/sensors/SUMMARY.MD).
 
-### [processing/](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/processing)
-Top-down Cartesian radar plotting, radar point filtering, and radar-camera image transposition. See [processing/SUMMARY.MD](file:///media/alef/Everything/SEGCOM/Segcom-Sensors_GUI/processing/SUMMARY.MD).
+

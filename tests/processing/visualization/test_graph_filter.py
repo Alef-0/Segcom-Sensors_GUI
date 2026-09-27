@@ -1,10 +1,10 @@
 from types import SimpleNamespace
 import unittest
 
-from processing.visualization.graph_filter import Filter_graph
-from processing.visualization.filter_schema import (
+from sensors.filter import (
     AMBIGUITY_STATE_OPTIONS,
     DYNAMIC_PROPERTY_OPTIONS,
+    Filter_graph,
     INVALID_STATE_OPTIONS,
     PDH_KEY,
     RCS_KEY,
@@ -103,6 +103,8 @@ class GraphFilterTests(unittest.TestCase):
         self.assertEqual(selected[0], p1)
         self.assertEqual((x, y), ([2.0], [5.0]))
         self.assertEqual(colors, [(0, 0, 255)])
+
+
 
 
 if __name__ == "__main__":

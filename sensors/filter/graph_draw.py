@@ -1,17 +1,19 @@
-"""OpenCV top-down radar plot with range scale and point inspection."""
+"""OpenCV top-down Cartesian radar plot with dynamic range grid and point inspector."""
 
 import math
 
 import cv2 as cv
 import numpy as np
 
-from processing.visualization.filter_schema import DYNAMIC_PROPERTY_OPTIONS
+from sensors.filter.filter import DYNAMIC_PROPERTY_OPTIONS
 
 WIDTH, HEIGHT, MAX_VALUES, MARGIN = 800, 600, 15.0, 50
 DYNAMIC_PROPERTY_LABELS = {option.value: option.label for option in DYNAMIC_PROPERTY_OPTIONS}
 
 
 class Graph_radar:
+    """Manages 2D top-down Cartesian radar canvas, grid scaling, and point inspection."""
+
     def __init__(self, distance_cutoff=MAX_VALUES, width=WIDTH, height=HEIGHT,
                  x_range=MAX_VALUES, y_range=MAX_VALUES):
         self.margin = MARGIN

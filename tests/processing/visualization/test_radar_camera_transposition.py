@@ -6,12 +6,10 @@ import unittest
 
 import numpy as np
 
-from processing.visualization.radar_camera_transformer import (
-    RadarCameraTransformer,
-)
-from processing.visualization.transposition import (
+from sensors.filter import (
     RADAR_GROUP_B,
     RadarCameraOverlay,
+    RadarCameraTransformer,
     get_latest,
     put_latest,
     transposition_payload,
@@ -111,6 +109,8 @@ class RadarCameraTranspositionTests(unittest.TestCase):
 
         self.assertEqual(transformer.intrinsic.shape, (3, 3))
         self.assertEqual(transformer.extrinsic.shape, (4, 4))
+
+
 
 
 if __name__ == "__main__":

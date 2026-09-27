@@ -1,6 +1,6 @@
 from pathlib import Path
 import FreeSimpleGUI as sg
-from processing.visualization.filter_schema import (
+from sensors.filter import (
     AMBIGUITY_STATE_OPTIONS, DYNAMIC_PROPERTY_OPTIONS, INVALID_STATE_OPTIONS, PDH_KEY, RCS_KEY,
 )
 
@@ -78,11 +78,11 @@ def build_record_tab():
     rec_root.mkdir(exist_ok=True)
     radar_choices = [sg.Text("Group:")] + [sg.Checkbox(letter, key=f"record_radar_{ch}", default=False) for ch, letter in ((1, "A"), (2, "B"), (3, "C"))]
     return [
-        [sg.Text("Destination folder"), sg.Input(str(rec_root), key="record_folder", expand_x=True), sg.FolderBrowse("SELECT", key="record_browse", target="record_folder")],
+        [sg.Text("Destination folder"), sg.Input("./recordings", key="record_folder", expand_x=True, enable_events=True), sg.FolderBrowse("SELECT", key="record_browse", target="record_folder", initial_folder="./recordings")],
         [*radar_choices, sg.Push(), sg.Text("IDLE", key="record_status", justification="center"), sg.Text("RADAR CLOSED | CAMERA CLOSED", key="record_devices", justification="center"), sg.Push(),
          sg.Button("START RECORDING", key="record_toggle", button_color=("white", "green"), disabled=True), sg.Button("SNAPSHOT", key="snapshot_capture", button_color=("white", "green"), disabled=True)],
         [sg.HorizontalSeparator()],
-        [sg.Text("Playback folder"), sg.Input(str(Path.cwd()), key="playback_folder", expand_x=True), sg.FolderBrowse("SELECT", key="playback_browse", target="playback_folder"), sg.Checkbox("Image + PCD", key="playback_synced_only", default=True)],
+        [sg.Text("Playback folder"), sg.Input("./recordings", key="playback_folder", expand_x=True, enable_events=True), sg.FolderBrowse("SELECT", key="playback_browse", target="playback_folder", initial_folder="./recordings"), sg.Checkbox("Image + PCD", key="playback_synced_only", default=True)],
         [sg.Push(), sg.Button("START PLAYBACK", key="playback_toggle", button_color=("white", "green")), sg.VSep(),
          sg.Button("PREVIOUS", key="playback_previous", disabled=True), sg.Button("PAUSE", key="playback_pause", disabled=True), sg.Button("NEXT", key="playback_next", disabled=True), sg.Button("SNAPSHOT CURRENT", key="playback_snapshot", disabled=True), sg.Push()],
         [sg.Text("", key="playback_status", expand_x=True, justification="center", pad=(0, 0))],
@@ -96,23 +96,23 @@ def build_video_tab():
     """Construct camera resolution, FPS, jitter, and offset calibration tab."""
     col_res = sg.Column([[
         sg.Text("Camera Resolution"),
-        sg.Input("1280", key="playback_width", size=(8, 1), justification="right", enable_events=True),
+        sg.Input("1280", key="playback_width", size=(8, 1), justification="center", enable_events=True),
         sg.Text("×"),
-        sg.Input("720", key="playback_height", size=(8, 1), justification="right", enable_events=True),
+        sg.Input("720", key="playback_height", size=(8, 1), justification="center", enable_events=True),
         sg.Button("APPLY", key="playback_resolution_apply"),
-    ]], expand_x=True)
+    ]], element_justification="center")
     col_fps = sg.Column([[
         sg.Text("Recorded frames (out of 30)"),
         sg.Combo(tuple(range(1, 31)), 30, key="camera_recording_rate", size=(5, 1), readonly=True),
         sg.Button("APPLY", key="recording_rate_apply"),
-    ]])
+    ]], element_justification="center")
     col_latency = sg.Column([[
         sg.Text("Jitter (ms)"),
-        sg.Input("145", key="camera_pipeline_latency", size=(6, 1), justification="right", enable_events=True),
+        sg.Input("145", key="camera_pipeline_latency", size=(6, 1), justification="center", enable_events=True),
         sg.Text("Offset (ms)"),
-        sg.Input("87.3", key="camera_latency_adjustment", size=(6, 1), justification="right", enable_events=True),
+        sg.Input("87.3", key="camera_latency_adjustment", size=(6, 1), justification="center", enable_events=True),
         sg.Button("APPLY", key="camera_latency_apply"),
-    ]], expand_x=True)
+    ]], element_justification="center")
     status_row1 = [
         sg.Push(),
         sg.Text("1280 × 720", key="playback_resolution_status"),
@@ -125,20 +125,26 @@ def build_video_tab():
         sg.Text("Jitter: 145 ms | Offset: 87.3 ms", key="camera_latency_status"),
         sg.Push(),
     ]
-    return [[col_res, sg.VSep(), col_fps], status_row1, [sg.HorizontalSeparator()], [col_latency], status_row2]
+    return [
+        [sg.Push(), col_res, sg.VSep(), col_fps, sg.Push()],
+        status_row1,
+        [sg.HorizontalSeparator()],
+        [sg.Push(), col_latency, sg.Push()],
+        status_row2,
+    ]
 
 
 def build_graph_tab():
-    """Construct radar point cutoff and graph range/resolution tab."""
+    """Construct radar point cutoff, graph range/resolution, and transposition tab."""
     col_cutoff = sg.Column([[
         sg.Text("Point cutoff (m)"),
-        sg.Input("15", key="point_cutoff", size=(6, 1), justification="right", enable_events=True),
+        sg.Input("15", key="point_cutoff", size=(6, 1), justification="center", enable_events=True),
         sg.Button("APPLY", key="point_cutoff_apply"),
-    ]])
+    ]], element_justification="center")
     col_graph = sg.Column([
-        [sg.Text("Graph Resolution"), sg.Input("800", key="graph_width", size=(6, 1), justification="right", enable_events=True), sg.Text("×"), sg.Input("600", key="graph_height", size=(6, 1), justification="right", enable_events=True)],
-        [sg.Text("Graph Range (m)"), sg.Text("X ±"), sg.Input("15", key="graph_x_range", size=(5, 1), justification="right", enable_events=True), sg.Text("Y 0–"), sg.Input("15", key="graph_y_range", size=(5, 1), justification="right", enable_events=True), sg.Button("APPLY", key="graph_settings_apply")],
-    ])
+        [sg.Text("Graph Resolution"), sg.Input("800", key="graph_width", size=(6, 1), justification="center", enable_events=True), sg.Text("×"), sg.Input("600", key="graph_height", size=(6, 1), justification="center", enable_events=True)],
+        [sg.Text("Graph Range (m)"), sg.Text("X ±"), sg.Input("15", key="graph_x_range", size=(5, 1), justification="center", enable_events=True), sg.Text("Y 0–"), sg.Input("15", key="graph_y_range", size=(5, 1), justification="center", enable_events=True), sg.Button("APPLY", key="graph_settings_apply")],
+    ], element_justification="center")
     status_row = [
         sg.Push(),
         sg.Text("Cutoff 15.0 m", key="point_cutoff_status"),
@@ -148,7 +154,22 @@ def build_graph_tab():
         sg.Text("X ±15 m | Y 0–15 m", key="graph_range_status"),
         sg.Push(),
     ]
-    return [[col_cutoff, sg.VSep(), col_graph], status_row]
+    transposition_row = [
+        sg.Push(),
+        sg.Text("Camera B + Radar B"),
+        sg.Button("ENABLE TRANSPOSITION", key="transposition_toggle", button_color=("white", "green")),
+        sg.Push(),
+    ]
+    transposition_status = [
+        sg.Text("OFF · camera points use current radar filters and distance cutoff", key="transposition_status", expand_x=True, justification="center"),
+    ]
+    return [
+        [sg.Push(), col_cutoff, sg.VSep(), col_graph, sg.Push()],
+        status_row,
+        [sg.HorizontalSeparator()],
+        transposition_row,
+        transposition_status,
+    ]
 
 
 def build_display_tab():
@@ -208,7 +229,6 @@ def build_main_layout():
     filter_tabs = [
         sg.Tab("Basic", build_filter_tab()),
         sg.Tab("Cluster Options", build_cluster_filter_tab()),
-        sg.Tab("Transposition", build_transposition_tab()),
     ]
     radar_control = sg.Frame("General Control", [[sg.TabGroup([control_tabs], expand_x=True, pad=(0, 0))]], expand_x=True, title_location=sg.TITLE_LOCATION_TOP, pad=(0, 0))
     filters = sg.Frame("Radar controls", [[sg.TabGroup([filter_tabs], expand_x=True)]], expand_x=True, title_location=sg.TITLE_LOCATION_TOP)

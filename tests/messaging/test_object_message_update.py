@@ -12,13 +12,14 @@ from sensors.radar.connection_packages import (
     read_60d_object_extended,
     read_60e_object_warning,
 )
-from processing.visualization.graph_filter import Filter_graph, UNKNOWN_DYNAMIC_COLOR_BGR
-from processing.visualization.filter_schema import (
+from sensors.filter import (
     AMBIGUITY_STATE_OPTIONS,
     DYNAMIC_PROPERTY_OPTIONS,
+    Filter_graph,
     INVALID_STATE_OPTIONS,
     PDH_KEY,
     RCS_KEY,
+    UNKNOWN_DYNAMIC_COLOR_BGR,
 )
 
 

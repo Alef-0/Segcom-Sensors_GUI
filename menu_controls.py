@@ -165,7 +165,7 @@ class MenuControls:
             if f"choose_{ch}" in self.window.key_dict:
                 self.window[f"choose_{ch}"].update(disabled=False)
         if "transposition_toggle" in self.window.key_dict:
-            self.window["transposition_toggle"].update(disabled=live_blocked)
+            self.window["transposition_toggle"].update(disabled=False)
 
     def update_record_device_status(self):
         """Update connection indicator texts."""

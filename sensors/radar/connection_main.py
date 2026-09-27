@@ -20,9 +20,9 @@ from sensors.radar.connection_packages import (
     read_701_cluster_list,
     read_702_quality_info,
 )
-from processing.visualization.graph_draw import Graph_radar
-from processing.visualization.graph_filter import Filter_graph
-from processing.visualization.transposition import (
+from sensors.filter import (
+    Filter_graph,
+    Graph_radar,
     RADAR_GROUP_B,
     clear_latest,
     put_latest,
@@ -294,6 +294,7 @@ def create_connection_communication(
                 frame.frame_type,
                 values["image_bytes"],
                 camera_recorded_at,
+                camera=RADAR_LETTERS.get(channel, "B"),
             )
             result["request_id"] = request_id
             put_status(pool, "snapshot_saved", result, critical=True)
