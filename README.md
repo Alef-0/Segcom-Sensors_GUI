@@ -3,8 +3,7 @@
 Segcom Sensors GUI is a desktop tool for operating a three-group Continental
 ARS40X radar setup together with cameras and the GPS exposed by a network DVR.
 It provides live monitoring, radar configuration, synchronized radar/camera
-recording, manual paired snapshots, playback, and a camera-delay calibration
-workflow.
+recording, manual paired snapshots, and playback.
 
 This README describes the current working tree. The hardware addresses,
 credentials, timing values, and physical group layout are deployment-specific
@@ -26,8 +25,6 @@ and should be confirmed on the real Segcom installation.
 - Play complete recordings at their recorded cadence, or inspect paired
   snapshots one frame at a time.
 - Poll the DVR GPS endpoint and open the last position in Google Maps.
-- Record camera channel 4 while displaying monotonic QR markers for
-  latency and clock-drift analysis.
 - Convert recorded PCD trees to CSV while preserving images and metadata.
 
 ## Deployment assumptions
@@ -37,7 +34,7 @@ The current source contains fixed addresses and credentials:
 | Device or service | Current endpoint | Used by |
 | --- | --- | --- |
 | Radar CAN gateway | `192.168.1.101:2323` over TCP | `sensors/radar/connection_communication.py` |
-| DVR RTSP cameras | `192.168.1.108:554`, channels 1-4 | `sensors/camera/camera_gstreamer.py` |
+| DVR RTSP cameras | `192.168.1.108:554`, channels 1-3 | `sensors/camera/camera_gstreamer.py` |
 | DVR GPS status | `http://192.168.1.108/cgi-bin/positionManager.cgi?action=getStatus` | `sensors/gps/gps_connection.py` |
 
 The DVR username and password are also embedded in the camera and GPS source.
@@ -46,7 +43,6 @@ those credentials should be handled.
 
 The source treats channels 1, 2, and 3 as groups A, B, and C respectively.
 The user interface labels those positions LEFT A, MIDDLE B, and RIGHT C.
-Camera channel 4 is reserved for calibration.
 
 ## Running the application
 
@@ -81,13 +77,12 @@ FreeSimpleGUI process
 
 The GUI sends commands to each worker through a dedicated pipe. Workers return
 state, progress, warnings, and errors through one bounded status queue. A
-shared shutdown event coordinates normal termination. The calibration display
-is started only when requested and runs in its own process.
+shared shutdown event coordinates normal termination.
 
 `application_core.py` contains the common event loop and record/playback orchestration.
-`main.py` extends that behavior with calibration and snapshot-playback modes.
+`main.py` extends that behavior with snapshot-playback modes.
 Likewise, `interface_core.py` contains the common window and state logic while
-`menu_configurations.py` adds the newer controls.
+`menu_configurations.py` adds display and transposition controls.
 
 ## Live radar flow
 
@@ -172,70 +167,15 @@ See `processing/recording/README.md` for file schemas and overload handling.
 
 ## Operating modes
 
-Live monitoring, normal playback, snapshot playback, and calibration camera
-mode are coordinated as mutually exclusive uses of the camera/radar displays.
-When playback or calibration needs the devices, the GUI first stops active
-recording and closes conflicting live workers before starting the requested
-mode.
+Live monitoring, normal playback, and snapshot playback are coordinated as mutually
+exclusive uses of the camera/radar displays. When playback needs the devices,
+the GUI first stops active recording and closes conflicting live workers before
+starting the requested mode.
 
 Normal playback follows recorded timestamps and supports restart and five
 second seeks. Snapshot playback can restrict the list to entries that contain
 both image and PCD data, pause, step backward or forward, and save the current
 pair into another snapshot folder.
-
-## Calibration
-
-The Calibration tab lets you require the desktop NVIDIA, ARM/Jetson, or CPU
-camera pipeline, select either the Qt/OpenGL or Pygame/SDL fullscreen clock,
-and choose its monitor.
-The selected pipeline is validated before the clock starts and does not silently
-fall back to another decoder. Both clock implementations accept a 4, 6, 8, 9,
-10, or 12-code grid and independently control how many of its latest QR codes
-remain visible. They present QR timestamps in a snake path through the grid,
-show the display index beside each timestamp, and underline the newest marker.
-Press **P** to pause/resume, or use **Q** or Escape to close either clock; the Qt
-clock also handles Ctrl+C directly. Paused markers are excluded from timing
-analysis.
-
-The Visualization tab opens the single analyzer with the project's copied
-camera intrinsics, an undistorted image, and alpha 0.25 by default. QReader
-detects every QR bounding box, retries grid cells without a readable result,
-and orders detections by grid cell. The first frame is decoded when the viewer
-opens; full-folder decoding begins only after **GO — DECODE FULL FOLDER** is
-pressed, and each completed frame is shown. A frame is accepted when at least
-one readable QR matches its journal; camera-grid position disagreements remain
-visible as warnings. Unreadable and invalid detections are retained as
-diagnostics while the latest journal-matched QR supplies the offset. The PTS,
-NTP, and configured grid values are editable without automatically starting a
-scan. Finishing the full scan writes `calibration_analysis.json` and
-`calibration_frames.csv` to a sibling
-`<recording-folder-name>_analysis` directory. After the inspection window is
-closed, the root launcher reads those files and writes a quantitative verdict,
-per-frame strategy predictions, and five Matplotlib graphs as PNG files.
-The histogram figures use one strategy per panel with compact, independently
-adjusted bins and ranges.
-
-```bash
-python3 analyze_calibration_recording.py /path/to/calibration-recording
-python3 analyze_calibration_recording.py /path/to/calibration-recording \
-  --intrinsics /path/to/intrinsics.json
-
-# Recreate only the verdict from existing analysis files (no window)
-python3 -m calibration.quantitative_analysis \
-  /path/to/calibration-recording_analysis
-
-# Also save SVG copies when running the quantitative analyzer directly
-python3 -m calibration.quantitative_analysis \
-  /path/to/calibration-recording_analysis --svg
-```
-
-For each decoded QR, the analyzer verifies the recorded quadrant and checks both
-its own flip timing and the following replacement. Suspect or missing replacement
-evidence stays visible but is excluded from the clean offset summary. The verdict
-compares 109 ms, calibrated fixed corrections, PTS-step groups, and a six-step
-causal PTS-history model on a chronological 70/30 split. A learned model remains
-experimental until the preselected strategy is confirmed on a later independent
-recording. Readable codes alone do not establish physical exposure time.
 
 ## CSV conversion
 

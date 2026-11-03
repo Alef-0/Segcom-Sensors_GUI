@@ -63,8 +63,6 @@ class GStreamerPipeline:
         self.pipeline_latency_ms = CAMERA_PIPELINE_LATENCY_MS
         self.latency_adjustment_ms = 109.0
         self.recording_frames_per_30 = CAMERA_FRAME_RATE
-        self.calibration_mode = False
-        self.calibration_recording = False
         self.snapshot_recorder = CameraSnapshotRecorder(
             self._report_snapshot,
             self._report_recording_drop,
@@ -170,41 +168,26 @@ class GStreamerPipeline:
         self._last_pts_gap_warning = now
 
     def _start_snapshot_recording(self, value):
-        calibration = bool(value.get("calibration"))
         try:
             self._last_writer_drop_warning = 0.0
             self._last_pts_gap_warning = 0.0
             self._pending_pts_gap_candidates = 0
             self.snapshot_recorder.start(
                 value.get("folders", {}),
-                calibration=calibration,
                 latency_adjustment_ms=self.latency_adjustment_ms,
                 timing_session={
                     "camera_channel": self.channel,
                     "decoder_backend": self.current_decoder_backend.name,
                     "pipeline_latency_ms": self.pipeline_latency_ms,
                     "stream_epoch_at_start": self.stream_epoch,
-                    "display_journal": value.get("display_journal"),
                 },
             )
-            self.calibration_recording = calibration
-            message = (
-                "calibration_recording_state"
-                if calibration
-                else "camera_recording_state"
-            )
-            self._put_status(message, {"active": True})
+            self._put_status("camera_recording_state", {"active": True})
         except Exception as error:
             self._put_status("camera_recording_error", str(error))
-            message = (
-                "calibration_recording_state"
-                if calibration
-                else "camera_recording_state"
-            )
-            self._put_status(message, {"active": False})
+            self._put_status("camera_recording_state", {"active": False})
 
     def _stop_snapshot_recording(self):
-        was_calibration = self.calibration_recording
         try:
             self.snapshot_recorder.record_timing_events(self.reference_clock.poll())
             self.snapshot_recorder.update_transport_stats(
@@ -212,15 +195,12 @@ class GStreamerPipeline:
                 stream_epoch=self.stream_epoch,
             )
             count = self.snapshot_recorder.stop()
-            self.calibration_recording = False
             confirmed_not_saved = (
                 self.snapshot_recorder.frames_dropped
                 + self.snapshot_recorder.frames_rejected_invalid_timing
             )
             self._put_status(
-                "calibration_recording_state"
-                if was_calibration
-                else "camera_recording_state",
+                "camera_recording_state",
                 {
                     "active": False,
                     "count": count,
@@ -235,14 +215,8 @@ class GStreamerPipeline:
                 },
             )
         except Exception as error:
-            self.calibration_recording = False
             self._put_status("camera_recording_error", str(error))
-            self._put_status(
-                "calibration_recording_state"
-                if was_calibration
-                else "camera_recording_state",
-                {"active": False},
-            )
+            self._put_status("camera_recording_state", {"active": False})
 
     def _connect_camera(self):
         try:
@@ -252,35 +226,6 @@ class GStreamerPipeline:
             self.connected = False
         self._put_status("change_cam", self.connected)
         return self.connected
-
-    def _set_calibration_camera(self, active):
-        active = bool(active)
-        if active:
-            self.calibration_mode = True
-            self.channel = 4
-            self.channel_changed = True
-            if not self.connected:
-                self._connect_camera()
-            if not self.connected:
-                self.calibration_mode = False
-                self.channel = self.normal_channel
-            if self.connected:
-                self.exit_reason = _RESULT_RESTART
-            self._put_status(
-                "calibration_camera_state",
-                {"active": self.connected, "channel": 4},
-            )
-            return self.connected
-
-        self.calibration_mode = False
-        self.channel = self.normal_channel
-        self.channel_changed = True
-        self.connected = False
-        self.exit_reason = _RESULT_CLOSED
-        self._fail_manual_snapshot("Calibration camera closed before taking the snapshot")
-        self._put_status("change_cam", False)
-        self._put_status("calibration_camera_state", {"active": False, "channel": 4})
-        return True
 
     def _set_latency_settings(self, value):
         try:
@@ -665,7 +610,7 @@ class GStreamerPipeline:
                     restart = True
                 elif event == "choose":
                     self.normal_channel = value
-                    if self.calibration_mode or value == self.channel:
+                    if value == self.channel:
                         continue
                     self.channel = value
                     self.channel_changed = True
@@ -676,8 +621,6 @@ class GStreamerPipeline:
                         self.exit_reason = _RESULT_RESTART
                         restart = True
                 elif event == "conn_cam":
-                    if self.calibration_mode:
-                        continue
                     if self.connected:
                         self.connected = False
                         self.exit_reason = _RESULT_CLOSED
@@ -686,8 +629,6 @@ class GStreamerPipeline:
                         restart = True
                     else:
                         self._connect_camera()
-                elif event == "calibration_camera":
-                    restart = self._set_calibration_camera(value.get("active")) or restart
                 elif event == "camera_decoder_backend":
                     restart = self._set_decoder_backend(value) or restart
                 elif event == "camera_latency_settings":
@@ -725,7 +666,6 @@ class GStreamerPipeline:
             return GLib.SOURCE_CONTINUE
         if (
             self.transposition_active
-            and not self.calibration_mode
             and self.channel == RADAR_GROUP_B
             and self.transposition_overlay is not None
             and self.capture_size is not None
@@ -745,7 +685,7 @@ class GStreamerPipeline:
                 self.transposition_payload = None
                 clear_latest(self.transposition_channel)
                 self._put_status("transposition_error", str(error))
-        cv.imshow("CALIBRATION CAMERA 4" if self.calibration_mode else "CAMERA", frame)
+        cv.imshow("CAMERA", frame)
         cv.waitKey(1)
         return GLib.SOURCE_CONTINUE
 
@@ -958,13 +898,6 @@ def gstreamer_main(connection, pool, shutdown_event, transposition_channel=None)
                 if pipeline.snapshot_recorder.active:
                     pipeline._stop_snapshot_recording()
                 pipeline._put_status("change_cam", False)
-                if pipeline.calibration_mode:
-                    pipeline.calibration_mode = False
-                    pipeline.channel = pipeline.normal_channel
-                    pipeline._put_status(
-                        "calibration_camera_state",
-                        {"active": False, "channel": 4},
-                    )
                 failed_attempts = 0
                 continue
 

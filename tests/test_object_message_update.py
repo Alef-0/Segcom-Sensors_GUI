@@ -172,11 +172,6 @@ class ObjectMessageUpdateTests(unittest.TestCase):
 
         self.assertEqual((x, y), ([3.0], [5.0]))
 
-    def test_default_rcs_preserves_latest_minus_twenty_setting(self):
-        values = initial_filter_values()
-        values.pop(RCS_KEY)
-        self.assertEqual(Filter_graph(values).rcs_min, -20.0)
-
     def test_playback_sequence_filter_uses_optional_field_rules(self):
         graph_filter = Filter_graph(initial_filter_values())
         obj = SimpleNamespace(

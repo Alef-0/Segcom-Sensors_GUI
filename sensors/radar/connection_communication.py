@@ -2,7 +2,6 @@ import struct
 import numpy as np
 import socket
 import time
-from bitstring import BitArray
 
 g_CANData_fmt = "<BBIQ8sB"  # little-endian, packed
 g_CANData_size = struct.calcsize(g_CANData_fmt)  # 23 bytes

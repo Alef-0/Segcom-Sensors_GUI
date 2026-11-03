@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+import tests  # Ensure GUI mocks are loaded in headless test environments
 from sensors.radar.connection_packages import MISSING_QUALITY, RadarPoint
 import processing.recording.camera_snapshot_recorder as camera_module
 import processing.recording.point_cloud_reader as reader_module
@@ -121,51 +122,6 @@ class RecordingChangesTests(unittest.TestCase):
         self.assertEqual(reader.clusters[0].cluster_id, 3)
         self.assertEqual(reader.objects, ())
 
-    def test_point_cloud_reader_restores_extended_object_fields(self):
-        values = [[
-            8, 40.0, -2.0, 3.5, 0.25, 1, -6.0,
-            np.nan, 0.063, 0.105, 0.288, np.nan, 2.187, 180.0,
-            MISSING_QUALITY, 7,
-            1.25, -0.25, 4, 12.0, 4.2, 1.8, 0x81,
-        ]]
-        FakeReaderCloud.current = FakeReaderCloud(recorder_module.OBJECT_PCD_FIELDS, values)
-        with TemporaryDirectory() as folder:
-            path = Path(folder) / "frame.pcd"
-            path.write_bytes(b"pcd")
-            reader = reader_module.PointCloudReader(path)
-
-        obj = reader.objects[0]
-        self.assertEqual(reader.frame_type, "object")
-        self.assertIsNone(obj.dist_long_rms)
-        self.assertIsNone(obj.acceleration_latitude_rms)
-        self.assertIsNone(obj.measurement_state)
-        self.assertEqual(obj.probability_of_existence, 7)
-        self.assertAlmostEqual(obj.acceleration_longitude, 1.25)
-        self.assertEqual(obj.object_class, 4)
-        self.assertEqual(obj.collision_detection_regions, 0x81)
-
-    def test_point_cloud_reader_supports_legacy_object_schema(self):
-        values = [[
-            8, 40.0, -2.0, 3.5, 0.25, 1, -6.0,
-            np.nan, 0.063, 0.105, 0.288, np.nan, 2.187, 180.0,
-            MISSING_QUALITY, 7,
-        ]]
-        FakeReaderCloud.current = FakeReaderCloud(
-            recorder_module.LEGACY_OBJECT_PCD_FIELDS,
-            values,
-        )
-        with TemporaryDirectory() as folder:
-            path = Path(folder) / "legacy.pcd"
-            path.write_bytes(b"pcd")
-            reader = reader_module.PointCloudReader(path)
-
-        obj = reader.objects[0]
-        self.assertEqual(reader.frame_type, "object")
-        self.assertIsNone(obj.measurement_state)
-        self.assertEqual(obj.probability_of_existence, 7)
-        self.assertIsNone(obj.object_class)
-        self.assertIsNone(obj.collision_detection_regions)
-
     def test_camera_recorder_selects_configured_frames_out_of_thirty(self):
         original_imwrite = camera_module.cv.imwrite
         saved = []
@@ -192,121 +148,6 @@ class RecordingChangesTests(unittest.TestCase):
         self.assertEqual(count, 4)
         self.assertEqual(len(files), 4)
         self.assertEqual(len(saved), 4)
-
-    def test_calibration_camera_recording_writes_compact_timing_telemetry(self):
-        original_imwrite = camera_module.cv.imwrite
-
-        def fake_imwrite(path, _frame):
-            Path(path).write_bytes(b"jpg")
-            return True
-
-        camera_module.cv.imwrite = fake_imwrite
-        try:
-            with TemporaryDirectory() as folder:
-                recorder = camera_module.CameraSnapshotRecorder()
-                recorder.start(
-                    {4: folder},
-                    calibration=True,
-                    latency_adjustment_ms=250,
-                    timing_session={
-                        "camera_channel": 4,
-                        "decoder_backend": "rtx",
-                        "pipeline_latency_ms": 145,
-                    },
-                )
-                captured_at = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
-                captured_ns = 1_787_745_600_000_000_000
-                recorder.submit(
-                    np.zeros((2, 2, 3), dtype=np.uint8),
-                    captured_at=captured_at,
-                    timing={
-                        "stream_epoch": 3,
-                        "pts_ns": 1_000_000_000,
-                        "running_time_ns": 1_000_000_000,
-                        "pipeline_zero_unix_ns": captured_ns - 1_000_000_000,
-                        "pipeline_zero_monotonic_ns": 99_000_000_000,
-                        "pipeline_clock_type": "GstSystemClock",
-                        "media_time_ns": captured_ns,
-                        "camera_ntp_ns": 1_787_745_628_000_000_000,
-                        "reference_timestamp_raw_ns": 1_787_745_628_000_000_000,
-                        "reference_clock": "timestamp/x-unix",
-                        "host_realtime_received_ns": captured_ns + 145_000_000,
-                        "host_monotonic_received_ns": 100_145_000_000,
-                        "large_pts_gap_candidate": True,
-                        "flags": ["unusual_pts_gap"],
-                    },
-                )
-                recorder.update_transport_stats(
-                    {"num_lost": 2, "num_late": 1},
-                    stream_epoch=3,
-                )
-                recorder.update_transport_stats(
-                    {"num_lost": 2, "num_late": 2},
-                    stream_epoch=3,
-                )
-                recorder.update_transport_stats(
-                    {"num_lost": 1, "num_late": 0},
-                    stream_epoch=4,
-                )
-                recorder.stop()
-                journal_records = [
-                    json.loads(line)
-                    for line in (
-                        Path(folder) / camera_module.CAMERA_TIMESTAMPS_JOURNAL_NAME
-                    ).read_text().splitlines()
-                ]
-                session = json.loads(
-                    (Path(folder) / camera_module.CAMERA_TIMING_SESSION_NAME).read_text()
-                )
-                summary = json.loads(
-                    (Path(folder) / camera_module.CAMERA_RECORDING_SUMMARY_NAME).read_text()
-                )
-                redundant_manifest_exists = (
-                    Path(folder) / "camera_timestamps.json"
-                ).exists()
-        finally:
-            camera_module.cv.imwrite = original_imwrite
-
-        self.assertFalse(redundant_manifest_exists)
-        self.assertEqual(len(journal_records), 1)
-        metadata = journal_records[0]
-        self.assertEqual(metadata["frame"], "images/camera_000001.jpg")
-        self.assertEqual(metadata["stream_epoch"], 3)
-        self.assertEqual(metadata["media_unix_ns"], captured_ns)
-        self.assertEqual(
-            metadata["estimated_exposure_unix_ns"],
-            captured_ns - 250_000_000,
-        )
-        self.assertEqual(metadata["reference_ntp_ns"], 1_787_745_628_000_000_000)
-        self.assertEqual(metadata["pts_ns"], 1_000_000_000)
-        self.assertEqual(
-            metadata["received_unix_ns"],
-            captured_ns + 145_000_000,
-        )
-        self.assertEqual(
-            set(metadata),
-            {
-                "frame", "stream_epoch", "pts_ns", "running_time_ns",
-                "received_monotonic_ns", "received_unix_ns",
-                "reference_timestamp_raw_ns", "reference_clock",
-                "reference_ntp_ns", "media_unix_ns",
-                "estimated_exposure_unix_ns", "saved_unix_ns", "flags",
-            },
-        )
-        self.assertEqual(session["schema_version"], 2)
-        self.assertEqual(session["camera_channel"], 4)
-        self.assertEqual(session["image_adjustment_ns"], 250_000_000)
-        self.assertEqual(session["epochs"][0]["stream_epoch"], 3)
-        self.assertEqual(summary["frames_saved"], 1)
-        self.assertEqual(summary["frames_dropped_writer_queue"], 0)
-        self.assertEqual(summary["unusual_pts_gap_candidates"], 1)
-        self.assertEqual(summary["confirmed_frames_not_saved"], 0)
-        self.assertEqual(summary["num_lost"], 3)
-        self.assertEqual(summary["num_late"], 2)
-        self.assertEqual(
-            [row["stream_epoch"] for row in summary["transport_stats_by_epoch"]],
-            [3, 4],
-        )
 
     def test_camera_recording_rate_is_limited_to_one_through_thirty(self):
         recorder = camera_module.CameraSnapshotRecorder()

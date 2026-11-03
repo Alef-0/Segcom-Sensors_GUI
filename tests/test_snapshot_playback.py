@@ -2,12 +2,14 @@ from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import cv2 as cv
 
+import tests  # Ensure GUI mocks are loaded in headless test environments
 import processing.playback.snapshot_playback as playback_module
 from processing.visualization.graph_draw import Graph_radar
 from menu_configurations import Configurations

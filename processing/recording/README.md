@@ -7,8 +7,8 @@ workers that create, read, and copy paired observations.
 
 - `point_cloud_recorder.py` writes cluster or object frames as PCD and manages
   per-group recording sessions.
-- `camera_snapshot_recorder.py` writes asynchronous JPEG sequences and detailed
-  calibration timing evidence.
+- `camera_snapshot_recorder.py` writes asynchronous JPEG sequences and frame
+  timing telemetry.
 - `point_cloud_reader.py` restores supported PCD schemas as typed radar points.
 - `manual_snapshot.py` appends one radar/image pair to a compatible folder.
 - `paths.py` defines the current data directories and legacy JSON path lookup.

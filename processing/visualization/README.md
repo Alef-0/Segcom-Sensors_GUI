@@ -18,7 +18,3 @@ image, or older than 0.5 seconds are not drawn.
 
 The package does not acquire sensor data or save recordings. Those concerns
 remain in `sensors/radar/` and `processing/recording/` respectively.
-
-
-Calibration image inspection is documented in
-[calibration/inspection](../../calibration/inspection/README.md).

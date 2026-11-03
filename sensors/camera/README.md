@@ -2,8 +2,7 @@
 
 The camera subsystem connects to one DVR RTSP channel at a time, displays the
 latest decoded image, produces timestamped full-resolution frames for
-recording, and temporarily changes channels for manual snapshots or
-calibration.
+recording, and temporarily changes channels for manual snapshots.
 
 ## Files
 
@@ -19,8 +18,7 @@ calibration.
 
 Channels 1-3 correspond to radar/camera groups A-C. The selected live group
 starts as channel 2. A manual snapshot can restart the pipeline on another
-group, capture one frame, and then restore the previous channel. Calibration
-mode moves to channel 4 and closes it when calibration ends.
+group, capture one frame, and then restore the previous channel.
 
 The RTSP URL and credentials are currently constructed directly in
 `GStreamerPipeline.create_url()`.
@@ -42,11 +40,6 @@ camera is reported closed.
 
 Set `SEGCOM_CAMERA_DECODER=rtx`, `orin`, or `cpu` to request a path explicitly.
 Hardware requests still fall back to CPU when their elements are missing.
-The explicit pipeline selected in the Calibration tab is stricter: missing
-plugins or a pipeline construction/startup failure is shown as an error instead
-of falling back to a different decoder. The ARM/Jetson option is rejected on a
-computer that is not detected as an NVIDIA Jetson, even if similarly named
-plugins happen to be installed.
 
 ## Pipeline shape
 
@@ -90,7 +83,7 @@ explicitly identify an NTP or Unix clock. It is retained as diagnostic evidence
 and never moves the PTS-derived image time. Unknown reference clocks remain raw
 and are flagged instead of being guessed.
 
-Each calibration row keeps the independent observations needed to recompute
+Each telemetry row keeps the independent observations needed to recompute
 the relationship: PTS, segment running time, host Unix and monotonic receipt,
 declared reference-clock data, PTS-derived media time, and flags. Epoch anchors
 are stored once per pipeline restart in the session file rather than repeated
@@ -109,12 +102,7 @@ Two settings have different purposes:
 - Pipeline latency, default 145 ms, configures the GStreamer RTSP jitter
   buffer and causes a pipeline restart when changed while connected.
 - Latency adjustment, default 109 ms, is an application-level camera-to-radar
-  alignment offset used by recording, snapshots, playback snapshots, and
-  calibration metadata.
-
-Changing one does not automatically derive the other. The adjustment must be
-validated from a calibration recording for the current stream session and
-hardware path.
+  alignment offset used by recording, snapshots, and playback snapshots.
 
 ## Recording and loss reporting
 
