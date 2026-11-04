@@ -10,10 +10,12 @@ import sys
 import time
 from multiprocessing import get_context
 from queue import Empty
+from uuid import uuid4
 
 import FreeSimpleGUI as sg
 
 import application_core as base
+from calibration_workbench import CalibrationWorkbench
 from sensors.camera.camera_gstreamer import gstreamer_main
 from sensors.radar.connection_main import create_connection_communication
 from sensors.gps.gps_connection import main as gps_main
@@ -28,6 +30,8 @@ class RuntimeState:
     pending_snapshot_playback: dict | None = None
     recording_stop_pending: bool = False
     process_context: object | None = None
+    workbench: object | None = None
+    active_channel: int = 2
 
 
 def _resolution(values):
@@ -88,16 +92,71 @@ def _camera_recording_rate(values):
     return frames_per_30
 
 
-def _set_transposition(active, config, send_radar, send_cam, message=None):
+def _codet_gate(values):
+    try:
+        gate = float(str(values.get("global_codet_gate", "0.50")).strip())
+    except ValueError as error:
+        raise ValueError("Co-detection gate must be a number in meters") from error
+    if not math.isfinite(gate) or gate <= 0:
+        raise ValueError("Co-detection gate must be greater than zero")
+    return gate
+
+
+def _radar_pose_values(values, channel):
+    pod = "A" if int(channel) == 1 else "C"
+    try:
+        ox = float(str(values.get(f"radar_pose_x_{channel}", "0")).strip())
+        oy = float(str(values.get(f"radar_pose_y_{channel}", "0")).strip())
+        yaw = float(str(values.get(f"radar_pose_yaw_{channel}", "0")).strip())
+    except ValueError as error:
+        raise ValueError(f"Radar {pod} X, Y, and Yaw must be numbers") from error
+    if not (math.isfinite(ox) and math.isfinite(oy) and math.isfinite(yaw)):
+        raise ValueError(f"Radar {pod} X, Y, and Yaw must be finite numbers")
+    return {"offset_x_m": ox, "offset_y_m": oy, "yaw_deg": yaw}
+
+
+def _global_map_payload(values, active, *, clear_accumulated=False):
+    return {
+        "active": bool(active),
+        "color_by_pod": not bool(values.get("global_color_dyn", False)),
+        "show_cones": bool(values.get("global_show_cones", True)),
+        "show_codet": bool(values.get("global_show_codet", True)),
+        "codet_gate_m": _codet_gate(values) if active else 0.50,
+        "accumulate_pairs": bool(values.get("global_accumulate_pairs", False)),
+        "clear_accumulated": bool(clear_accumulated),
+    }
+
+
+def _transposition_source(values):
+    return "global" if values.get("transposition_src_global") else "local"
+
+
+def _set_transposition(
+    active,
+    config,
+    send_radar,
+    send_cam,
+    *,
+    source="local",
+    group=2,
+    message=None,
+):
     active = bool(active)
-    if active:
-        config.window["choose_2"].update(value=True)
-        send_radar.send(("choose", 2))
-        send_cam.send(("choose", 2))
-    payload = {"active": active}
+    payload = {"active": active, "source": str(source), "group": int(group)}
     send_radar.send(("transposition", payload))
     send_cam.send(("transposition", payload))
     config.change_transposition(active, message)
+
+
+def _set_global_map(active, values, config, send_radar):
+    active = bool(active)
+    try:
+        payload = _global_map_payload(values, active)
+    except ValueError as error:
+        sg.popup_error(str(error), title="Global Map error")
+        return
+    send_radar.send(("global_map_settings", payload))
+    config.change_global_map(active)
 
 
 def _maybe_start_snapshot_playback(config, runtime, send_snapshot_playback):
@@ -170,18 +229,113 @@ def _handle_gui_event(
             config,
             send_radar,
             send_cam,
+            source=_transposition_source(values),
+            group=runtime.active_channel,
         )
         return
-    if (
-        isinstance(event, str)
-        and event.startswith("choose_")
-        and event != "choose_2"
-        and config.transposition
+    if event in ("transposition_src_local", "transposition_src_global"):
+        if config.transposition:
+            _set_transposition(
+                True,
+                config,
+                send_radar,
+                send_cam,
+                source=_transposition_source(values),
+                group=runtime.active_channel,
+            )
+        return
+    if isinstance(event, str) and event.startswith("choose_"):
+        try:
+            runtime.active_channel = int(event.rsplit("_", 1)[1])
+        except ValueError:
+            pass
+    if event == "global_map_toggle":
+        _set_global_map(not config.global_map_active, values, config, send_radar)
+        return
+    if event in (
+        "global_color_pod",
+        "global_color_dyn",
+        "global_show_cones",
+        "global_show_codet",
+        "global_accumulate_pairs",
     ):
-        _set_transposition(False, config, send_radar, send_cam)
+        try:
+            payload = _global_map_payload(values, config.global_map_active)
+        except ValueError as error:
+            sg.popup_error(str(error), title="Global Map error")
+            return
+        send_radar.send(("global_map_settings", payload))
+        return
+    if event == "global_clear_pairs":
+        send_radar.send(("global_map_settings", {"clear_accumulated": True}))
+        config.window["global_overlap_status"].update("Co-Det: A↔B 0 | C↔B 0 (cleared)")
+        return
+    if event in ("radar_poses_apply", "radar_poses_save"):
+        try:
+            pose_1 = _radar_pose_values(values, 1)
+            pose_3 = _radar_pose_values(values, 3)
+        except ValueError as error:
+            sg.popup_error(str(error), title="Radar pose error")
+            return
+        save_flag = event == "radar_poses_save"
+        config.extrinsics_registry.set_radar_pose(
+            1, pose_1["offset_x_m"], pose_1["offset_y_m"], pose_1["yaw_deg"]
+        )
+        config.extrinsics_registry.set_radar_pose(
+            3, pose_3["offset_x_m"], pose_3["offset_y_m"], pose_3["yaw_deg"]
+        )
+        if save_flag:
+            config.extrinsics_registry.save()
+            send_cam.send(("extrinsics_reload", None))
+            config.refresh_calibration_badges()
+        send_radar.send((
+            "radar_extrinsics_update",
+            {"1": pose_1, "3": pose_3, "save": False},
+        ))
+        return
+    if event in ("radar_autofit_1", "radar_autofit_3"):
+        ch = 1 if event.endswith("_1") else 3
+        send_radar.send(("radar_auto_fit", {"channel": ch}))
+        return
+    if event == "calibration_reload_json":
+        config.refresh_calibration_badges()
+        pose_a = config.extrinsics_registry.get_radar_pose(1)
+        pose_c = config.extrinsics_registry.get_radar_pose(3)
+        config.update_radar_pose_inputs(1, pose_a.offset_x_m, pose_a.offset_y_m, pose_a.yaw_deg)
+        config.update_radar_pose_inputs(3, pose_c.offset_x_m, pose_c.offset_y_m, pose_c.yaw_deg)
+        send_radar.send(("radar_extrinsics_reload", None))
+        send_cam.send(("extrinsics_reload", None))
+        return
+    if event == "calibration_open_workbench":
+        if runtime.workbench is not None and not runtime.workbench.closed:
+            runtime.workbench.close()
+        target_ch = 1 if values.get("cal_pod_1") else 3
+        config.extrinsics_registry.reload()
+
+        def _request_live_pair(ch):
+            send_cam.send((
+                "calibration_capture",
+                {"request_id": uuid4().hex, "target_channel": int(ch)},
+            ))
+
+        def _on_saved(_ch, _res):
+            config.refresh_calibration_badges()
+            send_radar.send(("radar_extrinsics_reload", None))
+            send_cam.send(("extrinsics_reload", None))
+
+        runtime.workbench = CalibrationWorkbench(
+            config.extrinsics_registry,
+            target_channel=target_ch,
+            request_live_pair_cb=_request_live_pair,
+            on_saved_cb=_on_saved,
+        )
+        return
     if event == "snapshot_playback_toggle":
-        if not config.snapshot_playback and config.transposition:
-            _set_transposition(False, config, send_radar, send_cam)
+        if not config.snapshot_playback:
+            if config.transposition:
+                _set_transposition(False, config, send_radar, send_cam)
+            if config.global_map_active:
+                _set_global_map(False, values, config, send_radar)
         _request_snapshot_playback(
             values, config, runtime, send_radar, send_cam, send_snapshot_playback
         )
@@ -261,8 +415,11 @@ def _handle_gui_event(
         ))
         return
 
-    if event == "playback_toggle" and not config.playback and config.transposition:
-        _set_transposition(False, config, send_radar, send_cam)
+    if event == "playback_toggle" and not config.playback:
+        if config.transposition:
+            _set_transposition(False, config, send_radar, send_cam)
+        if config.global_map_active:
+            _set_global_map(False, values, config, send_radar)
 
     base._handle_gui_event(
         event, values, config, runtime,
@@ -309,6 +466,43 @@ def _apply_status_message(
     if message == "transposition_error":
         send_radar.send(("transposition", {"active": False}))
         config.change_transposition(False, f"ERROR · {payload}")
+        return
+    if message == "global_map_telemetry":
+        config.change_global_telemetry(payload)
+        return
+    if message == "radar_auto_fit_result":
+        ch = int(payload["channel"])
+        ox = float(payload["offset_x_m"])
+        oy = float(payload["offset_y_m"])
+        yaw = float(payload["yaw_deg"])
+        config.extrinsics_registry.set_radar_pose(ch, ox, oy, yaw)
+        config.update_radar_pose_inputs(ch, ox, oy, yaw)
+        pod = "A" if ch == 1 else "C"
+        config.window["global_overlap_status"].update(
+            f"Auto-fit {pod}: {payload.get('pairs', 0)} pairs, "
+            f"RMSE {payload.get('rmse_cm', 0.0):.1f} cm (SAVE POSES to persist)"
+        )
+        return
+    if message == "radar_auto_fit_error":
+        sg.popup_error(str(payload), title="Radar Auto-Fit error")
+        return
+    if message == "radar_extrinsics_error":
+        sg.popup_error(str(payload), title="Radar Pose error")
+        return
+    if message == "radar_extrinsics_saved":
+        return
+    if message == "calibration_camera_pair":
+        send_radar.send(("calibration_match_radar", payload))
+        return
+    if message == "calibration_pair_ready":
+        if runtime.workbench is not None and not runtime.workbench.closed:
+            runtime.workbench.receive_live_pair(payload)
+        return
+    if message == "calibration_capture_error":
+        if runtime.workbench is not None and not runtime.workbench.closed:
+            runtime.workbench.report_error(str(payload))
+        else:
+            sg.popup_error(str(payload), title="Calibration capture error")
         return
     if message == "camera_recording_rate_state":
         config.change_recording_rate(payload["frames_per_30"])
@@ -368,6 +562,11 @@ def _run_event_loop(
             all_queue, config, runtime,
             send_radar, send_cam, send_playback, send_snapshot_playback,
         )
+        if runtime.workbench is not None:
+            if not runtime.workbench.closed:
+                runtime.workbench.poll()
+            if runtime.workbench.closed:
+                runtime.workbench = None
 
 
 def parse_arguments(argv=None):
@@ -450,6 +649,8 @@ def main(argv=None):
             shutdown_event,
         )
     finally:
+        if runtime.workbench is not None and not runtime.workbench.closed:
+            runtime.workbench.close()
         try:
             base._shutdown(
                 processes,

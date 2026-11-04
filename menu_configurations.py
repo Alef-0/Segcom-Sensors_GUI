@@ -4,6 +4,7 @@ from pathlib import Path
 import FreeSimpleGUI as sg
 
 from interface_core import Configurations as BaseConfigurations
+from processing.visualization.multi_radar_fusion import MultiSensorRegistry
 
 
 class Configurations(BaseConfigurations):
@@ -19,6 +20,8 @@ class Configurations(BaseConfigurations):
         self.graph_x_range = 15
         self.graph_y_range = 15
         self.transposition = False
+        self.global_map_active = False
+        self.extrinsics_registry = MultiSensorRegistry()
         super().__init__()
 
     def centralize_combos(self):
@@ -269,12 +272,112 @@ class Configurations(BaseConfigurations):
             ],
         ]
 
+    def _create_global_map_layout(self):
+        """Build Frame 2 tab for 3-radar global map, health, co-detections, and SE(2) poses."""
+        pose_a = self.extrinsics_registry.get_radar_pose(1)
+        pose_c = self.extrinsics_registry.get_radar_pose(3)
+        return [
+            [
+                sg.Button(
+                    "ENABLE GLOBAL MAP",
+                    key="global_map_toggle",
+                    button_color=("white", "green"),
+                ),
+                sg.Text("Pods: A:-- | B:-- | C:--", key="global_map_health"),
+                sg.Push(),
+                sg.Text("Color:"),
+                sg.Radio("Pod", "global_color", key="global_color_pod", default=True, enable_events=True),
+                sg.Radio("Dynamic", "global_color", key="global_color_dyn", enable_events=True),
+                sg.Checkbox("Cones", key="global_show_cones", default=True, enable_events=True),
+                sg.Checkbox("Co-Det", key="global_show_codet", default=True, enable_events=True),
+                sg.Text("Gate(m):"),
+                sg.Input("0.50", key="global_codet_gate", size=(5, 1), justification="right"),
+            ],
+            [sg.HorizontalSeparator()],
+            [
+                sg.Text("Left A  (vs B):", size=(13, 1)),
+                sg.Text("X"),
+                sg.Input(f"{pose_a.offset_x_m:.2f}", key="radar_pose_x_1", size=(6, 1), justification="right"),
+                sg.Text("m   Y"),
+                sg.Input(f"{pose_a.offset_y_m:.2f}", key="radar_pose_y_1", size=(6, 1), justification="right"),
+                sg.Text("m   Yaw (-L/+R)"),
+                sg.Input(f"{pose_a.yaw_deg:.1f}", key="radar_pose_yaw_1", size=(6, 1), justification="right"),
+                sg.Text("°"),
+                sg.Push(),
+                sg.Button("AUTO-FIT A", key="radar_autofit_1"),
+            ],
+            [
+                sg.Text("Right C (vs B):", size=(13, 1)),
+                sg.Text("X"),
+                sg.Input(f"{pose_c.offset_x_m:.2f}", key="radar_pose_x_3", size=(6, 1), justification="right"),
+                sg.Text("m   Y"),
+                sg.Input(f"{pose_c.offset_y_m:.2f}", key="radar_pose_y_3", size=(6, 1), justification="right"),
+                sg.Text("m   Yaw (-L/+R)"),
+                sg.Input(f"{pose_c.yaw_deg:.1f}", key="radar_pose_yaw_3", size=(6, 1), justification="right"),
+                sg.Text("°"),
+                sg.Push(),
+                sg.Button("AUTO-FIT C", key="radar_autofit_3"),
+            ],
+            [
+                sg.Button("APPLY POSES", key="radar_poses_apply"),
+                sg.Button("SAVE POSES", key="radar_poses_save"),
+                sg.Checkbox("Accumulate Co-Detections", key="global_accumulate_pairs", default=False, enable_events=True),
+                sg.Button("CLEAR PAIRS", key="global_clear_pairs"),
+                sg.Push(),
+                sg.Text("Co-Det: A↔B -- | C↔B --", key="global_overlap_status"),
+            ],
+        ]
+
+    def _create_calibration_layout(self):
+        """Build Frame 2 tab for launching common-point lateral camera extrinsic calibration."""
+        return [
+            [
+                sg.Text(
+                    "Lateral Camera Extrinsic Calibration (Shares Middle Camera B Intrinsics; camera_matrixes.json kept untouched)",
+                    expand_x=True,
+                    justification="center",
+                ),
+            ],
+            [sg.HorizontalSeparator()],
+            [
+                sg.Push(),
+                sg.Text("Target Pod:"),
+                sg.Radio("Left A", "cal_target_pod", key="cal_pod_1"),
+                sg.Radio("Right C", "cal_target_pod", key="cal_pod_3", default=True),
+                sg.VSep(),
+                sg.Button(
+                    "OPEN CALIBRATION WORKBENCH",
+                    key="calibration_open_workbench",
+                    button_color=("white", "green"),
+                ),
+                sg.Button("RELOAD EXTRINSICS JSON", key="calibration_reload_json"),
+                sg.Push(),
+            ],
+            [
+                sg.Push(),
+                sg.Text(self.extrinsics_registry.camera_status_summary(1), key="cal_status_1"),
+                sg.VSep(),
+                sg.Text(self.extrinsics_registry.camera_status_summary(3), key="cal_status_3"),
+                sg.Push(),
+            ],
+            [
+                sg.Text(
+                    "Supports Ground Z=0, Radar-Anchored 3D (feet/head), Outer Radar->Cam, and SIFT Overlap common points.",
+                    key="calibration_hint_status",
+                    expand_x=True,
+                    justification="center",
+                ),
+            ],
+        ]
+
     def create_radar_control(self):
         tabs = [[
             sg.Tab("Configurations", self.options),
             sg.Tab("Record", self._create_record_layout()),
             sg.Tab("Snapshots", self._create_snapshot_layout()),
             sg.Tab("Display", self._create_general_configurations_layout()),
+            sg.Tab("Global Map", self._create_global_map_layout()),
+            sg.Tab("Calibration", self._create_calibration_layout()),
         ]]
         self.radar_control = sg.Frame(
             "General Control",
@@ -289,12 +392,16 @@ class Configurations(BaseConfigurations):
         return [
             [
                 sg.Push(),
-                sg.Text("Camera B + Radar B"),
+                sg.Text("Active Camera (A / B / C)"),
                 sg.Button(
                     "ENABLE TRANSPOSITION",
                     key="transposition_toggle",
                     button_color=("white", "green"),
                 ),
+                sg.VSep(),
+                sg.Text("Source:"),
+                sg.Radio("Pod Radar", "transposition_src", key="transposition_src_local", default=True, enable_events=True),
+                sg.Radio("Global Map (A+B+C)", "transposition_src", key="transposition_src_global", enable_events=True),
                 sg.Push(),
             ],
             [
@@ -426,14 +533,9 @@ class Configurations(BaseConfigurations):
             self.window[key].update(disabled=live_blocked or self.snapshot_pending)
         for channel in range(1, 4):
             self.window[f"choose_{channel}"].update(disabled=False)
-        self.window["transposition_toggle"].update(
-            disabled=(
-                self.playback
-                or self.playback_pending
-                or self.snapshot_playback
-                or self.snapshot_playback_pending
-            )
-        )
+        self.window["transposition_toggle"].update(disabled=live_blocked)
+        self.window["global_map_toggle"].update(disabled=live_blocked)
+        self.window["calibration_open_workbench"].update(disabled=live_blocked)
 
     def change_received_messages(self, message_ids):
         messages = ", ".join(f"0x{message_id:03X}" for message_id in message_ids) or "--"
@@ -556,12 +658,52 @@ class Configurations(BaseConfigurations):
         )
         if message is None:
             message = (
-                "ON · GROUP B · waiting for camera and radar frames"
+                "ON · waiting for camera and radar frames"
                 if self.transposition
                 else "OFF · camera points use the current radar filters and distance cutoff"
             )
         self.window["transposition_status"].update(message)
         self._refresh_mode_controls()
+
+    def change_global_map(self, active):
+        self.global_map_active = bool(active)
+        self.window["global_map_toggle"].update(
+            "DISABLE GLOBAL MAP" if self.global_map_active else "ENABLE GLOBAL MAP",
+            button_color=("white", "red" if self.global_map_active else "green"),
+        )
+        if not self.global_map_active:
+            self.window["global_map_health"].update("Pods: A:-- | B:-- | C:--")
+            self.window["global_overlap_status"].update("Co-Det: A↔B -- | C↔B --")
+        self._refresh_mode_controls()
+
+    def change_global_telemetry(self, payload):
+        ch_map = payload.get("channels") or {}
+        parts = []
+        for ch, pod in ((1, "A"), (2, "B"), (3, "C")):
+            st = ch_map.get(ch) or ch_map.get(str(ch)) or {}
+            parts.append(f"{pod}:ON({st.get('count', 0)})" if st.get("online") else f"{pod}:OFF")
+        self.window["global_map_health"].update("Pods: " + " | ".join(parts))
+
+        ab_n = payload.get("ab_count", 0)
+        cb_n = payload.get("cb_count", 0)
+        ab_rmse = payload.get("ab_rmse_cm")
+        cb_rmse = payload.get("cb_rmse_cm")
+        ab_txt = f"{ab_n} ({ab_rmse:.1f} cm)" if ab_rmse is not None else str(ab_n)
+        cb_txt = f"{cb_n} ({cb_rmse:.1f} cm)" if cb_rmse is not None else str(cb_n)
+        self.window["global_overlap_status"].update(f"Co-Det: A↔B {ab_txt} | C↔B {cb_txt}")
+
+    def update_radar_pose_inputs(self, channel, offset_x_m, offset_y_m, yaw_deg):
+        ch = int(channel)
+        if ch not in (1, 3):
+            return
+        self.window[f"radar_pose_x_{ch}"].update(f"{float(offset_x_m):.2f}")
+        self.window[f"radar_pose_y_{ch}"].update(f"{float(offset_y_m):.2f}")
+        self.window[f"radar_pose_yaw_{ch}"].update(f"{float(yaw_deg):.1f}")
+
+    def refresh_calibration_badges(self):
+        self.extrinsics_registry.reload()
+        self.window["cal_status_1"].update(self.extrinsics_registry.camera_status_summary(1))
+        self.window["cal_status_3"].update(self.extrinsics_registry.camera_status_summary(3))
 
     def change_recording_rate(self, frames_per_30):
         self.window["recording_rate_status"].update(

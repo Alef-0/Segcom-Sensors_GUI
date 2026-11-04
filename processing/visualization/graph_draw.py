@@ -4,6 +4,7 @@ import cv2 as cv
 import numpy as np
 
 from processing.visualization.filter_schema import DYNAMIC_PROPERTY_OPTIONS
+from processing.visualization.multi_radar_fusion import CHANNEL_TO_POD, POD_COLORS_BGR
 
 # Frame dimensions
 WIDTH = 800
@@ -237,10 +238,14 @@ class Graph_radar():
             ),
         )
         point = closest["point"]
+        pod = closest.get("pod")
+        prefix = f"pod={pod} | " if pod else ""
         details = (
-            f"x={closest['x']:.2f} m | y={closest['y']:.2f} m | "
+            f"{prefix}x={closest['x']:.2f} m | y={closest['y']:.2f} m | "
             f"class={self._dynamic_class(point)} | rcs={self._format_rcs(point)}"
         )
+        if "local_x" in closest and "local_y" in closest:
+            details += f" | local=({closest['local_x']:.2f}, {closest['local_y']:.2f}) m"
         object_class = self._object_class(point)
         if object_class:
             details += f" | object_class={object_class}"
@@ -268,6 +273,136 @@ class Graph_radar():
         cv.namedWindow("RADAR")
         cv.setMouseCallback("RADAR", self._on_mouse)
         cv.imshow("RADAR", new_img)
+        cv.waitKey(1)
+
+    def _draw_sensor_cone(self, image, pose, color, *, online=True, fov_half_deg=60.0):
+        """Render a radar pod origin marker and rotated FoV cone on the global canvas."""
+        origin_px = self.graph_to_pixel(pose.offset_x_m, pose.offset_y_m)
+        if not online:
+            cv.circle(image, origin_px, 5, (150, 150, 150), 2)
+            cv.putText(
+                image,
+                f"{pose.pod}:OFF",
+                (origin_px[0] - 18, origin_px[1] + 16),
+                cv.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                (130, 130, 130),
+                1,
+            )
+            return
+
+        cone_range = min(float(self.distance_cutoff), math.hypot(self.x_range, self.y_range))
+        angles = np.linspace(-fov_half_deg, fov_half_deg, 25)
+        arc_local = np.column_stack([
+            cone_range * np.sin(np.radians(angles)),
+            cone_range * np.cos(np.radians(angles)),
+        ])
+        arc_uni = pose.transform_xy(arc_local)
+        poly_pts = [origin_px, *[self.graph_to_pixel(float(px), float(py)) for px, py in arc_uni]]
+        poly_arr = np.asarray(poly_pts, dtype=np.int32).reshape(-1, 1, 2)
+
+        overlay = image.copy()
+        cv.fillPoly(overlay, [poly_arr], color)
+        cv.addWeighted(overlay, 0.08, image, 0.92, 0, image)
+        cv.line(image, origin_px, poly_pts[1], color, 1)
+        cv.line(image, origin_px, poly_pts[-1], color, 1)
+        cv.polylines(image, [np.asarray(poly_pts[1:], dtype=np.int32).reshape(-1, 1, 2)], False, color, 1)
+        cv.circle(image, origin_px, 6, color, -1)
+        cv.circle(image, origin_px, 6, (0, 0, 0), 1)
+        cv.putText(
+            image,
+            pose.pod,
+            (origin_px[0] - 5, origin_px[1] - 9),
+            cv.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            color,
+            2,
+        )
+
+    def render_global_image(self, snapshot, *, show_cones=True, show_co_detections=True):
+        """Render a GlobalRadarSnapshot onto a fresh BGR canvas without calling imshow."""
+        canvas = self.create_base_image()
+        for distance in self._positive_ticks(self.y_range, 15):
+            self._draw_range_arc(canvas, distance, (220, 220, 220), 1)
+
+        if show_cones:
+            for ch in (1, 2, 3):
+                pose = snapshot.poses.get(ch)
+                if pose is None:
+                    continue
+                online = bool(snapshot.channel_status.get(ch, {}).get("online", False))
+                self._draw_sensor_cone(canvas, pose, POD_COLORS_BGR[ch], online=online)
+
+        self.displayed_points = []
+        for idx in range(len(snapshot.unified_xy)):
+            ux, uy = float(snapshot.unified_xy[idx, 0]), float(snapshot.unified_xy[idx, 1])
+            lx, ly = float(snapshot.local_xy[idx, 0]), float(snapshot.local_xy[idx, 1])
+            color = snapshot.colors[idx]
+            ch = snapshot.channels[idx]
+            pixel = self.graph_to_pixel(ux, uy)
+            if self.margin <= pixel[0] <= self.width - self.margin and self.margin <= pixel[1] <= self.height - self.margin:
+                cv.circle(canvas, pixel, 5, (255, 255, 255), 1)
+                cv.circle(canvas, pixel, 4, color, -1)
+            self.displayed_points.append({
+                "pixel": pixel,
+                "x": ux,
+                "y": uy,
+                "local_x": lx,
+                "local_y": ly,
+                "pod": CHANNEL_TO_POD.get(ch, str(ch)),
+                "channel": ch,
+                "point": snapshot.points[idx] if idx < len(snapshot.points) else None,
+            })
+
+        if show_co_detections:
+            for matches in snapshot.co_detections.values():
+                for match in matches:
+                    px_ref = self.graph_to_pixel(*match["ref_xy"])
+                    px_tgt = self.graph_to_pixel(*match["tgt_xy"])
+                    cv.circle(canvas, px_ref, 8, (0, 180, 0), 1)
+                    cv.circle(canvas, px_tgt, 8, (0, 180, 0), 1)
+                    cv.line(canvas, px_ref, px_tgt, (0, 180, 0), 2)
+                    mid = ((px_ref[0] + px_tgt[0]) // 2 + 4, (px_ref[1] + px_tgt[1]) // 2 - 4)
+                    cv.putText(
+                        canvas,
+                        f"{match['distance_m'] * 100.0:.0f}cm",
+                        mid,
+                        cv.FONT_HERSHEY_SIMPLEX,
+                        0.36,
+                        (0, 130, 0),
+                        1,
+                    )
+
+        hud_parts = ["GLOBAL"]
+        for ch in (1, 2, 3):
+            st = snapshot.channel_status.get(ch, {})
+            pod = CHANNEL_TO_POD[ch]
+            hud_parts.append(f"{pod}:{'ON(' + str(st.get('count', 0)) + ')' if st.get('online') else 'OFF'}")
+        n_ab = len(snapshot.co_detections.get("AB", ()))
+        n_cb = len(snapshot.co_detections.get("CB", ()))
+        if show_co_detections and (n_ab or n_cb):
+            hud_parts.append(f"CoDet AB:{n_ab} CB:{n_cb}")
+        cv.putText(
+            canvas,
+            " | ".join(hud_parts),
+            (self.margin // 2 + 6, 20),
+            cv.FONT_HERSHEY_SIMPLEX,
+            0.44,
+            (20, 20, 20),
+            1,
+        )
+        return canvas
+
+    def show_global_snapshot(self, snapshot, *, show_cones=True, show_co_detections=True):
+        """Render and display fused 3-radar global map on the OpenCV RADAR window."""
+        canvas = self.render_global_image(
+            snapshot,
+            show_cones=show_cones,
+            show_co_detections=show_co_detections,
+        )
+        cv.namedWindow("RADAR")
+        cv.setMouseCallback("RADAR", self._on_mouse)
+        cv.imshow("RADAR", canvas)
         cv.waitKey(1)
 
     def close(self):

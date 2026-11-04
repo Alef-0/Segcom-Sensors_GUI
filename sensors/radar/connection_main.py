@@ -1,8 +1,10 @@
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import math
 import queue
 import signal
+import time
 
 import cv2 as cv
 
@@ -26,9 +28,13 @@ from sensors.radar.object_messages import (
 )
 from processing.visualization.graph_draw import Graph_radar
 from processing.visualization.graph_filter import Filter_graph
+from processing.visualization.multi_radar_fusion import (
+    ChannelFrameCache,
+    MultiSensorRegistry,
+)
 from processing.visualization.transposition import (
-    RADAR_GROUP_B,
     clear_latest,
+    global_transposition_payload,
     put_latest,
     transposition_payload,
 )
@@ -164,6 +170,18 @@ def create_connection_communication(
     recording_ready: dict[int, bool] = {}
     received_message_ids: set[int] = set()
     transposition_active = False
+    transposition_source = "local"
+    transposition_group = int(radar_choice)
+    global_map_active = bool(initial_values.get("global_map_active", False))
+    global_color_by_pod = bool(initial_values.get("global_color_pod", True))
+    global_show_cones = bool(initial_values.get("global_show_cones", True))
+    global_show_codet = bool(initial_values.get("global_show_codet", True))
+    global_codet_gate_m = 0.50
+    global_accumulate_pairs = False
+    last_global_render_mono = 0.0
+    last_global_telemetry_mono = 0.0
+    registry = MultiSensorRegistry()
+    global_cache = ChannelFrameCache()
     graph = Graph_radar(
         initial_values.get("point_cutoff", 15.0),
         initial_values.get("graph_width", 800),
@@ -172,6 +190,47 @@ def create_connection_communication(
         initial_values.get("graph_y_range", 15.0),
     )
     filters = Filter_graph(initial_values)
+
+    def _emit_global_telemetry(snapshot, now_mono, *, force=False):
+        nonlocal last_global_telemetry_mono
+        if not force and (now_mono - last_global_telemetry_mono) < 0.25:
+            return
+        last_global_telemetry_mono = now_mono
+        ab = snapshot.co_detections.get("AB", ())
+        cb = snapshot.co_detections.get("CB", ())
+        rmse_ab = math.sqrt(sum(m["distance_m"] ** 2 for m in ab) / len(ab)) if ab else None
+        rmse_cb = math.sqrt(sum(m["distance_m"] ** 2 for m in cb) / len(cb)) if cb else None
+        _put_status(pool, "global_map_telemetry", {
+            "channels": snapshot.channel_status,
+            "ab_count": len(ab),
+            "cb_count": len(cb),
+            "ab_rmse_cm": None if rmse_ab is None else rmse_ab * 100.0,
+            "cb_rmse_cm": None if rmse_cb is None else rmse_cb * 100.0,
+        })
+
+    def _refresh_global_view(*, force=False):
+        nonlocal last_global_render_mono
+        now_mono = time.monotonic()
+        if not force and (now_mono - last_global_render_mono) < 0.045:
+            return None
+        last_global_render_mono = now_mono
+        snap = global_cache.build_snapshot(
+            registry,
+            distance_cutoff=graph.distance_cutoff,
+            color_by_pod=global_color_by_pod,
+            compute_overlap=global_show_codet or global_accumulate_pairs,
+            dist_gate_m=global_codet_gate_m,
+            accumulate_pairs=global_accumulate_pairs,
+            now_monotonic=now_mono,
+        )
+        if global_map_active and connection.connected:
+            graph.show_global_snapshot(
+                snap,
+                show_cones=global_show_cones,
+                show_co_detections=global_show_codet,
+            )
+            _emit_global_telemetry(snap, now_mono, force=force)
+        return snap
 
     def report_progress(channel, count):
         _put_status(pool, "recording_progress", {"channel": channel, "count": count})
@@ -199,31 +258,54 @@ def create_connection_communication(
         if previous_type is not None:
             previous_messages = frame_messages(channel, previous_type)
             points = previous_messages.snapshot()
-            filtered_points = ()
-            colors = ()
-            if channel == radar_choice or (
-                transposition_active and channel == RADAR_GROUP_B
-            ):
-                if previous_type == "cluster":
-                    x, y, colors = filters.filter_point_sequence(points)
-                else:
-                    x, y, colors = filters.filter_object_sequence(points)
-                filtered_points = filters.last_points
+            if previous_type == "cluster":
+                x, y, colors = filters.filter_point_sequence(points)
+            else:
+                x, y, colors = filters.filter_object_sequence(points)
+            filtered_points = filters.last_points
+            global_cache.update_channel(
+                channel,
+                filtered_points,
+                colors,
+                frame_type=previous_type,
+                recorded_at=frame_timestamps[channel],
+            )
 
-            if channel == radar_choice:
-                graph.show_points(x, y, colors, filters.last_points)
+            snap = None
+            if global_map_active:
+                snap = _refresh_global_view()
+            elif channel == radar_choice:
+                graph.show_points(x, y, colors, filtered_points)
 
-            if transposition_active and channel == RADAR_GROUP_B:
-                put_latest(
-                    transposition_channel,
-                    transposition_payload(
-                        filtered_points,
-                        colors,
-                        frame_type=previous_type,
-                        recorded_at=frame_timestamps[channel],
-                        distance_cutoff=graph.distance_cutoff,
-                    ),
-                )
+            if transposition_active:
+                if transposition_source == "global":
+                    if snap is None:
+                        snap = global_cache.build_snapshot(
+                            registry,
+                            distance_cutoff=graph.distance_cutoff,
+                            color_by_pod=global_color_by_pod,
+                            compute_overlap=False,
+                        )
+                    put_latest(
+                        transposition_channel,
+                        global_transposition_payload(
+                            snap,
+                            recorded_at=frame_timestamps[channel],
+                            frame_type=previous_type,
+                        ),
+                    )
+                elif channel == transposition_group:
+                    put_latest(
+                        transposition_channel,
+                        transposition_payload(
+                            filtered_points,
+                            colors,
+                            frame_type=previous_type,
+                            recorded_at=frame_timestamps[channel],
+                            distance_cutoff=graph.distance_cutoff,
+                            group=channel,
+                        ),
+                    )
 
             frame = RadarFrame(
                 recorded_at=frame_timestamps[channel],
@@ -248,6 +330,80 @@ def create_connection_communication(
         frame_timestamps[channel] = recorded_at
         if channel in recording.channels:
             recording_ready[channel] = True
+
+    def _serialize_radar_points_for_calibration(channel, target_time):
+        """Return filtered unified-B and local radar targets closest to target_time for calibration."""
+        history = frame_history.get(channel)
+        if not connection.connected or not history:
+            return (), None
+        frame = min(history, key=lambda item: abs((item.recorded_at - target_time).total_seconds()))
+        sync_err = abs((frame.recorded_at - target_time).total_seconds())
+        if sync_err > MAX_SNAPSHOT_SYNC_ERROR_SECONDS:
+            return (), sync_err
+        if frame.frame_type == "cluster":
+            _, _, cols = filters.filter_point_sequence(frame.points)
+        else:
+            _, _, cols = filters.filter_object_sequence(frame.points)
+        f_pts = filters.last_points
+        pose = registry.get_radar_pose(channel)
+        serialized = []
+        for pt, col in zip(f_pts, cols):
+            lat, lon = pt.dist_latitude, pt.dist_long
+            if lat is None or lon is None or not (math.isfinite(lat) and math.isfinite(lon)):
+                continue
+            if math.hypot(lat, lon) > graph.distance_cutoff:
+                continue
+            uni = pose.transform_xy([[lat, lon]])[0]
+            serialized.append({
+                "channel": int(channel),
+                "local_lat": float(lat),
+                "local_long": float(lon),
+                "unified_lat_b": float(uni[0]),
+                "unified_long_b": float(uni[1]),
+                "rcs": getattr(pt, "rcs", None),
+                "color": tuple(int(c) for c in col),
+            })
+        return tuple(serialized), sync_err
+
+    def match_calibration_radar(values):
+        target_ch = int(values.get("target_channel", 3))
+        cam_b_time = datetime.fromisoformat(values["captured_at_b"]) - timedelta(seconds=camera_delay_seconds)
+        cam_s_time = datetime.fromisoformat(values["captured_at_s"]) - timedelta(seconds=camera_delay_seconds)
+        pts_b, err_b = _serialize_radar_points_for_calibration(2, cam_b_time)
+        pts_s, err_s = _serialize_radar_points_for_calibration(target_ch, cam_s_time)
+        result = dict(values)
+        result["radar_points_b"] = pts_b
+        result["radar_points_s"] = pts_s
+        result["radar_sync_ms_b"] = None if err_b is None else round(err_b * 1000.0, 1)
+        result["radar_sync_ms_s"] = None if err_s is None else round(err_s * 1000.0, 1)
+        _put_status(pool, "calibration_pair_ready", result, critical=True)
+
+    def handle_radar_auto_fit(values):
+        ch = int(values.get("channel", 3))
+        try:
+            # Feed current live co-detections first so stationary scenes work immediately
+            _refresh_global_view(force=True)
+            snap = global_cache.build_snapshot(
+                registry,
+                distance_cutoff=graph.distance_cutoff,
+                color_by_pod=True,
+                compute_overlap=True,
+                dist_gate_m=max(global_codet_gate_m, 1.5),
+                accumulate_pairs=True,
+            )
+            pose, rmse_m, count = global_cache.solve_accumulated_se2(ch)
+            registry.set_radar_pose(ch, pose.offset_x_m, pose.offset_y_m, pose.yaw_deg)
+            _put_status(pool, "radar_auto_fit_result", {
+                "channel": ch,
+                "offset_x_m": pose.offset_x_m,
+                "offset_y_m": pose.offset_y_m,
+                "yaw_deg": pose.yaw_deg,
+                "rmse_cm": rmse_m * 100.0,
+                "pairs": count,
+            }, critical=True)
+            _refresh_global_view(force=True)
+        except Exception as error:
+            _put_status(pool, "radar_auto_fit_error", str(error), critical=True)
 
     def save_manual_snapshot(values):
         request_id = values.get("request_id")
@@ -313,6 +469,7 @@ def create_connection_communication(
                     elif event == "conn_radar":
                         connection.change_connection()
                         received_message_ids.clear()
+                        global_cache.clear()
                         _put_status(pool, "received_messages", ())
                         _put_status(pool, "change_radar", connection.connected, critical=True)
                         cv.destroyAllWindows()
@@ -323,11 +480,54 @@ def create_connection_communication(
                     elif event == "save_nvm" and connection.connected:
                         send_configuration_message(values, connection, True)
                     elif event == "choose":
-                        radar_choice = values
+                        radar_choice = int(values)
+                        transposition_group = int(values)
                     elif event == "transposition":
                         transposition_active = bool(values.get("active"))
+                        transposition_source = str(values.get("source", transposition_source))
+                        if "group" in values and values["group"] is not None:
+                            transposition_group = int(values["group"])
                         if not transposition_active:
                             clear_latest(transposition_channel)
+                    elif event == "global_map_settings":
+                        global_map_active = bool(values.get("active", global_map_active))
+                        global_color_by_pod = bool(values.get("color_by_pod", global_color_by_pod))
+                        global_show_cones = bool(values.get("show_cones", global_show_cones))
+                        global_show_codet = bool(values.get("show_codet", global_show_codet))
+                        global_codet_gate_m = float(values.get("codet_gate_m", global_codet_gate_m))
+                        if "accumulate_pairs" in values:
+                            global_accumulate_pairs = bool(values["accumulate_pairs"])
+                        if values.get("clear_accumulated"):
+                            global_cache.clear_accumulated_pairs()
+                        if global_map_active and connection.connected:
+                            _refresh_global_view(force=True)
+                    elif event == "radar_extrinsics_update":
+                        try:
+                            for ch in (1, 3):
+                                item = values.get(str(ch)) or values.get(ch)
+                                if isinstance(item, dict):
+                                    registry.set_radar_pose(
+                                        ch,
+                                        float(item.get("offset_x_m", 0.0)),
+                                        float(item.get("offset_y_m", 0.0)),
+                                        float(item.get("yaw_deg", 0.0)),
+                                        float(item.get("offset_z_m", 0.0)),
+                                    )
+                            if values.get("save"):
+                                registry.save()
+                            _put_status(pool, "radar_extrinsics_saved", {"saved": bool(values.get("save"))})
+                            if global_map_active and connection.connected:
+                                _refresh_global_view(force=True)
+                        except Exception as error:
+                            _put_status(pool, "radar_extrinsics_error", str(error), critical=True)
+                    elif event == "radar_extrinsics_reload":
+                        registry.reload()
+                        if global_map_active and connection.connected:
+                            _refresh_global_view(force=True)
+                    elif event == "radar_auto_fit":
+                        handle_radar_auto_fit(values or {})
+                    elif event == "calibration_match_radar":
+                        match_calibration_radar(values)
                     elif event == "record_start":
                         try:
                             folders = recording.start(values["folder"], values["channels"])
@@ -396,6 +596,8 @@ def create_connection_communication(
                 continue
 
             connection.read_chunk()
+            if global_map_active and (time.monotonic() - last_global_render_mono) >= 0.20:
+                _refresh_global_view(force=True)
             while connection.can_create_can():
                 message = connection.create_package()
                 channel = message.canChannel

@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "reference_pod": "B",
+  "angle_convention": "yaw_deg: negative is left (-X), positive is right (+X)",
+  "radars": {
+    "A": {
+      "offset_x_m": -0.25,
+      "offset_y_m": 0.0,
+      "offset_z_m": 0.0,
+      "yaw_deg": 0.0
+    },
+    "B": {
+      "offset_x_m": 0.0,
+      "offset_y_m": 0.0,
+      "offset_z_m": 0.0,
+      "yaw_deg": 0.0
+    },
+    "C": {
+      "offset_x_m": 0.25,
+      "offset_y_m": 0.0,
+      "offset_z_m": 0.0,
+      "yaw_deg": 0.0
+    }
+  },
+  "lateral_cameras": {
+    "A": {
+      "calibrated": false,
+      "solver_mode": "prior",
+      "prior_mode": "camera_b_shift",
+      "camera_shift_from_b_m": {
+        "d_long_m": 0.0,
+        "d_lat_m": -0.25,
+        "d_down_m": 0.0
+      },
+      "rmse_px": null,
+      "updated_at": null,
+      "extrinsic_from_radar_b": null,
+      "extrinsic_from_local_radar": null
+    },
+    "C": {
+      "calibrated": false,
+      "solver_mode": "prior",
+      "prior_mode": "camera_b_shift",
+      "camera_shift_from_b_m": {
+        "d_long_m": 0.0,
+        "d_lat_m": 0.25,
+        "d_down_m": 0.0
+      },
+      "rmse_px": null,
+      "updated_at": null,
+      "extrinsic_from_radar_b": null,
+      "extrinsic_from_local_radar": null
+    }
+  }
+}

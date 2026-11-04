@@ -10,6 +10,7 @@ import gi
 from processing import CameraSnapshotRecorder
 from processing.recording.camera_snapshot_recorder import CAMERA_FRAME_RATE as RECORDER_FRAME_RATE
 from processing.visualization.transposition import (
+    MultiGroupCameraOverlay,
     RADAR_GROUP_B,
     RadarCameraOverlay,
     clear_latest,
@@ -41,6 +42,23 @@ NTP_UI_UPDATE_INTERVAL_SECONDS = 0.1
 _RESULT_FAILURE = "failure"
 _RESULT_RESTART = "restart"
 _RESULT_CLOSED = "closed"
+CALIBRATION_CAPTURE_TIMEOUT_SECONDS = 6.0
+
+
+class _SingleFrameGrabber:
+    """Minimal recorder adapter capturing a single valid timestamped frame from ChannelCaptureStream."""
+
+    def __init__(self):
+        self.frame = None
+        self.captured_at = None
+
+    def note_invalid_timing_frame(self):
+        pass
+
+    def submit(self, frame, *, captured_at, timing=None):
+        if self.frame is None:
+            self.frame = frame.copy()
+            self.captured_at = captured_at
 
 
 class GStreamerPipeline:
@@ -97,14 +115,16 @@ class GStreamerPipeline:
         self._pending_pts_gap_candidates = 0
         self._manual_snapshot_lock = threading.Lock()
         self._pending_manual_snapshot: dict | None = None
+        self._calibration_capture: dict | None = None
         self.transposition_channel = transposition_channel
         self.transposition_active = False
+        self.transposition_source = "local"
         self.transposition_payload = None
         self.capture_size: tuple[int, int] | None = None
         self.transposition_overlay = None
         self.transposition_error = None
         try:
-            self.transposition_overlay = RadarCameraOverlay.from_json()
+            self.transposition_overlay = MultiGroupCameraOverlay()
         except Exception as error:
             self.transposition_error = str(error).strip() or type(error).__name__
 
@@ -134,8 +154,22 @@ class GStreamerPipeline:
         self._put_status("camera_recording_drop", payload)
         self._last_writer_drop_warning = now
 
+    def _emit_transposition_status(self):
+        if not self.transposition_active or self.transposition_overlay is None:
+            msg = "OFF · camera points use the current radar filters and distance cutoff"
+        else:
+            msg = self.transposition_overlay.status_for_channel(
+                self.channel,
+                self.transposition_source,
+            )
+        self._put_status(
+            "transposition_state",
+            {"active": self.transposition_active, "message": msg},
+        )
+
     def _set_transposition(self, value):
         active = bool(value.get("active"))
+        self.transposition_source = str(value.get("source", self.transposition_source))
         if active and self.transposition_overlay is None:
             self.transposition_active = False
             self.transposition_payload = None
@@ -147,17 +181,110 @@ class GStreamerPipeline:
         if not active:
             self.transposition_payload = None
             clear_latest(self.transposition_channel)
-        self._put_status(
-            "transposition_state",
-            {
-                "active": active,
-                "message": (
-                    "ON · GROUP B · camera matrix loaded"
-                    if active
-                    else "OFF · camera points use the current radar filters and distance cutoff"
-                ),
-            },
-        )
+        self._emit_transposition_status()
+
+    def _reload_extrinsics(self):
+        try:
+            if self.transposition_overlay is None:
+                self.transposition_overlay = MultiGroupCameraOverlay()
+            else:
+                self.transposition_overlay.reload()
+            self.transposition_error = None
+            if self.transposition_active:
+                self._emit_transposition_status()
+        except Exception as error:
+            self.transposition_error = str(error)
+
+    def _stop_calibration_capture(self):
+        cap = self._calibration_capture
+        self._calibration_capture = None
+        if not cap:
+            return
+        for stream in cap["streams"].values():
+            try:
+                stream.stop()
+            except Exception:
+                pass
+
+    def _start_calibration_capture(self, value):
+        self._stop_calibration_capture()
+        if not self.connected:
+            self._put_status(
+                "calibration_capture_error",
+                "Connect the camera before capturing a live calibration pair",
+            )
+            return
+        target_ch = int(value.get("target_channel", 3))
+        if target_ch not in (1, 3):
+            self._put_status("calibration_capture_error", f"Invalid lateral pod channel: {target_ch}")
+            return
+        grabbers = {2: _SingleFrameGrabber(), target_ch: _SingleFrameGrabber()}
+        streams = {
+            ch: ChannelCaptureStream(
+                ch,
+                grabber,
+                url=self.create_url(ch),
+                decoder_backend=self.current_decoder_backend,
+                latency_ms=self.pipeline_latency_ms,
+            )
+            for ch, grabber in grabbers.items()
+        }
+        for stream in streams.values():
+            stream.start()
+        self._calibration_capture = {
+            "request_id": value.get("request_id"),
+            "target_channel": target_ch,
+            "started_at": time.monotonic(),
+            "grabbers": grabbers,
+            "streams": streams,
+        }
+
+    def _poll_calibration_capture(self):
+        cap = self._calibration_capture
+        if not cap:
+            return
+        if not self.connected:
+            self._stop_calibration_capture()
+            self._put_status("calibration_capture_error", "Camera disconnected during calibration capture")
+            return
+        for stream in cap["streams"].values():
+            stream.poll()
+        g_b = cap["grabbers"][2]
+        target_ch = cap["target_channel"]
+        g_s = cap["grabbers"][target_ch]
+        if g_b.frame is not None and g_s.frame is not None:
+            self._stop_calibration_capture()
+            ok_b, jpg_b = cv.imencode(".jpg", g_b.frame, [int(cv.IMWRITE_JPEG_QUALITY), 95])
+            ok_s, jpg_s = cv.imencode(".jpg", g_s.frame, [int(cv.IMWRITE_JPEG_QUALITY), 95])
+            if not (ok_b and ok_s):
+                self._put_status("calibration_capture_error", "Failed to encode captured calibration frames")
+                return
+            self._put_status(
+                "calibration_camera_pair",
+                {
+                    "request_id": cap["request_id"],
+                    "target_channel": target_ch,
+                    "image_b_bytes": jpg_b.tobytes(),
+                    "image_s_bytes": jpg_s.tobytes(),
+                    "size_b": (int(g_b.frame.shape[1]), int(g_b.frame.shape[0])),
+                    "size_s": (int(g_s.frame.shape[1]), int(g_s.frame.shape[0])),
+                    "captured_at_b": g_b.captured_at.isoformat(timespec="microseconds"),
+                    "captured_at_s": g_s.captured_at.isoformat(timespec="microseconds"),
+                },
+                timeout=1.0,
+            )
+            return
+        if time.monotonic() - cap["started_at"] >= CALIBRATION_CAPTURE_TIMEOUT_SECONDS:
+            missing = [
+                {1: "A", 2: "B", 3: "C"}[ch]
+                for ch, g in cap["grabbers"].items()
+                if g.frame is None
+            ]
+            self._stop_calibration_capture()
+            self._put_status(
+                "calibration_capture_error",
+                f"Timed out waiting for camera pod(s): {', '.join(missing)}",
+            )
 
     def _report_unusual_pts_gap(self, timing):
         if not timing.get("large_pts_gap_candidate"):
@@ -674,6 +801,7 @@ class GStreamerPipeline:
             while self.communicate.poll():
                 event, value = self.communicate.recv()
                 if event == "STOP":
+                    self._stop_calibration_capture()
                     self._stop_snapshot_recording()
                     self._fail_manual_snapshot("Camera process stopped before taking the snapshot")
                     self.shutdown_event.set()
@@ -687,13 +815,17 @@ class GStreamerPipeline:
                     self.channel = value
                     self.channel_changed = True
                     self.capture_size = None
-                    self.transposition_payload = None
+                    if self.transposition_source == "local":
+                        self.transposition_payload = None
+                    if self.transposition_active:
+                        self._emit_transposition_status()
                     self._clear_frames()
                     if self.connected:
                         self.exit_reason = _RESULT_RESTART
                         restart = True
                 elif event == "conn_cam":
                     if self.connected:
+                        self._stop_calibration_capture()
                         self.connected = False
                         self.exit_reason = _RESULT_CLOSED
                         self._fail_manual_snapshot("Camera disconnected before taking the snapshot")
@@ -709,6 +841,10 @@ class GStreamerPipeline:
                     self._set_recording_rate(value)
                 elif event == "transposition":
                     self._set_transposition(value)
+                elif event == "extrinsics_reload":
+                    self._reload_extrinsics()
+                elif event == "calibration_capture":
+                    self._start_calibration_capture(value)
                 elif event == "record_start":
                     self._start_snapshot_recording(value)
                 elif event == "record_stop":
@@ -718,12 +854,14 @@ class GStreamerPipeline:
                 elif event == "playback_resolution":
                     restart = self._set_display_resolution(value) or restart
         except (EOFError, OSError):
+            self._stop_calibration_capture()
             self.shutdown_event.set()
             self.connected = False
             self.exit_reason = _RESULT_CLOSED
             restart = True
 
         self._poll_recording()
+        self._poll_calibration_capture()
 
         if (restart or self.shutdown_event.is_set()) and self.main_loop:
             self.main_loop.quit()
@@ -736,7 +874,7 @@ class GStreamerPipeline:
             return GLib.SOURCE_CONTINUE
         if (
             self.transposition_active
-            and self.channel == RADAR_GROUP_B
+            and self.channel in (1, 2, 3)
             and self.transposition_overlay is not None
             and self.capture_size is not None
         ):
@@ -746,6 +884,7 @@ class GStreamerPipeline:
             )
             try:
                 frame = self.transposition_overlay.draw(
+                    self.channel,
                     frame,
                     self.transposition_payload,
                     source_size=self.capture_size,
