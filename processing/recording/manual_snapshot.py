@@ -7,9 +7,15 @@ from typing import Iterable
 from sensors.radar.connection_packages import RadarObject, RadarPoint
 from processing.recording.point_cloud_recorder import (
     CAMERA_DELAY_SECONDS,
+    LEGACY_RECORDING_METADATA_NAME,
+    LEGACY_TIMESTAMPS_METADATA_NAME,
     RECORDING_METADATA_NAME,
     TIMESTAMPS_METADATA_NAME,
+    load_recording_metadata,
+    load_timestamps_metadata,
     save_point_cloud,
+    save_recording_metadata,
+    save_timestamps_metadata,
 )
 from processing.recording.paths import (
     image_path,
@@ -20,24 +26,24 @@ from processing.recording.paths import (
 
 # Older snapshot folders may contain this file. It is ignored and never created.
 _LEGACY_GROUP_METADATA_NAME = "group.json"
-_EXPECTED_JSON_FILES = {
+_EXPECTED_METADATA_FILES = {
     _LEGACY_GROUP_METADATA_NAME,
     RECORDING_METADATA_NAME,
     TIMESTAMPS_METADATA_NAME,
+    LEGACY_RECORDING_METADATA_NAME,
+    LEGACY_TIMESTAMPS_METADATA_NAME,
 }
 _INDEX_PATTERN = re.compile(r"^(?:frame|camera)_(\d+)\.(?:pcd|jpg)$", re.IGNORECASE)
 
 
 def _replace_json(path: Path, value: object) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    save_recording_metadata(path, value) if isinstance(value, list) else save_timestamps_metadata(path, value)
 
 
 def _load_json(path: Path, expected_type: type):
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        value = load_recording_metadata(path) if expected_type is list else load_timestamps_metadata(path)
+    except Exception as error:
         raise ValueError(f"Could not read {path.name}: {error}") from error
     if not isinstance(value, expected_type):
         raise ValueError(f"Invalid {path.name} format")
@@ -56,34 +62,51 @@ class ManualSnapshotWriter:
         self.camera_delay_seconds = float(camera_delay_seconds)
         self.metadata_path = self.folder / RECORDING_METADATA_NAME
         self.timestamps_path = self.folder / TIMESTAMPS_METADATA_NAME
+        self.legacy_metadata_path = self.folder / LEGACY_RECORDING_METADATA_NAME
+        self.legacy_timestamps_path = self.folder / LEGACY_TIMESTAMPS_METADATA_NAME
 
     def _load_or_initialize(self) -> tuple[list[dict], dict[str, str]]:
         if not self.folder.is_dir():
             raise ValueError("The snapshot destination must be an existing folder")
 
         json_names = {path.name for path in self.folder.glob("*.json")}
-        unexpected = json_names - _EXPECTED_JSON_FILES
+        csv_names = {path.name for path in self.folder.glob("*.csv")}
+        unexpected = (json_names | csv_names) - _EXPECTED_METADATA_FILES
         if unexpected:
             names = ", ".join(sorted(unexpected))
-            raise ValueError("The selected folder contains unrelated JSON metadata: " + names)
+            raise ValueError("The selected folder contains unrelated metadata: " + names)
 
-        if not self.metadata_path.exists() and not self.timestamps_path.exists():
+        has_csv = self.metadata_path.is_file() and self.timestamps_path.is_file()
+        has_json = self.legacy_metadata_path.is_file() and self.legacy_timestamps_path.is_file()
+
+        if not has_csv and not has_json:
+            if any(
+                path.exists()
+                for path in (
+                    self.metadata_path,
+                    self.timestamps_path,
+                    self.legacy_metadata_path,
+                    self.legacy_timestamps_path,
+                )
+            ):
+                raise ValueError(
+                    f"The folder must contain both {RECORDING_METADATA_NAME} and "
+                    f"{TIMESTAMPS_METADATA_NAME}, or contain neither"
+                )
             records: list[dict] = []
             timestamps: dict[str, str] = {}
-            _replace_json(self.metadata_path, records)
-            _replace_json(self.timestamps_path, timestamps)
+            save_recording_metadata(self.metadata_path, records)
+            save_timestamps_metadata(self.timestamps_path, timestamps)
             return records, timestamps
 
-        if not self.metadata_path.is_file() or not self.timestamps_path.is_file():
-            raise ValueError(
-                f"The folder must contain both {RECORDING_METADATA_NAME} and "
-                f"{TIMESTAMPS_METADATA_NAME}, or contain neither"
-            )
+        if has_csv:
+            records = load_recording_metadata(self.metadata_path)
+            timestamps = load_timestamps_metadata(self.timestamps_path)
+            return records, timestamps
 
-        return (
-            _load_json(self.metadata_path, list),
-            _load_json(self.timestamps_path, dict),
-        )
+        records = load_recording_metadata(self.legacy_metadata_path)
+        timestamps = load_timestamps_metadata(self.legacy_timestamps_path)
+        return records, timestamps
 
     def _next_index(self, records: list[dict]) -> int:
         indexes = []
@@ -107,6 +130,9 @@ class ManualSnapshotWriter:
         frame_type: str,
         image_bytes: bytes,
         camera_recorded_at: datetime,
+        pts: int | None = None,
+        ntp: int | None = None,
+        arrival_time: str | None = None,
     ) -> dict:
         records, timestamps = self._load_or_initialize()
         index = self._next_index(records)
@@ -114,12 +140,6 @@ class ManualSnapshotWriter:
         camera_name = image_reference(f"camera_{index:06d}.jpg")
         point_cloud_file = point_cloud_path(self.folder, point_cloud_name)
         camera_file = image_path(self.folder, camera_name)
-        target_radar_time = camera_recorded_at - timedelta(
-            seconds=self.camera_delay_seconds
-        )
-        synchronization_error_ms = (
-            radar_recorded_at - target_radar_time
-        ).total_seconds() * 1000.0
 
         created = []
         try:
@@ -138,12 +158,15 @@ class ManualSnapshotWriter:
                 "recorded_at": radar_timestamp,
                 "frame_type": frame_type,
                 "camera_frame": camera_name,
-                "camera_recorded_at": camera_timestamp,
-                "camera_delay_ms": round(self.camera_delay_seconds * 1000, 3),
-                "synchronization_error_ms": round(synchronization_error_ms, 3),
+                "pts": pts,
+                "ntp": ntp,
+                "arrival_time": arrival_time or camera_timestamp,
             })
-            _replace_json(self.timestamps_path, timestamps)
-            _replace_json(self.metadata_path, records)
+            save_timestamps_metadata(self.timestamps_path, timestamps)
+            save_recording_metadata(self.metadata_path, records)
+            if self.legacy_metadata_path.is_file() or self.legacy_timestamps_path.is_file():
+                save_timestamps_metadata(self.legacy_timestamps_path, timestamps)
+                save_recording_metadata(self.legacy_metadata_path, records)
         except Exception:
             for path in created:
                 try:
@@ -156,5 +179,4 @@ class ManualSnapshotWriter:
             "folder": str(self.folder.resolve()),
             "point_cloud": point_cloud_name,
             "camera_frame": camera_name,
-            "synchronization_error_ms": round(synchronization_error_ms, 3),
         }

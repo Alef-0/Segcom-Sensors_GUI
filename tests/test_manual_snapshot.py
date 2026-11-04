@@ -63,11 +63,11 @@ class ManualSnapshotTests(unittest.TestCase):
                 camera_time + timedelta(seconds=1),
             )
             root = Path(folder)
-            records = json.loads(
-                (root / recorder_module.RECORDING_METADATA_NAME).read_text()
+            records = recorder_module.load_recording_metadata(
+                root / recorder_module.RECORDING_METADATA_NAME
             )
-            timestamps = json.loads(
-                (root / recorder_module.TIMESTAMPS_METADATA_NAME).read_text()
+            timestamps = recorder_module.load_timestamps_metadata(
+                root / recorder_module.TIMESTAMPS_METADATA_NAME
             )
             group_exists = (root / "group.json").exists()
 
@@ -77,16 +77,16 @@ class ManualSnapshotTests(unittest.TestCase):
         self.assertEqual(len(records), 2)
         self.assertEqual(len(timestamps), 2)
         self.assertEqual(records[0]["camera_frame"], "images/camera_000001.jpg")
-        self.assertEqual(records[0]["synchronization_error_ms"], 0.0)
-        self.assertNotIn("group", first)
-        self.assertNotIn("channel", first)
+        self.assertIn("arrival_time", records[0])
+        self.assertIn("pts", records[0])
+        self.assertIn("ntp", records[0])
 
-    def test_snapshot_appends_to_existing_recording_metadata(self):
+    def test_snapshot_appends_to_legacy_json_metadata(self):
         recorded_at = datetime.now(timezone.utc)
         with TemporaryDirectory() as folder:
             root = Path(folder)
-            (root / recorder_module.RECORDING_METADATA_NAME).write_text("[]\n")
-            (root / recorder_module.TIMESTAMPS_METADATA_NAME).write_text("{}\n")
+            (root / "recording.json").write_text("[]\n")
+            (root / "timestamps.json").write_text("{}\n")
             ManualSnapshotWriter(folder).save(
                 (self.point(),),
                 recorded_at,
@@ -96,8 +96,39 @@ class ManualSnapshotTests(unittest.TestCase):
                     seconds=recorder_module.CAMERA_DELAY_SECONDS
                 ),
             )
-            records = json.loads(
-                (root / recorder_module.RECORDING_METADATA_NAME).read_text()
+            records_json = recorder_module.load_recording_metadata(root / "recording.json")
+            records_csv = recorder_module.load_recording_metadata(root / "recording.csv")
+
+        self.assertEqual(len(records_json), 1)
+        self.assertEqual(len(records_csv), 1)
+        self.assertEqual(records_json[0]["point_cloud"], "point_cloud/frame_000001.pcd")
+        self.assertEqual(records_json[0]["camera_frame"], "images/camera_000001.jpg")
+        self.assertEqual(records_csv[0]["point_cloud"], "point_cloud/frame_000001.pcd")
+        self.assertEqual(records_csv[0]["camera_frame"], "images/camera_000001.jpg")
+        self.assertNotIn("group", first)
+        self.assertNotIn("channel", first)
+
+    def test_snapshot_appends_to_existing_recording_metadata(self):
+        recorded_at = datetime.now(timezone.utc)
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / recorder_module.RECORDING_METADATA_NAME).write_text(
+                "point_cloud,recorded_at,frame_type,camera_frame,pts,ntp,arrival_time\n"
+            )
+            (root / recorder_module.TIMESTAMPS_METADATA_NAME).write_text(
+                "point_cloud,recorded_at\n"
+            )
+            ManualSnapshotWriter(folder).save(
+                (self.point(),),
+                recorded_at,
+                "cluster",
+                b"jpg",
+                recorded_at + timedelta(
+                    seconds=recorder_module.CAMERA_DELAY_SECONDS
+                ),
+            )
+            records = recorder_module.load_recording_metadata(
+                root / recorder_module.RECORDING_METADATA_NAME
             )
 
         self.assertEqual(len(records), 1)
@@ -109,8 +140,12 @@ class ManualSnapshotTests(unittest.TestCase):
         with TemporaryDirectory() as folder:
             root = Path(folder)
             (root / "group.json").write_text('{"channel": 2, "group": "B"}\n')
-            (root / recorder_module.RECORDING_METADATA_NAME).write_text("[]\n")
-            (root / recorder_module.TIMESTAMPS_METADATA_NAME).write_text("{}\n")
+            (root / recorder_module.RECORDING_METADATA_NAME).write_text(
+                "point_cloud,recorded_at,frame_type,camera_frame,pts,ntp,arrival_time\n"
+            )
+            (root / recorder_module.TIMESTAMPS_METADATA_NAME).write_text(
+                "point_cloud,recorded_at\n"
+            )
             result = ManualSnapshotWriter(folder).save(
                 (self.point(),),
                 recorded_at,
@@ -135,17 +170,40 @@ class ManualSnapshotTests(unittest.TestCase):
             session.submit(1, (self.point(),), second_time)
             session.add_camera_snapshot(1, "camera_000001.jpg", second_time)
             session.stop()
-            records = json.loads(
-                (
-                    Path(folders[1])
-                    / recorder_module.RECORDING_METADATA_NAME
-                ).read_text()
+            records = recorder_module.load_recording_metadata(
+                Path(folders[1]) / recorder_module.RECORDING_METADATA_NAME
             )
 
         self.assertEqual(records[0]["camera_frame"], "images/camera_000001.jpg")
         self.assertIsNone(records[1]["camera_frame"])
-        self.assertEqual(records[0]["camera_delay_ms"], 109)
-        self.assertEqual(records[0]["synchronization_error_ms"], 0.0)
+        self.assertIn("arrival_time", records[0])
+        self.assertIn("pts", records[0])
+        self.assertIn("ntp", records[0])
+
+    def test_snapshot_appends_to_legacy_json_metadata(self):
+        recorded_at = datetime.now(timezone.utc)
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "recording.json").write_text("[]\n")
+            (root / "timestamps.json").write_text("{}\n")
+            ManualSnapshotWriter(folder).save(
+                (self.point(),),
+                recorded_at,
+                "cluster",
+                b"jpg",
+                recorded_at + timedelta(
+                    seconds=recorder_module.CAMERA_DELAY_SECONDS
+                ),
+            )
+            records_json = recorder_module.load_recording_metadata(root / "recording.json")
+            records_csv = recorder_module.load_recording_metadata(root / "recording.csv")
+
+        self.assertEqual(len(records_json), 1)
+        self.assertEqual(len(records_csv), 1)
+        self.assertEqual(records_json[0]["point_cloud"], "point_cloud/frame_000001.pcd")
+        self.assertEqual(records_json[0]["camera_frame"], "images/camera_000001.jpg")
+        self.assertEqual(records_csv[0]["point_cloud"], "point_cloud/frame_000001.pcd")
+        self.assertEqual(records_csv[0]["camera_frame"], "images/camera_000001.jpg")
 
 
 if __name__ == "__main__":

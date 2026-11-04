@@ -11,7 +11,14 @@ import cv2 as cv
 from processing.visualization.graph_draw import Graph_radar
 from processing.visualization.graph_filter import Filter_graph
 from processing.recording.point_cloud_reader import PointCloudReader
-from processing.recording.point_cloud_recorder import RECORDING_METADATA_NAME, TIMESTAMPS_METADATA_NAME
+from processing.recording.point_cloud_recorder import (
+    LEGACY_RECORDING_METADATA_NAME,
+    LEGACY_TIMESTAMPS_METADATA_NAME,
+    RECORDING_METADATA_NAME,
+    TIMESTAMPS_METADATA_NAME,
+    load_recording_metadata,
+    load_timestamps_metadata,
+)
 from processing.recording.paths import (
     IMAGE_DIRECTORY_NAME,
     POINT_CLOUD_DIRECTORY_NAME,
@@ -50,59 +57,62 @@ def load_recording_entries(folder: str | Path) -> tuple[PlaybackEntry, ...]:
     if not root.is_dir():
         raise ValueError("The playback source must be an existing recording folder")
 
-    metadata_path = root / RECORDING_METADATA_NAME
-    timestamps_path = root / TIMESTAMPS_METADATA_NAME
+    metadata_csv_path = root / RECORDING_METADATA_NAME
+    metadata_json_path = root / LEGACY_RECORDING_METADATA_NAME
+    timestamps_csv_path = root / TIMESTAMPS_METADATA_NAME
+    timestamps_json_path = root / LEGACY_TIMESTAMPS_METADATA_NAME
     entries = []
     referenced_point_clouds = set()
     referenced_camera_frames = set()
 
     timestamps = {}
-    if timestamps_path.is_file():
-        timestamps = json.loads(timestamps_path.read_text(encoding="utf-8"))
-        if not isinstance(timestamps, dict):
-            raise ValueError(f"Invalid {TIMESTAMPS_METADATA_NAME} format")
+    if timestamps_csv_path.is_file():
+        timestamps = load_timestamps_metadata(timestamps_csv_path)
+    elif timestamps_json_path.is_file():
+        timestamps = load_timestamps_metadata(timestamps_json_path)
 
-    if metadata_path.is_file():
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if not isinstance(metadata, list):
-            raise ValueError(f"Invalid {RECORDING_METADATA_NAME} format")
+    metadata = []
+    if metadata_csv_path.is_file():
+        metadata = load_recording_metadata(metadata_csv_path)
+    elif metadata_json_path.is_file():
+        metadata = load_recording_metadata(metadata_json_path)
 
-        for item in metadata:
-            if not isinstance(item, dict):
-                continue
-            point_name = item.get("point_cloud")
-            camera_name = item.get("camera_frame")
+    for item in metadata:
+        if not isinstance(item, dict):
+            continue
+        point_name = item.get("point_cloud")
+        camera_name = item.get("camera_frame")
 
-            point_cloud = _path_if_file(root, point_name, POINT_CLOUD_DIRECTORY_NAME)
-            camera_frame = _path_if_file(root, camera_name, IMAGE_DIRECTORY_NAME)
-            if point_cloud is not None:
-                referenced_point_clouds.add(point_cloud)
-            if camera_frame is not None:
-                referenced_camera_frames.add(camera_frame)
-            if point_cloud is None and camera_frame is None:
-                continue
+        point_cloud = _path_if_file(root, point_name, POINT_CLOUD_DIRECTORY_NAME)
+        camera_frame = _path_if_file(root, camera_name, IMAGE_DIRECTORY_NAME)
+        if point_cloud is not None:
+            referenced_point_clouds.add(point_cloud)
+        if camera_frame is not None:
+            referenced_camera_frames.add(camera_frame)
+        if point_cloud is None and camera_frame is None:
+            continue
 
-            if point_cloud is not None:
-                recorded_at = _parse_time(item.get("recorded_at"), point_cloud)
-            else:
-                recorded_at = _parse_time(
-                    item.get("camera_recorded_at") or item.get("recorded_at"),
-                    camera_frame,
-                )
+        if point_cloud is not None:
+            recorded_at = _parse_time(item.get("recorded_at"), point_cloud)
+        else:
+            recorded_at = _parse_time(
+                item.get("arrival_time") or item.get("camera_recorded_at") or item.get("recorded_at"),
+                camera_frame,
+            )
 
-            camera_recorded_at = None
-            if camera_frame is not None:
-                camera_recorded_at = _parse_time(
-                    item.get("camera_recorded_at"),
-                    camera_frame,
-                )
+        camera_recorded_at = None
+        if camera_frame is not None:
+            camera_recorded_at = _parse_time(
+                item.get("arrival_time") or item.get("camera_recorded_at"),
+                camera_frame,
+            )
 
-            entries.append(PlaybackEntry(
-                point_cloud=point_cloud,
-                recorded_at=recorded_at,
-                camera_frame=camera_frame,
-                camera_recorded_at=camera_recorded_at,
-            ))
+        entries.append(PlaybackEntry(
+            point_cloud=point_cloud,
+            recorded_at=recorded_at,
+            camera_frame=camera_frame,
+            camera_recorded_at=camera_recorded_at,
+        ))
 
     for filename, recorded_at in timestamps.items():
         point_cloud = _path_if_file(root, filename, POINT_CLOUD_DIRECTORY_NAME)

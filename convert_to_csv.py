@@ -38,10 +38,8 @@ from typing import Any, Iterable
 try:
     import numpy as np
     from pypcd4 import PointCloud
-except ImportError as error:
-    raise SystemExit(
-        "Missing dependency. Install it with: python -m pip install pypcd4 numpy"
-    ) from error
+except ImportError:
+    PointCloud = None
 
 
 DICTIONARY_FILENAME = "value_dictionaries.json"
@@ -260,6 +258,8 @@ def output_fields(source_fields: Iterable[str]) -> list[str]:
 
 
 def convert_pcd(source: Path, destination: Path) -> int:
+    if PointCloud is None:
+        raise RuntimeError("Missing dependency. Install it with: python -m pip install pypcd4 numpy")
     cloud = PointCloud.from_path(str(source))
     fields = list(cloud.fields)
     values = cloud.numpy(fields)
@@ -294,6 +294,8 @@ IMAGE_SUFFIXES = {
 SEGCOM_METADATA_FILENAMES = {
     "recording.json",
     "timestamps.json",
+    "recording.csv",
+    "timestamps.csv",
 }
 
 
@@ -326,14 +328,31 @@ def replace_pcd_reference(value: Any) -> Any:
 
 def copy_segcom_metadata(source: Path, destination: Path) -> None:
     """Copy Segcom metadata while updating references to converted point clouds."""
-    data = json.loads(source.read_text(encoding="utf-8"))
-    converted = replace_pcd_reference(data)
+    if source.suffix.lower() == ".csv":
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with source.open("r", newline="", encoding="utf-8") as in_file:
+            reader = csv.reader(in_file)
+            rows = []
+            for row in reader:
+                converted_row = []
+                for cell in row:
+                    if cell.lower().endswith(".pcd"):
+                        converted_row.append(cell[:-4] + ".csv")
+                    else:
+                        converted_row.append(cell)
+                rows.append(converted_row)
+        with destination.open("w", newline="", encoding="utf-8") as out_file:
+            writer = csv.writer(out_file)
+            writer.writerows(rows)
+    else:
+        data = json.loads(source.read_text(encoding="utf-8"))
+        converted = replace_pcd_reference(data)
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        json.dumps(converted, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(converted, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
 
 
 def write_dictionary(directory: Path) -> None:

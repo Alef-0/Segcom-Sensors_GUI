@@ -1,13 +1,15 @@
 # Camera subsystem
 
-The camera subsystem connects to one DVR RTSP channel at a time, displays the
-latest decoded image, produces timestamped full-resolution frames for
-recording, and temporarily changes channels for manual snapshots.
+The camera subsystem displays one DVR RTSP channel at a time, temporarily
+changes that live channel for manual snapshots, and, while a recording is
+active, opens one extra capture-only stream per recorded group.
 
 ## Files
 
 - `camera_gstreamer.py` owns connection state, GStreamer lifecycle, display,
   recording commands, manual snapshots, retry behavior, and GUI status events.
+- `camera_capture_stream.py` decodes one channel without a display branch and
+  feeds that group's image recorder; it retries on errors or stalls.
 - `camera_pipeline.py` selects a decoder and builds the pipeline string.
 - `camera_timebase.py` validates PTS and maps it onto host Unix/monotonic time.
 - `camera_reference_clock.py` observes declared frame reference clocks, RTCP
@@ -19,6 +21,16 @@ recording, and temporarily changes channels for manual snapshots.
 Channels 1-3 correspond to radar/camera groups A-C. The selected live group
 starts as channel 2. A manual snapshot can restart the pipeline on another
 group, capture one frame, and then restore the previous channel.
+
+Recording does not use the live pipeline. Starting a recording creates a
+`ChannelCaptureStream` and a `CameraSnapshotRecorder` for every selected group,
+so each group folder receives images from its own camera regardless of which
+channel is on screen. Changing the live channel or taking a manual snapshot
+during a recording does not interrupt or redirect it. A recorded group that
+is also on screen is decoded twice (once for display, once for recording).
+Recording streams pause while the camera is disconnected and reopen when it
+reconnects; a stream that errors or stalls for five seconds is retried every
+second, and the GUI is warned once after three consecutive failures.
 
 The RTSP URL and credentials are currently constructed directly in
 `GStreamerPipeline.create_url()`.
@@ -52,9 +64,10 @@ rtspsrc -> H.264 depay/parse -> selected decoder -> BGR -> tee
 ```
 
 The display branch has a one-frame leaky queue and a one-frame dropping
-appsink. The capture branch has a bounded 30-buffer queue and a non-dropping
-appsink. After that appsink, `CameraSnapshotRecorder` has a separate eight-item
-writer queue. This keeps the live view responsive while making recording loss
+appsink. The live capture branch feeds manual snapshots only. Recording streams
+use the same decoder chain without the tee or display branch: a bounded
+30-buffer queue and a non-dropping appsink, followed by that group's
+`CameraSnapshotRecorder` with its own eight-item writer queue. This keeps the live view responsive while making recording loss
 observable and preventing unbounded memory growth.
 
 The current `rtspsrc` options are:
@@ -101,7 +114,7 @@ Two settings have different purposes:
 
 - Pipeline latency, default 145 ms, configures the GStreamer RTSP jitter
   buffer and causes a pipeline restart when changed while connected.
-- Latency adjustment, default 109 ms, is an application-level camera-to-radar
+- Latency adjustment, default 65 ms, is an application-level camera-to-radar
   alignment offset used by recording, snapshots, and playback snapshots.
 
 ## Recording and loss reporting

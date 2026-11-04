@@ -129,6 +129,32 @@ def available_decoder_backends(
     return tuple(available)
 
 
+def _rtsp_decode_chain(backend: CameraDecoderBackend, latency_ms: int) -> str:
+    return (
+        f"rtspsrc name=source latency={latency_ms} protocols=tcp+udp "
+        "buffer-mode=1 do-retransmission=true ! "
+        f"rtph264depay ! h264parse ! {backend.decoder_chain}"
+    )
+
+
+_CAPTURE_BRANCH = (
+    "queue name=capture_queue max-size-buffers=30 "
+    "max-size-bytes=0 max-size-time=0 ! "
+    "video/x-raw,format=BGR ! "
+    "appsink name=capture_sink emit-signals=true sync=false"
+)
+
+
+def build_capture_pipeline(
+    backend: CameraDecoderBackend,
+    *,
+    latency_ms: int,
+) -> str:
+    """Build a capture-only pipeline used to record one camera group."""
+
+    return f"{_rtsp_decode_chain(backend, latency_ms)} ! {_CAPTURE_BRANCH}"
+
+
 def build_camera_pipeline(
     backend: CameraDecoderBackend,
     *,
@@ -139,14 +165,9 @@ def build_camera_pipeline(
     """Build the low-latency display and full-resolution capture pipeline."""
 
     return (
-        f"rtspsrc name=source latency={latency_ms} protocols=tcp+udp "
-        "buffer-mode=1 do-retransmission=true ! "
-        f"rtph264depay ! h264parse ! {backend.decoder_chain} ! tee name=video "
+        f"{_rtsp_decode_chain(backend, latency_ms)} ! tee name=video "
         "video. ! queue leaky=downstream max-size-buffers=1 ! videoscale ! "
         f"video/x-raw,format=BGR,width={display_width},height={display_height} ! "
         "appsink name=display_sink emit-signals=true sync=false max-buffers=1 drop=true "
-        "video. ! queue name=capture_queue max-size-buffers=30 "
-        "max-size-bytes=0 max-size-time=0 ! "
-        "video/x-raw,format=BGR ! "
-        "appsink name=capture_sink emit-signals=true sync=false"
+        f"video. ! {_CAPTURE_BRANCH}"
     )

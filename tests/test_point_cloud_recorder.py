@@ -106,7 +106,7 @@ class PointCloudRecorderTests(unittest.TestCase):
             recording_folder = Path(paths[2])
             frame_path = recording_folder / "point_cloud" / "frame_000001.pcd"
             self.assertTrue(frame_path.is_file())
-            timestamps = json.loads((recording_folder / "timestamps.json").read_text())
+            timestamps = recorder_module.load_timestamps_metadata(recording_folder / recorder_module.TIMESTAMPS_METADATA_NAME)
 
         self.assertEqual(counts, {2: 1})
         self.assertEqual(
@@ -190,7 +190,7 @@ class PointCloudRecorderTests(unittest.TestCase):
 
             recording_folder = Path(paths[1])
             self.assertTrue((recording_folder / "point_cloud" / "frame_000001.pcd").is_file())
-            timestamps = json.loads((recording_folder / "timestamps.json").read_text())
+            timestamps = recorder_module.load_timestamps_metadata(recording_folder / recorder_module.TIMESTAMPS_METADATA_NAME)
 
         self.assertEqual(counts, {1: 1})
         self.assertEqual(list(timestamps), ["point_cloud/frame_000001.pcd"])
@@ -200,8 +200,8 @@ class PointCloudRecorderTests(unittest.TestCase):
         with TemporaryDirectory() as folder:
             session = recorder_module.RadarRecordingSession()
             paths = session.start(folder, (3,))
-            timestamp_path = Path(paths[3]) / "timestamps.json"
-            self.assertEqual(json.loads(timestamp_path.read_text()), {})
+            timestamp_path = Path(paths[3]) / recorder_module.TIMESTAMPS_METADATA_NAME
+            self.assertEqual(recorder_module.load_timestamps_metadata(timestamp_path), {})
             session.stop()
 
 

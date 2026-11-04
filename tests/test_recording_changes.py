@@ -95,12 +95,8 @@ class RecordingChangesTests(unittest.TestCase):
                 )
             )
             session.stop()
-            metadata = json.loads(
-                (Path(paths[1]) / recorder_module.RECORDING_METADATA_NAME).read_text()
-            )
-            timestamps = json.loads(
-                (Path(paths[1]) / recorder_module.TIMESTAMPS_METADATA_NAME).read_text()
-            )
+            metadata = recorder_module.load_recording_metadata(Path(paths[1]))
+            timestamps = recorder_module.load_timestamps_metadata(Path(paths[1]))
 
         self.assertEqual(len(metadata), 1)
         self.assertEqual(metadata[0]["point_cloud"], "point_cloud/frame_000001.pcd")
@@ -348,6 +344,58 @@ class RequestedControlChangesTests(unittest.TestCase):
         self.assertEqual(controller._apply_transport_request(1, timestamps), 0)
         controller.transport_request = ("restart", 0.0)
         self.assertEqual(controller._apply_transport_request(3, timestamps), 0)
+
+    def test_playback_loader_loads_csv_recording_metadata(self):
+        timestamp = "2026-07-29T12:00:00+00:00"
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "point_cloud").mkdir()
+            (root / "images").mkdir()
+            (root / "point_cloud" / "frame_000001.pcd").write_bytes(b"pcd")
+            (root / "images" / "camera_000001.jpg").write_bytes(b"jpg")
+            recorder_module.save_recording_csv(root / "recording.csv", [{
+                "point_cloud": "point_cloud/frame_000001.pcd",
+                "recorded_at": timestamp,
+                "frame_type": "cluster",
+                "camera_frame": "images/camera_000001.jpg",
+                "pts": 100,
+                "ntp": 200,
+                "arrival_time": timestamp,
+            }])
+            recorder_module.save_timestamps_csv(root / "timestamps.csv", {
+                "point_cloud/frame_000001.pcd": timestamp,
+            })
+            entries = load_recording_entries(root)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].point_cloud.name, "frame_000001.pcd")
+        self.assertEqual(entries[0].camera_frame.name, "camera_000001.jpg")
+
+    def test_convert_to_csv_copies_and_updates_both_csv_and_json_metadata(self):
+        from convert_to_csv import copy_segcom_metadata, is_segcom_metadata
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            csv_in = root / "recording.csv"
+            csv_out = root / "converted_recording.csv"
+            json_in = root / "recording.json"
+            json_out = root / "converted_recording.json"
+
+            recorder_module.save_recording_csv(csv_in, [{
+                "point_cloud": "point_cloud/frame_000001.pcd",
+                "recorded_at": "2026-07-29T12:00:00+00:00",
+            }])
+            self.assertTrue(is_segcom_metadata(csv_in))
+
+            copy_segcom_metadata(csv_in, csv_out)
+            converted_csv = recorder_module.load_recording_csv(csv_out)
+            self.assertEqual(converted_csv[0]["point_cloud"], "point_cloud/frame_000001.csv")
+
+            json_in.write_text(json.dumps([{"point_cloud": "frame_000001.pcd"}]))
+            self.assertTrue(is_segcom_metadata(json_in))
+            copy_segcom_metadata(json_in, json_out)
+            converted_json = json.loads(json_out.read_text())
+            self.assertEqual(converted_json[0]["point_cloud"], "frame_000001.csv")
 
 
 if __name__ == "__main__":

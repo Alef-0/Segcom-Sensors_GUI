@@ -14,7 +14,12 @@ from sensors.gps.gps_connection import main as gps_main
 from processing.visualization.filter_schema import RCS_KEY
 from menu_configurations import Configurations
 from processing.playback.playback import playback_main
-from processing.recording.point_cloud_recorder import RECORDING_METADATA_NAME, TIMESTAMPS_METADATA_NAME
+from processing.recording.point_cloud_recorder import (
+    LEGACY_RECORDING_METADATA_NAME,
+    LEGACY_TIMESTAMPS_METADATA_NAME,
+    RECORDING_METADATA_NAME,
+    TIMESTAMPS_METADATA_NAME,
+)
 
 
 @dataclass
@@ -143,6 +148,8 @@ def _is_recording_folder(folder: Path) -> bool:
         and (
             (folder / RECORDING_METADATA_NAME).is_file()
             or (folder / TIMESTAMPS_METADATA_NAME).is_file()
+            or (folder / LEGACY_RECORDING_METADATA_NAME).is_file()
+            or (folder / LEGACY_TIMESTAMPS_METADATA_NAME).is_file()
         )
     )
 

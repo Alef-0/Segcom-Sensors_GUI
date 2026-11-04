@@ -22,27 +22,20 @@ Each selected radar group gets its own folder named
 | File | Meaning |
 | --- | --- |
 | `point_cloud/frame_NNNNNN.pcd` | One complete cluster or object radar frame |
-| `images/camera_NNNNNN.jpg` | One camera frame; its number follows the camera sequence |
-| `recording.json` | Ordered radar records plus optional paired camera fields |
-| `timestamps.json` | Compatibility mapping from PCD filename to radar time |
+| `images/camera_NNNNNN.jpg` | One frame from this group's own camera; its number follows that camera's sequence |
+| `recording.csv` | Ordered radar records plus optional paired camera fields (legacy `recording.json` also accepted) |
+| `timestamps.csv` | Compatibility mapping from PCD filename to radar time (legacy `timestamps.json` also accepted) |
 
-`recording.json` records these fields for each radar frame:
+`recording.csv` records these columns for each radar frame:
 
-```json
-{
-  "point_cloud": "point_cloud/frame_000001.pcd",
-  "recorded_at": "ISO-8601 radar time",
-  "frame_type": "cluster or object",
-  "camera_frame": "images/camera_000001.jpg or null",
-  "camera_recorded_at": "ISO-8601 camera time or null",
-  "camera_delay_ms": 109.0,
-  "synchronization_error_ms": 0.0
-}
+```csv
+point_cloud,recorded_at,frame_type,camera_frame,pts,ntp,arrival_time
+point_cloud/frame_000001.pcd,2026-11-04T10:00:00.000000+00:00,cluster,images/camera_000001.jpg,1234567890,1725456789123456789,2026-11-04T10:00:00.065000+00:00
 ```
 
-JSON updates use a temporary file followed by replacement so readers do not
-normally observe a partially written document. Metadata is flushed at most
-about once per second during recording and forced at shutdown.
+Metadata updates use a temporary file followed by atomic replacement so readers
+do not observe a partially written document. Metadata is flushed at most about
+once per second during recording and forced at shutdown.
 
 ## PCD schemas
 
@@ -69,8 +62,8 @@ The camera frame is attached to the closest radar record that does not already
 have a camera frame. Pending camera notifications wait until a new-enough radar
 frame exists, or are resolved against available records when recording stops.
 
-The default delay is 109 ms. Metadata stores the actual value used so that a
-recording remains interpretable if the setting changes later.
+The default delay is 65 ms. Metadata stores `pts`, `ntp`, and `arrival_time`
+so timing can be analyzed independently.
 
 ## Queue and failure behavior
 
@@ -102,8 +95,9 @@ rejects the snapshot.
 
 ## Playback loading
 
-`load_recording_entries()` prefers `recording.json`, supplements it from
-`timestamps.json`, and finally discovers unreferenced PCD and `camera_*` image
+`load_recording_entries()` prefers `recording.csv` (and accepts legacy `recording.json`),
+supplements it from `timestamps.csv` (or legacy `timestamps.json`), and finally discovers
+unreferenced PCD and `camera_*` image
 files. It resolves both current paths such as `point_cloud/frame_000001.pcd`
 and legacy bare names such as `frame_000001.pcd`; missing files are skipped,
 and file modification time is the fallback when metadata has no timestamp.

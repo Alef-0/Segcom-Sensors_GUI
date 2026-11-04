@@ -1,7 +1,13 @@
 from datetime import datetime, timezone
+import io
+import queue
+import sys
+import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+sys.modules.setdefault("FreeSimpleGUI", MagicMock())
 
 import gi
 
@@ -23,6 +29,7 @@ from sensors.camera.camera_reference_clock import (
     ReferenceClockObserver,
     reference_timestamp_for_buffer,
 )
+from main import parse_arguments
 
 
 class FakeBuffer:
@@ -414,7 +421,7 @@ class CameraPipelinePolicyTests(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertIn("duplicated", result.reason)
 
-    def test_capture_callback_skips_recording_when_timestamp_is_invalid(self):
+    def test_live_capture_callback_skips_manual_snapshot_when_timestamp_is_invalid(self):
         pipeline = object.__new__(GStreamerPipeline)
         pipeline.first_frame_received = True
         pipeline._sample_to_frame = lambda _sample: object()
@@ -427,12 +434,6 @@ class CameraPipelinePolicyTests(unittest.TestCase):
                 )
             },
         )()
-        submitted = []
-        pipeline.snapshot_recorder = type(
-            "Recorder",
-            (),
-            {"submit": lambda _self, *args, **kwargs: submitted.append((args, kwargs))},
-        )()
         rejected = []
         pipeline._reject_synchronized_frame = rejected.append
         pipeline._emit_manual_snapshot = lambda *_args: self.fail(
@@ -442,10 +443,9 @@ class CameraPipelinePolicyTests(unittest.TestCase):
         result = pipeline.on_new_capture_sample(FakeSink(object()))
 
         self.assertEqual(result, Gst.FlowReturn.OK)
-        self.assertEqual(submitted, [])
         self.assertEqual(rejected, ["frame has invalid PTS"])
 
-    def test_capture_callback_sends_only_valid_timestamp_to_both_savers(self):
+    def test_live_capture_callback_only_feeds_manual_snapshot(self):
         captured_at = datetime.now(timezone.utc)
         frame = object()
         pipeline = object.__new__(GStreamerPipeline)
@@ -462,12 +462,6 @@ class CameraPipelinePolicyTests(unittest.TestCase):
                 )
             },
         )()
-        submitted = []
-        pipeline.snapshot_recorder = type(
-            "Recorder",
-            (),
-            {"submit": lambda _self, *args, **kwargs: submitted.append((args, kwargs))},
-        )()
         observed_ntp = []
         pipeline._observe_camera_ntp = lambda *args: observed_ntp.append(args)
         pipeline._report_unusual_pts_gap = lambda _timing: None
@@ -478,13 +472,7 @@ class CameraPipelinePolicyTests(unittest.TestCase):
         result = pipeline.on_new_capture_sample(FakeSink(sample))
 
         self.assertEqual(result, Gst.FlowReturn.OK)
-        self.assertEqual(submitted, [((frame,), {
-            "captured_at": captured_at,
-            "timing": {
-                "timestamp_source": "pipeline-clock",
-                "reference_clock_offset_seconds": None,
-            },
-        })])
+        self.assertFalse(hasattr(pipeline, "snapshot_recorder"))
         self.assertEqual(observed_ntp, [(None, None)])
         self.assertEqual(manual, [(frame, captured_at)])
 
@@ -498,6 +486,64 @@ class CameraPipelinePolicyTests(unittest.TestCase):
 
         self.assertTrue(pipeline._has_frame_ntp)
         self.assertEqual(published, [(Gst.SECOND, 250.0)])
+
+    def test_parse_arguments_debug_flag(self):
+        self.assertFalse(parse_arguments([]).debug)
+        self.assertTrue(parse_arguments(["--debug"]).debug)
+
+    def test_category_2_messages_suppressed_without_debug(self):
+        pipeline = object.__new__(GStreamerPipeline)
+        pipeline.debug = False
+        pipeline.channel = 2
+        pipeline.pool = queue.Queue()
+        pipeline._last_timestamp_warning = 0.0
+        pipeline._manual_snapshot_lock = threading.Lock()
+        pipeline._pending_manual_snapshot = None
+        pipeline._last_pts_gap_warning = 0.0
+        pipeline._pending_pts_gap_candidates = 0
+        pipeline._last_writer_drop_warning = 0.0
+
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            pipeline._reject_synchronized_frame("frame has invalid PTS")
+            pipeline._report_unusual_pts_gap({
+                "large_pts_gap_candidate": True,
+                "pts_delta_ns": 60000000,
+            })
+            pipeline._report_recording_drop({"dropped": 1})
+            self.assertEqual(mock_stdout.getvalue(), "")
+
+    def test_category_2_messages_appear_with_debug(self):
+        pipeline = object.__new__(GStreamerPipeline)
+        pipeline.debug = True
+        pipeline.channel = 2
+        pipeline.pool = queue.Queue()
+        pipeline._last_timestamp_warning = 0.0
+        pipeline._manual_snapshot_lock = threading.Lock()
+        pipeline._pending_manual_snapshot = None
+        pipeline._last_pts_gap_warning = 0.0
+        pipeline._pending_pts_gap_candidates = 0
+        pipeline._last_writer_drop_warning = 0.0
+
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            pipeline._reject_synchronized_frame("frame has invalid PTS")
+            pipeline._report_unusual_pts_gap({
+                "large_pts_gap_candidate": True,
+                "pts_delta_ns": 60000000,
+            })
+            pipeline._report_recording_drop({"dropped": 1})
+            output = mock_stdout.getvalue()
+            self.assertIn(
+                "[DEBUG][CAMERA] Skipping unsynchronized camera frame: frame has invalid PTS",
+                output,
+            )
+            self.assertIn(
+                "[WARNING][CAMERA] Camera channel 2 had 1 unusual PTS gap candidate(s)",
+                output,
+            )
+            self.assertIn(
+                "[WARNING][CAMERA] Dropped a selected camera frame because the image writer queue is full",
+                output,
+            )
 
 
 if __name__ == "__main__":

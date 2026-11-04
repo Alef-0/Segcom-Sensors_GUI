@@ -1,3 +1,4 @@
+import argparse
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -369,7 +370,19 @@ def _run_event_loop(
         )
 
 
-def main():
+def parse_arguments(argv=None):
+    """Parse command-line arguments for the GUI application."""
+    parser = argparse.ArgumentParser(description="Segcom Sensors GUI")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable verbose debug and timing warning messages",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_arguments(argv)
     process_context = get_context("spawn")
     shutdown_event = process_context.Event()
 
@@ -412,6 +425,7 @@ def main():
                 shutdown_event,
                 transposition_channel,
             ),
+            kwargs={"debug": args.debug},
         ),
         process_context.Process(
             target=gps_main,

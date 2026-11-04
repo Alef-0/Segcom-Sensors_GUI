@@ -150,7 +150,7 @@ def create_connection_communication(
 
     try:
         camera_delay_seconds = float(
-            initial_values.get("camera_latency_adjustment", 109)
+            initial_values.get("camera_latency_adjustment", 65)
         ) / 1000.0
     except (TypeError, ValueError):
         camera_delay_seconds = CAMERA_DELAY_SECONDS
@@ -289,6 +289,9 @@ def create_connection_communication(
                 frame.frame_type,
                 values["image_bytes"],
                 camera_recorded_at,
+                pts=values.get("pts"),
+                ntp=values.get("ntp"),
+                arrival_time=values.get("arrival_time", values.get("captured_at")),
             )
             result["request_id"] = request_id
             _put_status(pool, "snapshot_saved", result, critical=True)
@@ -340,11 +343,17 @@ def create_connection_communication(
                             _put_status(pool, "recording_error", str(error), critical=True)
                     elif event == "record_camera":
                         captured_at = values.get("captured_at", "")
+                        pts = values.get("pts")
+                        ntp = values.get("ntp")
+                        arrival_time = values.get("arrival_time", captured_at)
                         for channel, filename in values.get("files", {}).items():
                             recording.add_camera_snapshot(
                                 int(channel),
                                 filename,
                                 captured_at,
+                                pts=pts,
+                                ntp=ntp,
+                                arrival_time=arrival_time,
                             )
                     elif event == "record_stop":
                         _stop_recording(recording, pool, recording_ready)

@@ -2,19 +2,11 @@ from datetime import datetime
 from pathlib import Path
 import queue
 import threading
-import time
 from typing import Callable, Mapping
 
 import cv2 as cv
 import numpy as np
 
-from processing.recording.camera_telemetry import (
-    CAMERA_RECORDING_SUMMARY_NAME,
-    CAMERA_TIMESTAMPS_JOURNAL_NAME,
-    CAMERA_TIMING_EVENTS_NAME,
-    CAMERA_TIMING_SESSION_NAME,
-    CameraTelemetryWriter,
-)
 from processing.recording.paths import (
     IMAGE_DIRECTORY_NAME,
     image_path,
@@ -28,6 +20,8 @@ _STOP = object()
 
 
 class CameraSnapshotRecorder:
+    """Asynchronously writes camera JPEG frames and emits NTP, PTS, and arrival timing."""
+
     def __init__(
         self,
         saved_callback: Callable[[dict], None] | None = None,
@@ -43,9 +37,6 @@ class CameraSnapshotRecorder:
         self._queue: queue.Queue | None = None
         self._thread: threading.Thread | None = None
         self._frame_number = 0
-        self._telemetry = CameraTelemetryWriter()
-        self._latency_adjustment_ms = 0.0
-        self._calibration = False
         self.recorded_frames_per_30 = DEFAULT_RECORDED_FRAMES_PER_30
         self._sampling_accumulator = 0
         self.frames_observed = 0
@@ -53,20 +44,15 @@ class CameraSnapshotRecorder:
         self.frames_dropped = 0
         self.unusual_pts_gap_candidates = 0
         self.frames_rejected_invalid_timing = 0
-        self._recording_started_at = ""
-        self._recording_started_unix_ns = 0
-        self._recording_started_monotonic_ns = 0
-        self._transport_stats: dict[str, int] = {}
-        self._transport_stats_by_epoch: dict[int, dict[str, int]] = {}
 
     def start(
         self,
         folders: Mapping[int, str],
         *,
-        calibration: bool = False,
-        latency_adjustment_ms: float = 0.0,
-        timing_session: Mapping | None = None,
+        latency_adjustment_ms: float = 65.0,
+        **kwargs,
     ) -> None:
+        """Initialize image folders and launch worker thread."""
         if self.active:
             raise RuntimeError("Camera snapshot recording is already active")
         selected = {int(channel): Path(folder).expanduser() for channel, folder in folders.items()}
@@ -86,32 +72,7 @@ class CameraSnapshotRecorder:
         self.frames_dropped = 0
         self.unusual_pts_gap_candidates = 0
         self.frames_rejected_invalid_timing = 0
-        self._transport_stats = {}
-        self._transport_stats_by_epoch = {}
         self.error = None
-        self._latency_adjustment_ms = float(latency_adjustment_ms)
-        self._calibration = calibration
-        started = datetime.now().astimezone()
-        self._recording_started_at = started.isoformat(
-            timespec="microseconds"
-        )
-        self._recording_started_unix_ns = time.time_ns()
-        self._recording_started_monotonic_ns = time.monotonic_ns()
-        if calibration:
-            self._telemetry.start(
-                tuple(selected.values()),
-                {
-                    "recording_started_at": self._recording_started_at,
-                    "recording_started_unix_ns": self._recording_started_unix_ns,
-                    "recording_started_monotonic_ns": self._recording_started_monotonic_ns,
-                    "recorded_frames_per_30": self.recorded_frames_per_30,
-                    "image_adjustment_ns": round(
-                        self._latency_adjustment_ms * 1_000_000
-                    ),
-                    **dict(timing_session or {}),
-                },
-            )
-        self._write_calibration_summary()
         self.active = True
         self._thread = threading.Thread(
             target=self._write_loop,
@@ -126,13 +87,11 @@ class CameraSnapshotRecorder:
         captured_at: datetime | None = None,
         timing: Mapping | None = None,
     ) -> bool:
+        """Enqueue frame if sampling accumulator permits."""
         if not self.active or self.error is not None or self._queue is None:
             return False
         self.frames_observed += 1
         timing = dict(timing or {})
-        self.unusual_pts_gap_candidates += int(
-            bool(timing.get("large_pts_gap_candidate"))
-        )
         self._sampling_accumulator += self.recorded_frames_per_30
         if self._sampling_accumulator < CAMERA_FRAME_RATE:
             return False
@@ -161,17 +120,16 @@ class CameraSnapshotRecorder:
         return True
 
     def poll_error(self) -> Exception | None:
+        """Return the first fatal worker error if one occurred."""
         return self.error
 
     def note_invalid_timing_frame(self) -> None:
+        """Track invalid frames dropped prior to submission."""
         if self.active:
             self.frames_rejected_invalid_timing += 1
 
     def record_timing_events(self, events) -> None:
-        if not self.active or not self._calibration:
-            return
-        for event in events:
-            self._telemetry.append_event(event)
+        """Compatibility no-op for transport timing events."""
 
     def update_transport_stats(
         self,
@@ -179,33 +137,13 @@ class CameraSnapshotRecorder:
         *,
         stream_epoch: int = 0,
     ) -> None:
-        current = {
-            str(key): int(value)
-            for key, value in stats.items()
-        }
-        previous = self._transport_stats_by_epoch.setdefault(
-            int(stream_epoch),
-            {},
-        )
-        for key, value in current.items():
-            previous[key] = max(previous.get(key, 0), value)
-        fields = {
-            key
-            for epoch_stats in self._transport_stats_by_epoch.values()
-            for key in epoch_stats
-        }
-        self._transport_stats = {
-            key: sum(
-                epoch_stats.get(key, 0)
-                for epoch_stats in self._transport_stats_by_epoch.values()
-            )
-            for key in fields
-        }
+        """Compatibility no-op for RTP transport stats."""
 
     def set_latency_adjustment_ms(self, value: float) -> None:
-        self._latency_adjustment_ms = float(value)
+        """Compatibility no-op for software latency adjustments."""
 
     def set_recorded_frames_per_30(self, value: int) -> None:
+        """Adjust decimated capture rate between 1 and 30 frames."""
         numeric_value = float(value)
         if not numeric_value.is_integer():
             raise ValueError("Recorded frames must be a whole number")
@@ -216,6 +154,7 @@ class CameraSnapshotRecorder:
         self._sampling_accumulator = CAMERA_FRAME_RATE - frames_per_30
 
     def stop(self) -> int:
+        """Drain worker queue and wait for the thread to exit."""
         if not self.active:
             return self._frame_number
         self.active = False
@@ -227,13 +166,12 @@ class CameraSnapshotRecorder:
                 except queue.Full:
                     continue
             self._thread.join()
-        self._write_calibration_summary(final=True)
-        self._telemetry.stop()
         if self.error is not None:
             raise self.error
         return self._frame_number
 
     def _write_loop(self) -> None:
+        """Worker loop writing JPEG files and notifying saved callback."""
         assert self._queue is not None
         try:
             while True:
@@ -252,94 +190,16 @@ class CameraSnapshotRecorder:
                             raise RuntimeError(f"Could not save camera snapshot: {path}")
                         files[channel] = reference
                     self._frame_number = frame_number
-                    saved_at_ns = time.time_ns()
-                    self._record_calibration_timestamp(
-                        reference,
-                        captured_at,
-                        timing,
-                        saved_at_ns,
-                    )
                     if self.saved_callback:
+                        timing_dict = dict(timing or {})
                         self.saved_callback({
                             "files": files,
                             "captured_at": captured_at,
-                            "calibration": self._calibration,
+                            "pts": timing_dict.get("pts_ns"),
+                            "ntp": timing_dict.get("camera_ntp_ns"),
+                            "arrival_time": captured_at,
                         })
                 finally:
                     self._queue.task_done()
         except Exception as error:
             self.error = error
-
-    def _record_calibration_timestamp(
-        self,
-        filename: str,
-        captured_at: str,
-        timing: Mapping,
-        saved_at_ns: int,
-    ) -> None:
-        if not self._telemetry.active:
-            return
-        timing = dict(timing)
-        self._telemetry.update_epoch({
-            key: timing.get(key)
-            for key in (
-                "stream_epoch",
-                "pipeline_zero_unix_ns",
-                "pipeline_zero_monotonic_ns",
-                "pipeline_clock_type",
-            )
-            if timing.get(key) is not None
-        })
-        media_time_ns = timing.get("media_time_ns")
-        if media_time_ns is None:
-            media_time_ns = round(
-                datetime.fromisoformat(captured_at).timestamp() * 1_000_000_000
-            )
-        adjustment_ns = round(self._latency_adjustment_ms * 1_000_000)
-        estimated_exposure_ns = int(media_time_ns) - adjustment_ns
-        record = {
-            "frame": filename,
-            "stream_epoch": timing.get("stream_epoch"),
-            "pts_ns": timing.get("pts_ns"),
-            "running_time_ns": timing.get("running_time_ns"),
-            "received_monotonic_ns": timing.get("host_monotonic_received_ns"),
-            "received_unix_ns": timing.get("host_realtime_received_ns"),
-            "reference_timestamp_raw_ns": timing.get("reference_timestamp_raw_ns"),
-            "reference_clock": timing.get("reference_clock"),
-            "reference_ntp_ns": timing.get("camera_ntp_ns"),
-            "media_unix_ns": int(media_time_ns),
-            "estimated_exposure_unix_ns": estimated_exposure_ns,
-            "saved_unix_ns": int(saved_at_ns),
-            "flags": list(timing.get("flags") or ()),
-        }
-        self._telemetry.append_frame(record)
-
-    def _write_calibration_summary(self, *, final: bool = False) -> None:
-        if not self._telemetry.active:
-            return
-        summary = {
-            "schema_version": 2,
-            "started_at": self._recording_started_at,
-            "started_unix_ns": self._recording_started_unix_ns,
-            "started_monotonic_ns": self._recording_started_monotonic_ns,
-            "recorded_frames_per_30": self.recorded_frames_per_30,
-            "frames_observed": self.frames_observed,
-            "frames_selected": self.frames_selected,
-            "frames_dropped_writer_queue": self.frames_dropped,
-            "unusual_pts_gap_candidates": self.unusual_pts_gap_candidates,
-            "frames_rejected_invalid_timing": self.frames_rejected_invalid_timing,
-            "confirmed_frames_not_saved": (
-                self.frames_dropped + self.frames_rejected_invalid_timing
-            ),
-            "frames_saved": self._frame_number,
-            **self._transport_stats,
-            "transport_stats_by_epoch": [
-                {"stream_epoch": epoch, **stats}
-                for epoch, stats in sorted(self._transport_stats_by_epoch.items())
-            ],
-        }
-        if final:
-            summary["stopped_at"] = datetime.now().astimezone().isoformat(
-                timespec="microseconds"
-            )
-        self._telemetry.write_summary(summary)

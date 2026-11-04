@@ -136,9 +136,7 @@ class ObjectRecordingUpdateTests(unittest.TestCase):
             session.submit(1, (obj,), recorded_at, frame_type="object")
             session.add_camera_snapshot(1, "camera_000001.jpg", recorded_at)
             session.stop()
-            records = json.loads(
-                (Path(paths[1]) / recorder_module.RECORDING_METADATA_NAME).read_text()
-            )
+            records = recorder_module.load_recording_metadata(Path(paths[1]))
 
         self.assertEqual(records[0]["frame_type"], "object")
         self.assertEqual(records[0]["camera_frame"], "images/camera_000001.jpg")

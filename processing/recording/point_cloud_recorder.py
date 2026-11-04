@@ -1,11 +1,12 @@
 from collections import deque
+import csv
 from datetime import datetime, timedelta
 import json
 from pathlib import Path
 import queue
 import threading
 import time
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 import numpy as np
 
@@ -105,11 +106,168 @@ OBJECT_PCD_TYPES = LEGACY_OBJECT_PCD_TYPES + (
 PCD_FIELDS = CLUSTER_PCD_FIELDS
 PCD_TYPES = CLUSTER_PCD_TYPES
 RADAR_LETTERS = {1: "A", 2: "B", 3: "C"}
-CAMERA_DELAY_SECONDS = 0.109
+CAMERA_DELAY_SECONDS = 0.065
 METADATA_FLUSH_SECONDS = 1.0
-RECORDING_METADATA_NAME = "recording.json"
-TIMESTAMPS_METADATA_NAME = "timestamps.json"
+RECORDING_METADATA_NAME = "recording.csv"
+TIMESTAMPS_METADATA_NAME = "timestamps.csv"
+LEGACY_RECORDING_METADATA_NAME = "recording.json"
+LEGACY_TIMESTAMPS_METADATA_NAME = "timestamps.json"
+RECORDING_CSV_COLUMNS = (
+    "point_cloud",
+    "recorded_at",
+    "frame_type",
+    "camera_frame",
+    "pts",
+    "ntp",
+    "arrival_time",
+)
 _STOP = object()
+
+
+def save_recording_csv(path: Path, records: Iterable[Mapping]) -> None:
+    """Save records to CSV using a temporary file for atomic replacement."""
+    records_list = list(records)
+    standard_keys = list(RECORDING_CSV_COLUMNS)
+    extra_keys = []
+    for record in records_list:
+        for key in record:
+            if key not in standard_keys and key not in extra_keys:
+                extra_keys.append(key)
+    fieldnames = standard_keys + extra_keys
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records_list:
+            row = {}
+            for key in fieldnames:
+                value = record.get(key)
+                row[key] = "" if value is None else value
+            writer.writerow(row)
+    temporary_path.replace(path)
+
+
+def load_recording_csv(path: Path) -> list[dict]:
+    """Load recording CSV records into structured dictionaries."""
+    with path.open("r", newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        records = []
+        for row in reader:
+            record = {}
+            for key, value in row.items():
+                if value == "" or value is None:
+                    record[key] = None
+                elif key in ("pts", "ntp"):
+                    try:
+                        record[key] = int(value)
+                    except (ValueError, TypeError):
+                        record[key] = value
+                elif key in ("camera_delay_ms", "synchronization_error_ms"):
+                    try:
+                        record[key] = float(value)
+                    except (ValueError, TypeError):
+                        record[key] = value
+                else:
+                    record[key] = value
+            records.append(record)
+        return records
+
+
+def save_timestamps_csv(path: Path, timestamps: Mapping[str, str]) -> None:
+    """Save point cloud to timestamp mappings as CSV."""
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(["point_cloud", "recorded_at"])
+        for point_cloud, recorded_at in timestamps.items():
+            writer.writerow([point_cloud, recorded_at])
+    temporary_path.replace(path)
+
+
+def load_timestamps_csv(path: Path) -> dict[str, str]:
+    """Load point cloud to timestamp mappings from CSV."""
+    with path.open("r", newline="", encoding="utf-8") as file:
+        reader = csv.reader(file)
+        timestamps = {}
+        header_skipped = False
+        for row in reader:
+            if not row or not any(row):
+                continue
+            if not header_skipped:
+                header_skipped = True
+                if row[0].strip().lower() in ("point_cloud", "file", "filename"):
+                    continue
+            if len(row) >= 2:
+                timestamps[row[0].strip()] = row[1].strip()
+        return timestamps
+
+
+def save_recording_metadata(path: Path, records: Iterable[Mapping]) -> None:
+    """Save recording metadata as CSV or JSON based on file extension."""
+    if path.suffix.lower() == ".json":
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
+        temporary_path.write_text(
+            json.dumps(list(records), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(path)
+    else:
+        save_recording_csv(path, records)
+
+
+def load_recording_metadata(source: str | Path) -> list[dict]:
+    """Load recording metadata transparently from CSV or JSON."""
+    path = Path(source).expanduser()
+    if path.is_dir():
+        csv_path = path / RECORDING_METADATA_NAME
+        json_path = path / LEGACY_RECORDING_METADATA_NAME
+        if csv_path.is_file():
+            return load_recording_metadata(csv_path)
+        if json_path.is_file():
+            return load_recording_metadata(json_path)
+        raise FileNotFoundError(f"No recording metadata found in {path}")
+    raw_text = path.read_text(encoding="utf-8")
+    stripped = raw_text.lstrip()
+    if stripped.startswith(("[", "{")):
+        data = json.loads(raw_text)
+        if not isinstance(data, list):
+            raise ValueError(f"Invalid {path.name} format")
+        return data
+    return load_recording_csv(path)
+
+
+def save_timestamps_metadata(path: Path, timestamps: Mapping[str, str]) -> None:
+    """Save timestamps metadata as CSV or JSON based on file extension."""
+    if path.suffix.lower() == ".json":
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
+        temporary_path.write_text(
+            json.dumps(dict(timestamps), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(path)
+    else:
+        save_timestamps_csv(path, timestamps)
+
+
+def load_timestamps_metadata(source: str | Path) -> dict[str, str]:
+    """Load timestamps metadata transparently from CSV or JSON."""
+    path = Path(source).expanduser()
+    if path.is_dir():
+        csv_path = path / TIMESTAMPS_METADATA_NAME
+        json_path = path / LEGACY_TIMESTAMPS_METADATA_NAME
+        if csv_path.is_file():
+            return load_timestamps_metadata(csv_path)
+        if json_path.is_file():
+            return load_timestamps_metadata(json_path)
+        raise FileNotFoundError(f"No timestamps metadata found in {path}")
+    raw_text = path.read_text(encoding="utf-8")
+    stripped = raw_text.lstrip()
+    if stripped.startswith(("{", "[")):
+        data = json.loads(raw_text)
+        if not isinstance(data, dict):
+            raise ValueError(f"Invalid {path.name} format")
+        return data
+    return load_timestamps_csv(path)
 
 
 def _float_or_nan(value: float | None) -> float:
@@ -258,15 +416,23 @@ class PointCloudRecorder:
             )
             return False
 
-    def add_camera_snapshot(self, filename: str, recorded_at: datetime | str) -> None:
+    def add_camera_snapshot(
+        self,
+        filename: str,
+        recorded_at: datetime | str,
+        pts: int | None = None,
+        ntp: int | None = None,
+        arrival_time: str | None = None,
+    ) -> None:
         camera_time = _datetime(recorded_at)
         delay_seconds = self.camera_delay_seconds
         target_time = camera_time - timedelta(seconds=delay_seconds)
         snapshot = {
             "camera_frame": image_reference(filename),
-            "camera_recorded_at": _timestamp(camera_time),
             "target_recorded_at": _timestamp(target_time),
-            "camera_delay_ms": delay_seconds * 1000.0,
+            "pts": pts,
+            "ntp": ntp,
+            "arrival_time": arrival_time or _timestamp(camera_time),
         }
         with self._metadata_lock:
             self._pending_camera_frames.append(snapshot)
@@ -306,12 +472,9 @@ class PointCloudRecorder:
             record_time = _datetime(record["recorded_at"])
             record.update({
                 "camera_frame": snapshot["camera_frame"],
-                "camera_recorded_at": snapshot["camera_recorded_at"],
-                "camera_delay_ms": round(snapshot["camera_delay_ms"], 3),
-                "synchronization_error_ms": round(
-                    (record_time - target).total_seconds() * 1000.0,
-                    3,
-                ),
+                "pts": snapshot.get("pts"),
+                "ntp": snapshot.get("ntp"),
+                "arrival_time": snapshot.get("arrival_time"),
             })
             self._pending_camera_frames.popleft()
             self._metadata_dirty = True
@@ -341,9 +504,9 @@ class PointCloudRecorder:
                             "recorded_at": recorded_at,
                             "frame_type": frame_type,
                             "camera_frame": None,
-                            "camera_recorded_at": None,
-                            "camera_delay_ms": None,
-                            "synchronization_error_ms": None,
+                            "pts": None,
+                            "ntp": None,
+                            "arrival_time": None,
                         })
                         self._metadata_dirty = True
                         self._match_camera_frames_locked()
@@ -378,11 +541,17 @@ class PointCloudRecorder:
             self._write_metadata_locked()
 
     def _write_metadata_locked(self) -> None:
-        self._replace_json(self.timestamps_path, self._timestamps)
-        self._replace_json(self.metadata_path, self._records)
+        save_timestamps_metadata(self.timestamps_path, self._timestamps)
+        save_recording_metadata(self.metadata_path, self._records)
 
     @staticmethod
     def _replace_json(path: Path, value: object) -> None:
+        if path.suffix.lower() == ".csv":
+            if isinstance(value, list):
+                save_recording_csv(path, value)
+            else:
+                save_timestamps_csv(path, value)
+            return
         temporary_path = path.with_suffix(path.suffix + ".tmp")
         temporary_path.write_text(
             json.dumps(value, indent=2) + "\n",
@@ -466,11 +635,20 @@ class RadarRecordingSession:
         channel: int,
         filename: str,
         recorded_at: datetime | str,
+        pts: int | None = None,
+        ntp: int | None = None,
+        arrival_time: str | None = None,
     ) -> bool:
         recorder = self.recorders.get(channel)
         if recorder is None:
             return False
-        recorder.add_camera_snapshot(filename, recorded_at)
+        recorder.add_camera_snapshot(
+            filename,
+            recorded_at,
+            pts=pts,
+            ntp=ntp,
+            arrival_time=arrival_time,
+        )
         return True
 
     def set_camera_delay_seconds(self, value: float) -> None:

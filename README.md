@@ -69,7 +69,7 @@ fallback.
 ```text
 FreeSimpleGUI process
 ├── radar worker: TCP/CAN input, decoding, plot, PCD recording
-├── camera worker: RTSP/GStreamer input, display, JPEG recording
+├── camera worker: live RTSP display, plus one capture stream per recorded group
 ├── GPS worker: DVR position polling and map link
 ├── recording playback worker
 └── snapshot playback worker
@@ -123,7 +123,7 @@ metadata disciplines that PTS timeline gradually. Missing NTP falls back to
 PTS, large NTP steps require repeated confirmation, and invalid or non-forward
 PTS frames are rejected and counted.
 
-The separate camera latency adjustment defaults to 109 ms. It is subtracted
+The separate camera latency adjustment defaults to 65 ms. It is subtracted
 when associating a camera observation with radar time and is recorded in
 metadata. It does not replace or configure the RTSP jitter buffer. This value
 is a calibration result, so it should be rechecked after changes to the DVR,
@@ -141,21 +141,25 @@ recording_A_YYYYMMDD_HHMMSS_microseconds/
 │   └── camera_000001.jpg
 ├── point_cloud/
 │   └── frame_000001.pcd
-├── recording.json
-└── timestamps.json
+├── recording.csv
+└── timestamps.csv
 ```
 
 Radar frames are written as PCD point clouds inside `point_cloud/`. Camera
-frames are written as JPEGs inside `images/` in every selected group folder.
-`recording.json` is the authoritative ordered association between radar frames
-and camera frames; `timestamps.json` keeps the older filename-to-radar-time
-mapping. The loader also accepts older JSON that refers to loose root-level
-files, and can resolve those bare references if the files were moved into the
-new subfolders.
+frames are written as JPEGs inside `images/`. Each selected group is recorded
+from its own DVR channel (A = channel 1, B = 2, C = 3) through a dedicated
+capture-only RTSP stream, independent of the channel shown in the live camera
+window, so `recording_A_*` holds LEFT camera images, `recording_C_*` holds
+RIGHT camera images, and so on.
+`recording.csv` is the authoritative ordered association between radar frames
+and camera frames (with legacy `recording.json` fully supported); `timestamps.csv`
+keeps the filename-to-radar-time mapping (with legacy `timestamps.json` also accepted).
+The loader also accepts older files that refer to loose root-level files, and can
+resolve those bare references if the files were moved into the new subfolders.
 
-For each camera frame, the recorder subtracts the configured camera delay and
-matches the result to the closest still-unpaired radar frame. The metadata
-retains the camera time, applied delay, and residual synchronization error.
+For each camera frame, the recorder subtracts the configured camera delay
+(default 65 ms) and matches the result to the closest still-unpaired radar
+frame. The metadata retains PTS, camera NTP, and arrival time.
 
 A manual snapshot first captures a valid-timestamp camera frame for the chosen
 group. The radar worker then selects the closest completed radar frame from a
@@ -238,5 +242,5 @@ are not independently proven by source alone:
 - The current 109 ms camera adjustment is the intended operational default for
   this deployment.
 - Snapshot matching should continue to allow up to 500 ms residual error.
-- Recording camera frames into every selected radar folder is the desired data
-  duplication model.
+- The DVR accepts one extra main-stream RTSP session per recorded group in
+  addition to the live view (up to four concurrent sessions).
